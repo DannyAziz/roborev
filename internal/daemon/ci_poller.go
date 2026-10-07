@@ -74,22 +74,26 @@ type ghPRAuthor struct {
 
 // ghPR represents an open GitHub pull request summary.
 type ghPR struct {
-	Number      int        `json:"number"`
-	HeadRefOid  string     `json:"headRefOid"`
-	HeadRefName string     `json:"headRefName"`
-	BaseRefName string     `json:"baseRefName"`
-	Title       string     `json:"title"`
-	Author      ghPRAuthor `json:"author"`
-	Labels      []string   `json:"labels"`
+	Draft              bool
+	RequestedReviewers []string
+	Number             int        `json:"number"`
+	HeadRefOid         string     `json:"headRefOid"`
+	HeadRefName        string     `json:"headRefName"`
+	BaseRefName        string     `json:"baseRefName"`
+	Title              string     `json:"title"`
+	Author             ghPRAuthor `json:"author"`
+	Labels             []string   `json:"labels"`
 }
 
 type panelPostTarget struct {
-	Open        bool
-	HeadSHA     string
-	HeadRefName string
-	BaseRefName string
-	AuthorLogin string
-	Labels      []string
+	Draft              bool
+	RequestedReviewers []string
+	Open               bool
+	HeadSHA            string
+	HeadRefName        string
+	BaseRefName        string
+	AuthorLogin        string
+	Labels             []string
 }
 
 const (
@@ -109,22 +113,25 @@ type CIPoller struct {
 
 	// Test seams for mocking side effects (gh/git/LLM) in unit tests.
 	// Nil means use the real implementation.
-	listOpenPRsFn       func(context.Context, string) ([]ghPR, error)
-	listTrustedActorsFn func(context.Context, string) (map[string]struct{}, error)
-	listPRDiscussionFn  func(context.Context, string, int) ([]ghpkg.PRDiscussionComment, error)
-	gitFetchFn          func(context.Context, string, []string) error
-	gitFetchPRHeadFn    func(context.Context, string, string, []string) error
-	gitCloneFn          func(ctx context.Context, ghRepo, targetPath string, env []string) error
-	mergeBaseFn         func(string, string, string) (string, error)
-	loadRepoConfigFn    func(string) (ciRepoConfigSource, error)
-	buildReviewPromptFn func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error)
-	postPRCommentFn     func(string, int, string) error
-	setCommitStatusFn   func(ghRepo, sha, state, description string) error
-	setSkippedCheckFn   func(ghRepo, sha, summary string) error
-	agentResolverFn     func(name string) (string, error)      // returns resolved agent name
-	jobCancelFn         func(jobID int64)                      // kills running worker process (optional)
-	isPROpenFn          func(ghRepo string, prNumber int) bool // checks if a PR is still open
-	prPostTargetFn      func(context.Context, string, int) (panelPostTarget, error)
+	listOpenPRsFn          func(context.Context, string) ([]ghPR, error)
+	listTrustedActorsFn    func(context.Context, string) (map[string]struct{}, error)
+	listPRDiscussionFn     func(context.Context, string, int) ([]ghpkg.PRDiscussionComment, error)
+	gitFetchFn             func(context.Context, string, []string) error
+	gitFetchPRHeadFn       func(context.Context, string, string, []string) error
+	gitCloneFn             func(ctx context.Context, ghRepo, targetPath string, env []string) error
+	mergeBaseFn            func(string, string, string) (string, error)
+	loadRepoConfigFn       func(string) (ciRepoConfigSource, error)
+	buildReviewPromptFn    func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error)
+	postPRCommentFn        func(string, int, string) error
+	setCommitStatusFn      func(ghRepo, sha, state, description string) error
+	setSkippedCheckFn      func(ghRepo, sha, summary string) error
+	agentResolverFn        func(name string) (string, error)      // returns resolved agent name
+	jobCancelFn            func(jobID int64)                      // kills running worker process (optional)
+	isPROpenFn             func(ghRepo string, prNumber int) bool // checks if a PR is still open
+	prPostTargetFn         func(context.Context, string, int) (panelPostTarget, error)
+	personalActorFn        func(context.Context, string) (string, error)
+	findPersonalReviewFn   func(context.Context, string, int, ghpkg.ReviewSubmission) (int64, error)
+	submitPersonalReviewFn func(context.Context, string, int, ghpkg.ReviewSubmission) (int64, error)
 
 	repoResolver *RepoResolver
 	errorLog     *ErrorLog
@@ -507,6 +514,12 @@ func (p *CIPoller) pollRepo(ctx context.Context, ghRepo string, cfg *config.Conf
 	// unhealthy or block the other PRs.
 	unavailableHeads := make(map[ciPollTarget]bool)
 	for _, pr := range prs {
+		if cfg.CI.Personal.Enabled && personalRepoAllowed(cfg, ghRepo) {
+			if err := p.db.ObservePersonalRequest(ghRepo, pr.Number, cfg.CI.Personal.Reviewer, personalRequestEligible(cfg.CI.Personal, pr)); err != nil {
+				processingErrors = append(processingErrors, err)
+				continue
+			}
+		}
 		err := p.processPR(ctx, ghRepo, pr, cfg)
 		if err == nil {
 			continue
@@ -636,6 +649,9 @@ func (p *CIPoller) reconcileRetryHealth(
 }
 
 func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *config.Config) error {
+	if cfg.CI.Personal.Enabled && (!personalRepoAllowed(cfg, ghRepo) || !personalRequestEligible(cfg.CI.Personal, pr)) {
+		return nil
+	}
 	// Retry unfinished cancellation before any gate can skip this PR. Active
 	// panels remain subject to the normal enqueue and quiet-hours decisions.
 	if err := p.supersedePriorPanels(ghRepo, pr.Number, pr.HeadRefOid, false); err != nil {
@@ -718,6 +734,14 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 // reserved atomically inside CreateCIPanelRun; the sweep's already-claimed
 // (pending) attempt is left intact by that idempotent reserve.
 func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, cfg *config.Config) (bool, error) {
+	if cfg.CI.Personal.Enabled {
+		if !personalRepoAllowed(cfg, ghRepo) || !personalRequestEligible(cfg.CI.Personal, pr) {
+			return false, nil
+		}
+		if err := p.verifyPersonalActor(ctx, ghRepo, cfg.CI.Personal.Reviewer); err != nil {
+			return false, err
+		}
+	}
 	// Find local repo matching this GitHub repo (auto-clones if needed).
 	repo, err := p.findOrCloneRepo(ctx, ghRepo)
 	if err != nil {
@@ -768,30 +792,38 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 	}
 	repoCfg := repoConfig.Config
 	rawRepoCfg := repoConfig.Raw
-	selection, err := config.SelectReviewExperiment(config.ExperimentSelectionInput{
-		Workflow: config.ExperimentWorkflowCI,
-		Subject: config.ExperimentSubject{
-			Repository: repo.Identity,
-			Branch:     pr.HeadRefName,
-		},
-		Global:  cfg,
-		Repo:    repoCfg,
-		RawRepo: rawRepoCfg,
-	})
-	if err != nil {
-		return false, &ciConfigurationError{
-			err: fmt.Errorf("select review experiment: %w", err),
+	selection := config.ExperimentSelection{}
+	if !cfg.CI.Personal.Enabled {
+		selection, err = config.SelectReviewExperiment(config.ExperimentSelectionInput{
+			Workflow: config.ExperimentWorkflowCI,
+			Subject: config.ExperimentSubject{
+				Repository: repo.Identity,
+				Branch:     pr.HeadRefName,
+			},
+			Global: cfg, Repo: repoCfg, RawRepo: rawRepoCfg,
+		})
+		if err != nil {
+			return false, &ciConfigurationError{err: fmt.Errorf("select review experiment: %w", err)}
 		}
-	}
-	repoCfg = selection.RepoConfig
-	if selection.RawRepoConfig != nil {
-		rawRepoCfg = selection.RawRepoConfig
+		repoCfg = selection.RepoConfig
+		if selection.RawRepoConfig != nil {
+			rawRepoCfg = selection.RawRepoConfig
+		}
 	}
 
 	// Resolve panel members + synthesis: a configured [ci].panel names a panel,
 	// else the agents x review_types matrix is adapted into members.
+	executionRepoCfg, executionRaw, executionCfg := repoCfg, rawRepoCfg, cfg
+	if cfg.CI.Personal.Enabled {
+		// The local personal panel is authority; repository definitions cannot
+		// replace its reviewers, models, instructions or publication policy.
+		local := *cfg
+		local.CI.Panel = cfg.CI.Personal.Panel
+		executionCfg, executionRepoCfg, executionRaw = &local, nil, nil
+		repoCfg = personalPromptRepoConfig(repoCfg, cfg)
+	}
 	members, synth, err := p.resolveCIMembers(
-		repo, repoCfg, rawRepoCfg, cfg, ghRepo,
+		repo, executionRepoCfg, executionRaw, executionCfg, ghRepo,
 	)
 	if err != nil {
 		// A member's agent could not be resolved (none installed / quota):
@@ -814,7 +846,9 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 
 	// Append one whole-range design member when auto-design warrants it and
 	// no member already covers the design review type (F8, F12).
-	members = p.maybeAppendDesignMember(ctx, members, repo, repoCfg, cfg, mergeBase, pr.HeadRefOid)
+	if !cfg.CI.Personal.Enabled {
+		members = p.maybeAppendDesignMember(ctx, members, repo, repoCfg, cfg, mergeBase, pr.HeadRefOid)
+	}
 
 	memberOpts, synthOpts, err := p.buildPanelOpts(
 		ctx,
@@ -842,6 +876,9 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		synthOpts.Experiment = assignment
 	}
 	for i := range memberOpts {
+		if cfg.CI.Personal.Enabled {
+			continue
+		}
 		memberOpts[i].SessionID, memberOpts[i].ResumeSourceJobUUID = findCompatibleReusableSession(
 			ctx, p.db, repo.RootPath, pr.HeadRefOid, memberOpts[i],
 			repoCfg, rawRepoCfg, cfg, synthOpts.Experiment, pr.Number,
@@ -977,6 +1014,9 @@ func (p *CIPoller) alreadyReviewedPR(ghRepo string, pr ghPR) (bool, error) {
 		return true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("check CI panel: %w", err)
+	}
+	if p.cfgGetter.Config().CI.Personal.Enabled {
+		return false, nil
 	}
 	posted, err := p.db.HasPostedCIReview(ghRepo, pr.Number, pr.HeadRefOid)
 	if err != nil {
@@ -1609,7 +1649,13 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			}
 			log.Printf("CI poller: failed to prebuild prompt for %s#%d (member=%s, agent=%s): %v; enqueuing without stored prompt",
 				in.ghRepo, in.prNumber, m.Name, m.Agent, err)
+			if in.cfg.CI.Personal.Enabled {
+				return nil, storage.EnqueueOpts{}, fmt.Errorf("build personal review prompt: %w", err)
+			}
 			storedPrompt = ""
+		}
+		if in.cfg.CI.Personal.Enabled && strings.TrimSpace(storedPrompt) == "" {
+			return nil, storage.EnqueueOpts{}, fmt.Errorf("personal review prompt is empty")
 		}
 		acpSnapshot, err := snapshotACPExecutionConfig(
 			in.repoCfg, in.cfg, m.Agent, m.BackupAgent,
@@ -1622,6 +1668,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		cfgJSON, err := json.Marshal(ciPanelMemberConfig{
 			ResolvedMember: m,
 			ACP:            acpSnapshot,
+			Personal:       personalPolicySnapshot(in.cfg),
 		})
 		if err != nil {
 			return nil, storage.EnqueueOpts{}, fmt.Errorf(
@@ -1665,8 +1712,12 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			"snapshot synthesis ACP config: %w", err,
 		)
 	}
-	if len(synthACP) > 0 {
-		encoded, marshalErr := json.Marshal(ciACPExecutionConfig{ACP: synthACP})
+	if len(synthACP) > 0 || in.cfg.CI.Personal.Enabled {
+		execution := ciACPExecutionConfig{ACP: synthACP, Personal: personalPolicySnapshot(in.cfg)}
+		if execution.Personal != nil {
+			execution.PersonalMemberCount = len(in.members)
+		}
+		encoded, marshalErr := json.Marshal(execution)
 		if marshalErr != nil {
 			return nil, storage.EnqueueOpts{}, fmt.Errorf("snapshot synthesis ACP config: %w", marshalErr)
 		}
@@ -2224,13 +2275,15 @@ func (p *CIPoller) listOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, erro
 	prs := make([]ghPR, 0, len(openPRs))
 	for _, pr := range openPRs {
 		prs = append(prs, ghPR{
-			Number:      pr.Number,
-			HeadRefOid:  pr.HeadRefOID,
-			HeadRefName: pr.HeadRefName,
-			BaseRefName: pr.BaseRefName,
-			Title:       pr.Title,
-			Author:      ghPRAuthor{Login: pr.AuthorLogin},
-			Labels:      pr.Labels,
+			Draft:              pr.Draft,
+			RequestedReviewers: pr.RequestedReviewers,
+			Number:             pr.Number,
+			HeadRefOid:         pr.HeadRefOID,
+			HeadRefName:        pr.HeadRefName,
+			BaseRefName:        pr.BaseRefName,
+			Title:              pr.Title,
+			Author:             ghPRAuthor{Login: pr.AuthorLogin},
+			Labels:             pr.Labels,
 		})
 	}
 	return prs, nil
@@ -2410,6 +2463,10 @@ func (p *CIPoller) postPanelRun(ctx context.Context, row *storage.CIPanel) {
 	}
 	if !won {
 		return // another path is posting this run
+	}
+
+	if p.handlePersonalPanel(ctx, row) {
+		return
 	}
 
 	if !p.guardPanelPostTarget(ctx, row) {
@@ -3537,6 +3594,9 @@ func (p *CIPoller) callPostPRComment(ghRepo string, prNumber int, body string) e
 }
 
 func (p *CIPoller) callSetCommitStatus(ghRepo, sha, state, description string) error {
+	if p.cfgGetter.Config().CI.Personal.Enabled {
+		return nil
+	}
 	if p.setCommitStatusFn != nil {
 		return p.setCommitStatusFn(ghRepo, sha, state, description)
 	}
@@ -3544,6 +3604,9 @@ func (p *CIPoller) callSetCommitStatus(ghRepo, sha, state, description string) e
 }
 
 func (p *CIPoller) callSetSkippedCommitStatus(ghRepo, sha, description string) error {
+	if p.cfgGetter.Config().CI.Personal.Enabled {
+		return nil
+	}
 	if p.setCommitStatusFn != nil {
 		return p.setCommitStatusFn(ghRepo, sha, "success", description)
 	}
@@ -3558,6 +3621,9 @@ func (p *CIPoller) callSetSkippedCommitStatus(ghRepo, sha, description string) e
 }
 
 func (p *CIPoller) callSetSkippedCheck(ghRepo, sha, summary string) error {
+	if p.cfgGetter.Config().CI.Personal.Enabled {
+		return nil
+	}
 	if p.setSkippedCheckFn != nil {
 		return p.setSkippedCheckFn(ghRepo, sha, summary)
 	}
@@ -3619,12 +3685,14 @@ func (p *CIPoller) panelPostTarget(
 		return panelPostTarget{}, err
 	}
 	return panelPostTarget{
-		Open:        strings.EqualFold(pr.State, "open"),
-		HeadSHA:     pr.HeadRefOID,
-		HeadRefName: pr.HeadRefName,
-		BaseRefName: pr.BaseRefName,
-		AuthorLogin: pr.AuthorLogin,
-		Labels:      pr.Labels,
+		Draft:              pr.Draft,
+		RequestedReviewers: pr.RequestedReviewers,
+		Open:               strings.EqualFold(pr.State, "open"),
+		HeadSHA:            pr.HeadRefOID,
+		HeadRefName:        pr.HeadRefName,
+		BaseRefName:        pr.BaseRefName,
+		AuthorLogin:        pr.AuthorLogin,
+		Labels:             pr.Labels,
 	}, nil
 }
 

@@ -380,6 +380,119 @@ roborev daemon start        # background mode
 roborev daemon run          # or foreground mode to watch logs
 ```
 
+## Personal requested reviews (fork)
+
+This fork adds an opt-in mode for direct review requests to your GitHub user. It
+reuses the daemon and agent adapters, but publishes formal GitHub reviews
+instead of issue comments. Existing broad polling is unchanged when this mode is
+disabled.
+
+Use a separate `ROBOREV_DATA_DIR` for the personal instance. Do not install a
+fork build over a production daemon or share its database. This mode requires
+personal GitHub authentication, not a GitHub App installation token. The daemon
+checks the authenticated user against `reviewer` before queueing and submitting.
+
+Add the following to that instance's local `config.toml`, replacing the
+repository and reviewer placeholders:
+
+```toml
+[ci]
+enabled = true
+repos = ["example/project"]
+poll_interval = "1m"
+throttle_interval = "0"
+
+[ci.personal]
+enabled = true
+reviewer = "your-github-login"
+panel = "personal"
+mode = "dry-run"
+approve = false
+request_changes = false
+
+[review.subagents.personal]
+agent = "claude-code"
+model = "sonnet"
+instructions = "Review correctness, security and regressions. Explain concrete fixes."
+
+[review.panels.personal]
+members = ["personal"]
+synthesis_agent = "claude-code"
+```
+
+Select `pi`, `codex`, `claude-code` or `cursor` in the subagent's `agent` field
+and choose a model supported by that harness. Existing custom review types can
+provide longer prompt templates and includes. Each user keeps their own local
+panel and credentials; the machine hosting a job does not change its publishing
+identity. Repository panel definitions cannot replace the local personal panel.
+
+### Selection and follow-up
+
+- Reviews only direct user requests. Team-only requests do not count.
+- Skips drafts, self-authored PRs and configured skip labels.
+- Keeps the full open-PR inventory for cleanup; unrequested does not mean
+    closed.
+- New commits are reviewed while your request remains outstanding. After you
+    submit a formal review, GitHub removes you from the requested reviewers.
+- An observed request removal followed by a new request re-arms the same commit.
+    A removal and re-request entirely between polls cannot be detected. Signed
+    webhook intake is not implemented in this fork.
+- Uses the local panel's frozen instructions, execution settings and publication
+    permissions. Enabling approval or publishing later does not upgrade queued
+    dry-run jobs. Disabling permissions suppresses pending submissions.
+
+### Publication modes and verdicts
+
+`mode = "dry-run"` is the default, even when omitted. It runs the agents and
+stores a local proposal, but writes no GitHub comments, reviews, statuses or
+checks. Read the daemon log for the proposed event and use `roborev show` to
+inspect the underlying review. Proposals remain in the local publication
+journal.
+
+`mode = "publish"` enables formal `COMMENT` reviews. Approval and change
+requests need separate explicit opt-ins:
+
+| Setting | Behavior |
+| --- | --- |
+| `approve = true` | May submit `APPROVE` only when every panel member and the authoritative review explicitly pass with zero findings. |
+| `request_changes = true` | May submit `REQUEST_CHANGES` when the authoritative review explicitly fails with actionable findings. |
+| Both false | Submits `COMMENT`, including findings or a clean result. |
+
+A partial panel may comment, but never approve. Failed or missing synthesis,
+invalid output and unavailable reviewers do not become approvals. Findings
+currently appear in the review body; diff-validated inline comments are not
+implemented.
+
+The publisher rechecks the PR, requested reviewer, repository identity and exact
+head SHA. It pins `commit_id` to the reviewed commit. Personal reviews never use
+the quiet-hours exception for stale snapshot comments. Enable stale-approval
+dismissal in repository rules: GitHub does not provide an atomic conditional
+review submission, so a later push can still race with publication.
+
+### Submission recovery and safety
+
+The daemon persists an immutable operation before calling GitHub and embeds its
+marker in the formal review. After a lost response or restart it searches for
+that same operation, actor, commit and event before marking it delivered.
+
+If acceptance is uncertain and no matching review can be confirmed, it does
+**not** automatically resend. Inspect the remote PR and local publication
+journal before intervening. The local-only SQLite tables
+`personal_review_publications` and `personal_review_requests` are not synced to
+other machines. This is not an exactly-once guarantee across independent
+daemons.
+
+Personal agent and synthesis subprocesses use the existing CI credential/helper
+filtering. That filtering and disposable worktrees are not a filesystem sandbox.
+Start with trusted contributors and keep publication credentials out of prompts.
+
+Do not run `roborev update` on a distributed fork build until its release source
+has been configured for the fork; the upstream updater can replace fork
+behavior. No background service is installed automatically by enabling these
+config keys. To stop this instance's CI reviews, set `ci.enabled = false`.
+Setting only `ci.personal.enabled = false` returns the instance to broad CI
+polling.
+
 ## Verifying It Works
 
 On startup you should see:

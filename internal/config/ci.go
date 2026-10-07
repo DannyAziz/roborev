@@ -101,6 +101,9 @@ type AgentReviewType struct {
 
 // CIConfig holds configuration for the CI poller that watches GitHub PRs
 type CIConfig struct {
+	// Personal scopes reviews to direct requests for a verified human identity.
+	Personal PersonalReviewConfig `toml:"personal"`
+
 	// Enabled enables the CI poller
 	Enabled bool `toml:"enabled"`
 

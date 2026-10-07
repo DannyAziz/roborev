@@ -164,6 +164,24 @@ CREATE TABLE IF NOT EXISTS ci_pr_review_attempts (
   UNIQUE(github_repo, pr_number, head_sha)
 );
 
+CREATE TABLE IF NOT EXISTS personal_review_requests (
+  github_repo TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  reviewer TEXT NOT NULL,
+  requested INTEGER NOT NULL,
+  PRIMARY KEY(github_repo, pr_number, reviewer)
+);
+
+-- Personal publication intents are local-only and are not sync-replicated.
+-- An immutable request is persisted before calling GitHub, so an ambiguous
+-- POST can never be blindly retried after a crash.
+CREATE TABLE IF NOT EXISTS personal_review_publications (
+  panel_run_uuid TEXT PRIMARY KEY,
+  submission_json TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN ('sending', 'uncertain', 'submitted', 'preview')),
+  review_id INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS daemon_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

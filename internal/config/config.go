@@ -717,6 +717,9 @@ func (c *Config) Validate() (err error) {
 	if err := validateSearchConfig(c.Search); err != nil {
 		return err
 	}
+	if err := c.CI.Personal.Validate(c); err != nil {
+		return err
+	}
 	reasoning := []namedConfigValue{
 		{key: "review_reasoning", value: c.ReviewReasoning},
 		{key: "refine_reasoning", value: c.RefineReasoning},

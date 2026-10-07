@@ -906,6 +906,16 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	// fail before an agent starts and synthesis paths that do not invoke one.
 	defer wp.outputBuffers.CloseJob(job.ID)
 
+	if job.IsCIReview() {
+		protected, cleanup, err := agent.WithCIReview(ctx)
+		if err != nil {
+			wp.failOrRetryContext(ctx, workerID, job, job.Agent, err.Error())
+			return
+		}
+		defer cleanup()
+		ctx = protected
+	}
+
 	jobUUID := uuid.Nil()
 	if job.UUID != nil {
 		jobUUID = *job.UUID
@@ -1862,7 +1872,8 @@ func failoverWorkflow(job *storage.ReviewJob) string {
 
 // resolveBackupAgent determines the backup agent for a job. A frozen
 // experiment plan is authoritative, including an explicit empty backup.
-// Ordinary jobs retain the workflow-config fallback.
+// Personal CI jobs use only a stored, locally resolved backup. Ordinary jobs
+// retain the workflow-config fallback.
 func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	// An explicit per-job backup wins, for reliability: the enqueuer (e.g. a CI
 	// panel synthesis) chose this failover deliberately. Canonicalize the alias
@@ -1878,6 +1889,9 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 			return resolved.Name()
 		}
 		return job.BackupAgent
+	}
+	if policy, err := personalJobPolicy(job); err != nil || policy != nil {
+		return ""
 	}
 	if job.JobType == storage.JobTypeSynthesis {
 		return ""
@@ -1924,6 +1938,9 @@ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
 	}
 	if job.BackupAgent != "" {
 		return job.BackupModel
+	}
+	if policy, err := personalJobPolicy(job); err != nil || policy != nil {
+		return ""
 	}
 	if job.JobType == storage.JobTypeSynthesis {
 		return ""

@@ -12,11 +12,15 @@ import (
 
 type ciPanelMemberConfig struct {
 	config.ResolvedMember
-	ACP config.ACPAgentConfigs `json:"acp,omitempty"`
+	ACP      config.ACPAgentConfigs       `json:"acp,omitempty"`
+	Personal *config.PersonalReviewConfig `json:"personal,omitempty"`
 }
 
 type ciACPExecutionConfig struct {
-	ACP config.ACPAgentConfigs `json:"acp,omitempty"`
+	ACP      config.ACPAgentConfigs       `json:"acp,omitempty"`
+	Personal *config.PersonalReviewConfig `json:"personal,omitempty"`
+	// Freeze completeness independently of rows that may later be purged.
+	PersonalMemberCount int `json:"personal_member_count,omitempty"`
 }
 
 func snapshotACPExecutionConfig(
