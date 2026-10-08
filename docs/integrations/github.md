@@ -486,12 +486,15 @@ Personal agent and synthesis subprocesses use the existing CI credential/helper
 filtering. That filtering and disposable worktrees are not a filesystem sandbox.
 Start with trusted contributors and keep publication credentials out of prompts.
 
-Do not run `roborev update` on a distributed fork build until its release source
-has been configured for the fork; the upstream updater can replace fork
-behavior. No background service is installed automatically by enabling these
-config keys. To stop this instance's CI reviews, set `ci.enabled = false`.
-Setting only `ci.personal.enabled = false` returns the instance to broad CI
-polling.
+Build a personal service binary with
+`-ldflags '-X go.kenn.io/roborev/internal/update.selfUpdatesDisabled=true'`.
+This disables upstream update checks and installation, including
+`update --force`. Update these binaries by rebuilding from fork source. Builds
+without this flag still use the upstream updater and must not be distributed for
+personal automation. No background service is installed automatically by
+enabling these config keys. To stop this instance's CI reviews, set
+`ci.enabled = false`. Setting only `ci.personal.enabled = false` returns the
+instance to broad CI polling.
 
 ## Verifying It Works
 

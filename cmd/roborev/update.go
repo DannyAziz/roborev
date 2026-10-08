@@ -799,6 +799,9 @@ official release over a dev build.
 Use --no-restart when daemon lifecycle is managed externally (for example,
 launchd or systemd).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if update.SelfUpdatesDisabled() {
+				return fmt.Errorf("self-updates are disabled for this build; rebuild from fork source")
+			}
 			policy, err := parseRunningReviewPolicy(runningPolicy)
 			if err != nil {
 				return err

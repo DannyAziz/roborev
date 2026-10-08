@@ -31,6 +31,11 @@ const (
 	downloadTimeout      = 30 * time.Minute
 )
 
+// Set to true via -ldflags for fork builds that must never install upstream.
+var selfUpdatesDisabled = "false"
+
+func SelfUpdatesDisabled() bool { return selfUpdatesDisabled == "true" }
+
 type UpdateInfo = selfupdate.Info
 
 type Reporter interface {
@@ -39,15 +44,16 @@ type Reporter interface {
 }
 
 type Deps struct {
-	Client           *http.Client
-	Now              func() time.Time
-	Version          string
-	GOOS             string
-	GOARCH           string
-	CacheDir         func() string
-	Executable       func() (string, error)
-	GitHubAPIBaseURL string
-	GitHubBaseURL    string
+	DisableSelfUpdate bool
+	Client            *http.Client
+	Now               func() time.Time
+	Version           string
+	GOOS              string
+	GOARCH            string
+	CacheDir          func() string
+	Executable        func() (string, error)
+	GitHubAPIBaseURL  string
+	GitHubBaseURL     string
 }
 
 type Updater struct {
@@ -87,6 +93,7 @@ func GetCacheDir() string {
 }
 
 func NewUpdater(deps Deps) *Updater {
+	deps.DisableSelfUpdate = deps.DisableSelfUpdate || SelfUpdatesDisabled()
 	if deps.Client == nil {
 		deps.Client = defaultHTTPClient()
 	}
@@ -119,6 +126,9 @@ func defaultUpdater() *Updater {
 }
 
 func (u *Updater) CheckForUpdate(forceCheck bool) (*UpdateInfo, error) {
+	if u.deps.DisableSelfUpdate {
+		return nil, nil
+	}
 	if selfupdate.IsDevBuildVersion(u.deps.Version) && !forceCheck {
 		return nil, nil
 	}
@@ -315,6 +325,9 @@ func (u *Updater) PerformUpdate(info *UpdateInfo, reporter Reporter) error {
 func (u *Updater) PerformUpdateContext(
 	ctx context.Context, info *UpdateInfo, reporter Reporter,
 ) error {
+	if u.deps.DisableSelfUpdate {
+		return fmt.Errorf("self-updates are disabled for this build; rebuild from fork source")
+	}
 	reporter = normalizeReporter(reporter)
 	if info == nil {
 		return fmt.Errorf("update info is nil")
