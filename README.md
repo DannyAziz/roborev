@@ -17,6 +17,11 @@ last_edited: 2026-09-17
 > requests, clone the `personal-reviews` branch and follow the
 > [personal setup guide](docs/integrations/personal-reviews-setup.md).
 > Each user supplies their own credentials and config; start in dry-run mode.
+>
+> **Agent-assisted setup:** Tell your agent: “Get this ready for me. Read
+> `AGENTS.md` and follow `docs/integrations/personal-reviews-agent-setup.md`.”
+> The agent collects your choices, verifies access, builds an isolated binary,
+> and asks before enabling publishing or a background service.
 
 Continuous code review for AI coding agents. roborev runs in the
 background, reviews every commit as agents write code, and surfaces

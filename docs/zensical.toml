@@ -29,6 +29,7 @@ nav = [
   {"Supported Agents" = "agents/index.md"},
   {"GitHub Integration" = "integrations/github.md"},
   {"Personal Review Setup (Fork)" = "integrations/personal-reviews-setup.md"},
+  {"Agent Setup Runbook (Fork)" = "integrations/personal-reviews-agent-setup.md"},
   {"GitLab Integration" = "integrations/gitlab.md"},
   {"Guides" = [
     {"Reviewing Code" = "guides/reviewing-code.md"},

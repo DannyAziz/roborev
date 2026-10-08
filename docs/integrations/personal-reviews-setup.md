@@ -8,6 +8,19 @@ credentials.
 The implementation is on the `personal-reviews` branch. Do not install the
 upstream release binary: it does not include this feature.
 
+## Ask an agent to set it up
+
+Point your agent at this fork's `personal-reviews` branch and say:
+
+> Get this ready for me. Read `AGENTS.md` and follow
+> `docs/integrations/personal-reviews-agent-setup.md`. Ask for any missing
+> choices and verify a dry run before enabling live publishing or a background
+> service.
+
+The [agent runbook](personal-reviews-agent-setup.md) defines the setup sequence,
+authorization gates, verification and handoff. Supply your repository allowlist
+and preferred harness/rubric if you already know them.
+
 ## Clone and build
 
 Install Go 1.27 or later, GitHub CLI, and your preferred review harness first.

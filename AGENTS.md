@@ -6,6 +6,15 @@ This repo hosts roborev, a local daemon + CLI for AI-assisted code review. Use t
 navigate the codebase quickly, understand subsystem boundaries, and avoid missing adjacent
 changes when working in a growing Go project.
 
+## Personal Review Setup Requests
+
+When the user asks to “get this ready for me”, install personal requested-review
+automation, or change its publishing mode, read and follow
+`docs/integrations/personal-reviews-agent-setup.md` before running setup commands.
+That runbook owns operator setup and authorization gates; preparation alone does
+not authorize live GitHub reviews or a persistent service. Setup does not require
+source edits, commits, hooks, or modifying an existing production installation.
+
 ## Start Here
 
 - Product behavior and user-facing workflows: `README.md`
