@@ -13,6 +13,11 @@ last_edited: 2026-09-17
 
 **[Documentation](https://roborev.io/docs/)** | **[Quick Start](https://roborev.io/docs/quickstart/)** | **[Installation](https://roborev.io/docs/installation/)**
 
+> **Personal-review fork:** For reviews triggered by direct GitHub review
+> requests, clone the `personal-reviews` branch and follow the
+> [personal setup guide](docs/integrations/personal-reviews-setup.md).
+> Each user supplies their own credentials and config; start in dry-run mode.
+
 Continuous code review for AI coding agents. roborev runs in the
 background, reviews every commit as agents write code, and surfaces
 issues in seconds -- before they compound. Pull code reviews into

@@ -49,8 +49,17 @@ docs/site/
 docs/assets/static/
 docs/assets/generated/
 
-# Local config (users create their own)
+# Local config and personal review state (keep runtime data outside this checkout)
 .roborev.toml
+/config.toml
+/personal-review-state/
+*.log
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 
 .gocache
 .golangci-lint-cache/
