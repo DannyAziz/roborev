@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,6 +33,13 @@ const (
 // HostAgent hands the review to the model driving the current shell through
 // prompt.md, schema.json and instructions.md in a fresh job directory, then
 // waits for the host to rename its answer into answer.md.
+//
+// Agentic mode and allow_unsafe_agents do not apply: host does not run a
+// shell agent, so those settings add no tools. The handoff is a
+// prompt-injection surface. prompt.md contains the review prompt, including
+// the change under review, and the attached model is asked to follow it.
+// Anyone who can write the handoff directory can replace that prompt or
+// plant answer.md, which roborev reads as the review.
 type HostAgent struct {
 	Dir          string
 	Timeout      time.Duration
@@ -43,7 +51,13 @@ type HostAgent struct {
 
 func (a *HostAgent) Name() string                       { return hostAgentName }
 func (a *HostAgent) WithReasoning(ReasoningLevel) Agent { return a }
-func (a *HostAgent) WithAgentic(bool) Agent             { return a }
+
+// WithAgentic ignores agentic mode. Host has no tool sandbox to open, and
+// allow_unsafe_agents does not change the handoff.
+func (a *HostAgent) WithAgentic(bool) Agent {
+	return a
+}
+
 func (a *HostAgent) WithModel(model string) Agent {
 	c := *a
 	c.Model = strings.TrimSpace(model)
@@ -127,6 +141,7 @@ func (a *HostAgent) handoff(ctx context.Context, repoPath, gitRef, prompt string
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return "", fmt.Errorf("host agent: create handoff dir: %w", err)
 	}
+	warnIfSharedHostDir(base)
 	jobDir, err := os.MkdirTemp(base, hostJobLabel(gitRef)+"-")
 	if err != nil {
 		return "", fmt.Errorf("host agent: create job dir: %w", err)
@@ -200,6 +215,25 @@ func writeSyncedTemp(dir, name string, data []byte, final string) error {
 // when the filesystem rejects the flag instead of falling back to a replacing
 // rename. Tests replace it to simulate that unsupported-flag error.
 var renameHandoffFile = atomicfile.RenameNoReplace
+
+// warnIfSharedHostDir logs when ROBOREV_HOST_DIR is the handoff directory and
+// group or world writable. Another user could then edit prompt.md or plant
+// answer.md.
+func warnIfSharedHostDir(dir string) {
+	configured := strings.TrimSpace(os.Getenv("ROBOREV_HOST_DIR"))
+	if configured == "" || filepath.Clean(configured) != filepath.Clean(dir) {
+		return
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o022 == 0 {
+		return
+	}
+	log.Printf("Warning: ROBOREV_HOST_DIR %s is group- or world-writable (mode %#o); another user can edit the handoff prompt or plant answer.md", dir, perm)
+}
 
 // HostTimeoutError is the host handoff timeout, distinct from the job timeout.
 type HostTimeoutError struct {

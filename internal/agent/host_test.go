@@ -714,6 +714,53 @@ func TestHostAgentRefusesPlantedHandoffFile(t *testing.T) {
 	assert.Equal(t, "planted", readFileString(filepath.Join(dir, "schema.json")))
 }
 
+func TestHostIgnoresAgenticMode(t *testing.T) {
+	a := &HostAgent{}
+	assert.Same(t, a, a.WithAgentic(true))
+	assert.Same(t, a, a.WithAgentic(false))
+}
+
+func TestHostWarnsWhenHostDirIsGroupOrWorldWritable(t *testing.T) {
+	for _, mode := range []os.FileMode{0o700, 0o755, 0o750, 0o770, 0o707, 0o777, 0o702} {
+		t.Run(mode.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.Chmod(dir, mode))
+			t.Setenv("ROBOREV_HOST_DIR", dir)
+			buf := captureLog(t)
+			handoffs := fakeHost(t, dir, answerWith("ok"))
+
+			out, err := (&HostAgent{Timeout: 5 * time.Second, PollInterval: 5 * time.Millisecond}).Review(
+				context.Background(), "/repo", "HEAD", "prompt", nil,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, "ok", out)
+			<-handoffs
+
+			if mode&0o022 != 0 {
+				assert.Contains(t, buf.String(), "ROBOREV_HOST_DIR")
+				assert.Contains(t, buf.String(), "group- or world-writable")
+				assert.Contains(t, buf.String(), dir)
+			} else {
+				assert.NotContains(t, buf.String(), "group- or world-writable")
+			}
+		})
+	}
+
+	t.Run("explicit dir is not the env var", func(t *testing.T) {
+		shared := t.TempDir()
+		require.NoError(t, os.Chmod(shared, 0o777))
+		t.Setenv("ROBOREV_HOST_DIR", shared)
+		private := t.TempDir()
+		buf := captureLog(t)
+		handoffs := fakeHost(t, private, answerWith("ok"))
+		out, err := hostTestAgent(private, 5*time.Second).Review(context.Background(), "/repo", "HEAD", "prompt", nil)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", out)
+		<-handoffs
+		assert.NotContains(t, buf.String(), "group- or world-writable")
+	})
+}
+
 func TestHostAgentCancel(t *testing.T) {
 	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
