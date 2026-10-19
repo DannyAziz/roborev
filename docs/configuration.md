@@ -1156,9 +1156,9 @@ filter_branch = false             # Show all branches on startup (default: curre
 Host reviews run only with the explicit marker `ROBOREV_HOST_AGENT=1`. Detecting
 a Cursor cloud agent (`CURSOR_AGENT=1` plus a `CLOUD_AGENT_*` variable) never
 substitutes for the marker: a named host, listings, and automatic picks all
-require `ROBOREV_HOST_AGENT=1`. Without the marker, an explicit host is an
-error and never falls back to a local agent. Failover skips `host` and tries
-the next agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
+require `ROBOREV_HOST_AGENT=1`. Without the marker, an explicit host is an error
+and never falls back to a local agent. Failover skips `host` and tries the next
+agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
 
 ### Review Search Embeddings
 
