@@ -145,6 +145,26 @@ func TestRerunSelectedAutoIsPinned(t *testing.T) {
 	require.Error(t, err, "auto with nothing available is an error, not a stored 'auto'")
 }
 
+// Rerun --agent auto must resolve the model as enqueue --agent auto does:
+// keep PreferredAgent as the auto keyword so Claude does not inherit the
+// configured Codex review_model. Mutant pin: pinning the name without
+// updating resolution.PreferredAgent leaves the workflow model in place.
+func TestRerunSelectedAutoDoesNotInheritWorkflowModel(t *testing.T) {
+	noHostMarker(t)
+	stubAgentPath(t, "claude")
+	cfg := config.DefaultConfig()
+	cfg.DefaultAgent = "codex"
+	cfg.ReviewModel = "gpt-5"
+	job := &storage.ReviewJob{
+		Agent: "codex", JobType: storage.JobTypeReview,
+		ReviewType: config.ReviewTypeDefault, RepoPath: t.TempDir(),
+	}
+	opts, err := resolveRerunOpts(job, cfg, nil, "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", opts.Agent)
+	assert.Empty(t, opts.Model)
+}
+
 func stubAgentPathWithGit(t *testing.T, commands ...string) {
 	t.Helper()
 	gitPath, err := exec.LookPath("git")

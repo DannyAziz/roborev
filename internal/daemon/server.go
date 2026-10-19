@@ -1053,6 +1053,10 @@ func resolveRerunOpts(
 		}
 		if agentname.IsAuto(selectedAgent) {
 			// Pin auto to the agent it resolved to, as enqueue does.
+			// Keep PreferredAgent as the auto keyword so model resolution
+			// uses autoSelectionModel instead of the configured primary's
+			// workflow model.
+			resolution.PreferredAgent = selectedAgent
 			selectedAgent = selected.Name()
 		}
 		storageName := agent.StorageNameFromConfig(
