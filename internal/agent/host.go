@@ -187,13 +187,19 @@ func writeSyncedTemp(dir, name string, data []byte, final string) error {
 	_, err = f.Write(data)
 	err = errors.Join(err, f.Sync(), f.Close())
 	if err == nil {
-		err = atomicfile.RenameNoReplace(f.Name(), final)
+		err = renameHandoffFile(f.Name(), final)
 	}
 	if err != nil {
 		_ = os.Remove(f.Name())
 	}
 	return err
 }
+
+// renameHandoffFile publishes a staged handoff file without replacing an
+// existing name. On Linux that is renameat2(RENAME_NOREPLACE), which fails
+// when the filesystem rejects the flag instead of falling back to a replacing
+// rename. Tests replace it to simulate that unsupported-flag error.
+var renameHandoffFile = atomicfile.RenameNoReplace
 
 // HostTimeoutError is the host handoff timeout, distinct from the job timeout.
 type HostTimeoutError struct {

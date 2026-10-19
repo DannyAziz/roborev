@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -661,6 +662,35 @@ func TestHandoffFilesArePublishedAtomically(t *testing.T) {
 		require.Len(t, entries, 1, "only the published file remains")
 		assert.Equal(t, name, entries[0].Name())
 	}
+}
+
+// writeHandoffFile lstats the destination and returns before the rename when
+// the name exists, so replacing RenameNoReplace with os.Rename stays green
+// there. writeSyncedTemp is the rename itself.
+func TestWriteSyncedTempRefusesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "prompt.md")
+	require.NoError(t, os.WriteFile(final, []byte("planted"), 0o600))
+
+	err := writeSyncedTemp(dir, "prompt.md", []byte("overwrite"), final)
+
+	require.Error(t, err)
+	switch runtime.GOOS {
+	case "linux", "darwin", "windows":
+		require.ErrorIs(t, err, fs.ErrExist)
+	default:
+		require.ErrorIs(t, err, errors.ErrUnsupported)
+	}
+	if runtime.GOOS == "linux" {
+		var linkErr *os.LinkError
+		require.ErrorAs(t, err, &linkErr)
+		assert.Equal(t, "renameat2", linkErr.Op)
+	}
+	assert.Equal(t, "planted", readFileString(final))
+	entries, readErr := os.ReadDir(dir)
+	require.NoError(t, readErr)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "prompt.md", entries[0].Name())
 }
 
 func TestHostAgentRefusesPlantedHandoffFile(t *testing.T) {
