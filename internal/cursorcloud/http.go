@@ -32,11 +32,43 @@ const listPageLimit = 100
 // Option configures an HTTP client.
 type Option func(*httpClient)
 
+// secret is an API key that fmt must not print. %v, %+v, %#v, and %s of a
+// secret, and of any client value that holds one, stay redacted.
+type secret string
+
+func (secret) String() string   { return "cursorcloud.secret(redacted)" }
+func (secret) GoString() string { return "cursorcloud.secret(redacted)" }
+
+func (secret) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, "cursorcloud.secret(redacted)")
+}
+
+func (k secret) value() string { return string(k) }
+
 type httpClient struct {
-	apiKey  string
+	apiKey  secret
 	baseURL string
 	hc      *http.Client
 	cfgErr  error
+}
+
+func (c *httpClient) String() string { return c.redactedSummary() }
+
+func (c *httpClient) GoString() string { return c.redactedSummary() }
+
+func (c *httpClient) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.redactedSummary())
+}
+
+func (c *httpClient) redactedSummary() string {
+	if c == nil {
+		return "cursorcloud.Client(nil)"
+	}
+	base := c.baseURL
+	if key := c.apiKey.value(); key != "" {
+		base = strings.ReplaceAll(base, key, "[REDACTED]")
+	}
+	return "cursorcloud.Client(base=" + base + ")"
 }
 
 // NewHTTPClient calls the Cursor Cloud Agents API at https://api.cursor.com.
@@ -44,7 +76,7 @@ type httpClient struct {
 // as a Basic Authorization header.
 func NewHTTPClient(apiKey string, opts ...Option) Client {
 	c := &httpClient{
-		apiKey:  strings.TrimSpace(apiKey),
+		apiKey:  secret(strings.TrimSpace(apiKey)),
 		baseURL: defaultBaseURL,
 		hc: &http.Client{
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -171,16 +203,6 @@ func (c *httpClient) FinalMessage(ctx context.Context, id string) (string, error
 	return "", errors.New("cursor cloud final message: no assistant message")
 }
 
-func (c *httpClient) ArchiveAgent(ctx context.Context, id string) error {
-	path, err := agentPath(id)
-	if err != nil {
-		return err
-	}
-	// v0 has no archive endpoint. DELETE /v0/agents/{id} permanently deletes
-	// the agent. https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
-	return c.do(ctx, "archive agent", http.MethodDelete, path, nil, nil)
-}
-
 func (c *httpClient) ListAgents(ctx context.Context) ([]Agent, error) {
 	cursor := ""
 	seen := map[string]struct{}{"": {}}
@@ -269,7 +291,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	if c.cfgErr != nil {
 		return c.cfgErr
 	}
-	if c.apiKey == "" {
+	if c.apiKey.value() == "" {
 		return errors.New("cursor cloud: API key is empty")
 	}
 	endpoint, err := c.endpoint(path)
@@ -330,7 +352,7 @@ func (c *httpClient) endpoint(path string) (string, error) {
 }
 
 func (c *httpClient) authorization() string {
-	token := base64.StdEncoding.EncodeToString([]byte(c.apiKey + ":"))
+	token := base64.StdEncoding.EncodeToString([]byte(c.apiKey.value() + ":"))
 	return "Basic " + token
 }
 
@@ -374,11 +396,12 @@ func parseAPIErrorBody(data []byte) (code, message string, ok bool) {
 }
 
 func (c *httpClient) redact(s string) string {
-	if c.apiKey == "" || s == "" {
+	key := c.apiKey.value()
+	if key == "" || s == "" {
 		return s
 	}
-	s = strings.ReplaceAll(s, c.apiKey, "[REDACTED]")
-	encoded := base64.StdEncoding.EncodeToString([]byte(c.apiKey + ":"))
+	s = strings.ReplaceAll(s, key, "[REDACTED]")
+	encoded := base64.StdEncoding.EncodeToString([]byte(key + ":"))
 	return strings.ReplaceAll(s, encoded, "[REDACTED]")
 }
 

@@ -47,13 +47,8 @@ func TestFakeLifecycleAndCalls(t *testing.T) {
 	listed, err := fake.ListAgents(ctx)
 	require.NoError(t, err)
 	require.Len(t, listed, 2)
-
-	require.NoError(t, fake.ArchiveAgent(ctx, created.ID))
-	listed, err = fake.ListAgents(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, []cursorcloud.Agent{other}, listed)
-	_, err = fake.GetAgent(ctx, created.ID)
-	require.ErrorContains(t, err, "not found")
+	assert.Equal(t, created.ID, listed[0].ID)
+	assert.Equal(t, other.ID, listed[1].ID)
 
 	calls := fake.Calls()
 	require.GreaterOrEqual(t, len(calls), 2)
@@ -78,8 +73,8 @@ func TestFakeDefaultFinalAndErrors(t *testing.T) {
 	assert.Equal(t, cursorcloud.StatusExpired, got.Status)
 
 	boom := errors.New("injected")
-	fake.MethodErrors = map[string]error{MethodArchive: boom}
-	err = fake.ArchiveAgent(ctx, "bc_seed")
+	fake.MethodErrors = map[string]error{MethodGet: boom}
+	_, err = fake.GetAgent(ctx, "bc_seed")
 	require.ErrorIs(t, err, boom)
 	listed, err := fake.ListAgents(ctx)
 	require.NoError(t, err)

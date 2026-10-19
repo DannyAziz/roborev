@@ -35,8 +35,5 @@ type Client interface {
 	// FinalMessage returns the agent's last assistant message (the review text).
 	// It returns an error when the conversation has no assistant_message.
 	FinalMessage(ctx context.Context, id string) (string, error)
-	// ArchiveAgent permanently deletes the agent. v0 has no archive call, so
-	// this is DELETE /v0/agents/{id}.
-	ArchiveAgent(ctx context.Context, id string) error
 	ListAgents(ctx context.Context) ([]Agent, error)
 }
