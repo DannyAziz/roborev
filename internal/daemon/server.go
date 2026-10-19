@@ -3180,9 +3180,14 @@ func (s *Server) enqueueSingleAgent(
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
-	o.BackupAgent = execution.BackupAgent
-	o.BackupModel = execution.BackupModel
+	// A named backup stays empty so failover still reads the current workflow
+	// config. An "auto" backup, and any backup frozen by an experiment, is
+	// pinned now and kept even when the pin is empty.
 	o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
+	if o.BackupAuto || in.experiment != nil {
+		o.BackupAgent = execution.BackupAgent
+		o.BackupModel = execution.BackupModel
+	}
 	if in.experiment != nil {
 		assignment, assignErr := storageAssignmentForExperiment(
 			in.experiment, experimentPlanForJob(o),
