@@ -298,7 +298,7 @@ func TestPostgresMigration_BackupColumns(t *testing.T) { //nolint:paralleltest /
 	pg := openTestPgPool(t)
 	defer pg.Close()
 
-	for _, col := range []string{"backup_agent", "backup_model"} {
+	for _, col := range []string{"backup_agent", "backup_model", "backup_auto"} {
 		var n int
 		require.NoError(t, pgxPool(pg).QueryRow(ctx, `
 			SELECT COUNT(*) FROM information_schema.columns
@@ -307,11 +307,13 @@ func TestPostgresMigration_BackupColumns(t *testing.T) { //nolint:paralleltest /
 		require.Equal(t, 1, n, "column %s should exist after v15 upgrade", col)
 	}
 
-	// The pre-existing row survived and backfilled to '' (NOT NULL DEFAULT '').
+	// The pre-existing row survived and backfilled to '' / false (NOT NULL DEFAULT).
 	var ba, bm string
+	var auto bool
 	require.NoError(t, pgxPool(pg).QueryRow(ctx,
-		`SELECT backup_agent, backup_model FROM roborev.review_jobs WHERE git_ref = 'pre-backup'`,
-	).Scan(&ba, &bm))
+		`SELECT backup_agent, backup_model, backup_auto FROM roborev.review_jobs WHERE git_ref = 'pre-backup'`,
+	).Scan(&ba, &bm, &auto))
 	require.Empty(t, ba)
 	require.Empty(t, bm)
+	require.False(t, auto)
 }
