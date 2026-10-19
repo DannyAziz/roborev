@@ -156,6 +156,7 @@ type ReviewJob struct {
 	ReusableSessionTarget string `json:"-"`
 
 	BudgetRoutingLocked       bool   `json:"-"` // Local retry/failover scheduling guard
+	BackupAuto                bool   `json:"-"` // BackupAgent is an "auto" pin, even if empty
 	BudgetOriginalAgent       string `json:"-"` // Pre-budget choice restored on manual rerun
 	BudgetOriginalBackupAgent string `json:"-"`
 	BudgetOriginalBackupModel string `json:"-"`

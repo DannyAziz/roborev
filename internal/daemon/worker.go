@@ -21,6 +21,7 @@ import (
 	gitworktree "go.kenn.io/kit/git/worktree"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
 	gitpkg "go.kenn.io/roborev/internal/git"
@@ -1904,6 +1905,16 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	if job.FrozenExperimentPlan != nil && job.BackupAgent == "" {
 		return ""
 	}
+	if job.BackupAuto && (job.BackupAgent == "" ||
+		agent.CanonicalName(job.BackupAgent) == "host" && !agent.HostAllowed(agent.HostAuto)) {
+		// An "auto" pin is final, even an empty one. A host that auto pinned
+		// under ROBOREV_HOST_AGENT=1 runs only while that marker is still
+		// set: a Cursor cloud agent alone never makes host an automatic pick.
+		return ""
+	}
+	if agentname.IsAuto(job.BackupAgent) {
+		return wp.resolveAutoBackupAgent(job)
+	}
 	if job.BackupAgent != "" {
 		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
 			return ""
@@ -1934,6 +1945,9 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	if backup == "" {
 		return ""
 	}
+	if agentname.IsAuto(backup) {
+		return wp.resolveAutoBackupAgent(job)
+	}
 	// Resolve exactly the configured backup using the config-aware path so
 	// command overrides and configured ACP aliases participate in failover
 	// without falling through to unrelated agents.
@@ -1950,9 +1964,13 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	return resolved.Name()
 }
 
-// skippedHostBackupNote names the marker when the job's stored or workflow
-// backup is host but this daemon has no host model.
+// skippedHostBackupNote explains a missing backup on the final error: a
+// stored or workflow host backup this daemon cannot run, or an "auto" backup
+// that found no agent.
 func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
+	if job.BackupAuto && job.BackupAgent == "" {
+		return fmt.Sprintf("\nbackup %q found no available agent when the job was queued", agentname.Auto)
+	}
 	backup := job.BackupAgent
 	if backup == "" && job.FrozenExperimentPlan == nil {
 		configRoot := job.RepoPath
@@ -1963,7 +1981,54 @@ func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
 			backup = res.BackupAgent
 		}
 	}
+	if agentname.IsAuto(backup) && !job.BudgetRoutingLocked {
+		if wp.resolveAutoBackupAgent(job) == "" {
+			return agent.AutoBackupNotFound()
+		}
+	}
 	return agent.SkippedHostBackupNote(backup)
+}
+
+// resolveAutoBackupAgent resolves an "auto" backup to a concrete agent other
+// than the one that just failed and able to run the job. FailoverJob resets
+// retry_count and sets budget_routing_locked, so a job that already failed
+// over (or was rerouted) does not hop again: re-resolving auto there could
+// pick the agent that failed first and loop between the two with fresh
+// retries.
+func (wp *WorkerPool) resolveAutoBackupAgent(job *storage.ReviewJob) string {
+	if job.BudgetRoutingLocked {
+		return ""
+	}
+	configRoot := job.RepoPath
+	if job.IsGoalReviewJob() {
+		configRoot = GoalReviewConfigRepoPath(job)
+	}
+	var repoCfg *config.RepoConfig
+	if strings.TrimSpace(configRoot) != "" {
+		repoCfg, _ = config.LoadRepoConfig(configRoot)
+	}
+	return agent.ResolveAutoBackup(repoCfg, wp.cfgGetter.Config(), job.Agent, autoBackupEligible(job.ReviewType))
+}
+
+// autoBackupEligible accepts the agents that can run a job of reviewType:
+// goal reviews need a goal-review agent, custom reviews structured output.
+func autoBackupEligible(reviewType string) func(string) bool {
+	return func(name string) bool {
+		a, err := agent.Get(name)
+		if err != nil {
+			return false
+		}
+		if reviewType == config.ReviewTypeGoal {
+			return goalreview.ValidateAgent(a) == nil
+		}
+		return agent.ValidateStructuredReviewSelection(reviewType, a) == nil
+	}
+}
+
+// backupIsAuto reports whether workflow's backup is "auto", which enqueue
+// pins; the job records that so the pin, even an empty one, stays final.
+func backupIsAuto(repoCfg *config.RepoConfig, cfg *config.Config, workflow string) bool {
+	return agentname.IsAuto(config.ResolveBackupAgentForWorkflowFromConfig(repoCfg, cfg, workflow))
 }
 
 // resolveBackupModel returns the frozen experiment value when present.
@@ -1974,6 +2039,9 @@ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
 	// different agent (the user's F7 guardrail).
 	if job.FrozenExperimentPlan != nil {
 		return job.BackupModel
+	}
+	if agentname.IsAuto(job.BackupAgent) {
+		return ""
 	}
 	if job.BackupAgent != "" {
 		return job.BackupModel
@@ -1996,7 +2064,7 @@ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
 		return ""
 	}
 	backup := strings.TrimSpace(resolution.BackupAgent)
-	if backup == "" {
+	if backup == "" || agentname.IsAuto(backup) {
 		return ""
 	}
 	// Resolve the model for the concrete backup agent through the same

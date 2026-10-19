@@ -43,6 +43,9 @@ func (b BudgetConfig) Validate() error {
 		if canonical == "test" {
 			return fmt.Errorf("budget.agent_costs: the test agent cannot be used for budget routing")
 		}
+		if canonical == agentname.Auto {
+			return fmt.Errorf("budget.agent_costs: %q is a selection keyword, not an agent", agentname.Auto)
+		}
 		if canonical == "host" {
 			return fmt.Errorf("budget.agent_costs: the host agent cannot be used for budget routing")
 		}

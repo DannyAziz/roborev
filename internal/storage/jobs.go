@@ -102,6 +102,7 @@ type EnqueueOpts struct {
 	// backup agent/model when the worker fails this job over to a backup.
 	BackupAgent string
 	BackupModel string
+	BackupAuto  bool // BackupAgent is the enqueue-time pin of an "auto" backup
 	// Panel relation (subagent review panels).
 	PanelRunUUID          *uuid.UUID                 // Groups member + synthesis jobs of one run
 	PanelRole             string                     // "", "member", or "synthesis"
@@ -310,8 +311,8 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 			status, job_type, review_type, patch_id, diff_content, dirty_files, prompt, agentic, prompt_prebuilt, output_prefix,
 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, non_voting, claim_blocked, source,
-			analysis_type, analysis_files, analysis_commit_sha)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			analysis_type, analysis_files, analysis_commit_sha, backup_auto)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
 		sessionResumedInt, opts.ResumeSourceJobUUID,
 		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
@@ -321,7 +322,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		uid, machineID, nowStr, opts.WorktreePath, normalizeMinSeverityForWrite(opts.MinSeverity), opts.BackupAgent, opts.BackupModel,
 		opts.PanelRunUUID, nullString(opts.PanelRole), nullString(opts.PanelName),
 		nullString(opts.PanelMemberName), opts.PanelMemberIndex, nullString(opts.PanelMemberConfigJSON), nonVotingInt, claimBlockedInt, nullString(opts.Source),
-		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA))
+		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA), opts.BackupAuto)
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +362,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		MinSeverity:           normalizeMinSeverityForWrite(opts.MinSeverity),
 		BackupAgent:           opts.BackupAgent,
 		BackupModel:           opts.BackupModel,
+		BackupAuto:            opts.BackupAuto,
 		PanelRunUUID:          opts.PanelRunUUID,
 		PanelRole:             opts.PanelRole,
 		PanelName:             opts.PanelName,

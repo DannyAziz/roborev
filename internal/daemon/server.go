@@ -30,6 +30,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/agenthook"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
@@ -1049,6 +1050,10 @@ func resolveRerunOpts(
 			if err := goalreview.ValidateAgent(selected); err != nil {
 				return storage.ReenqueueOpts{}, err
 			}
+		}
+		if agentname.IsAuto(selectedAgent) {
+			// Pin auto to the agent it resolved to, as enqueue does.
+			selectedAgent = selected.Name()
 		}
 		storageName := agent.StorageNameFromConfig(
 			agent.CanonicalName(selectedAgent), resolution.RepoConfig, cfg,
@@ -3143,7 +3148,7 @@ func (s *Server) resolveSingleAgent(
 		return resolvedSingleAgent{}, out
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, agentName, in.repoCfg, in.cfg,
+		resolution, in.req.ReviewType, agentName, in.repoCfg, in.cfg,
 	)
 	return resolvedSingleAgent{
 		Agent:       agentName,
@@ -3174,6 +3179,7 @@ func (s *Server) enqueueSingleAgent(
 	if in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
 		o.BackupModel = execution.BackupModel
+		o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
 		assignment, assignErr := storageAssignmentForExperiment(
 			in.experiment, experimentPlanForJob(o),
 		)
@@ -3686,6 +3692,8 @@ func (s *Server) humaFixJob(
 		Agentic:      true,
 		Label:        fmt.Sprintf("fix #%d", req.ParentJobID),
 		JobType:      storage.JobTypeFix,
+		BackupAgent:  pinnedAutoBackup(resolution, "", agentName),
+		BackupAuto:   agentname.IsAuto(resolution.BackupAgent),
 		ParentJobID:  req.ParentJobID,
 		WorktreePath: worktreePath,
 		MinSeverity:  fixMinSev,

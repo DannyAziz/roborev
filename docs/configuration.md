@@ -1095,8 +1095,8 @@ filter_branch = false             # Show all branches on startup (default: curre
 
 | Option | Type | Default | Description | Hot-Reload |
 |--------|------|---------|-------------|------------|
-| `default_agent` | string | auto-detect | Default AI agent to use | Yes |
-| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
+| `default_agent` | string | auto-detect | Default AI agent to use. `auto` uses the availability order (with `host` as the last resort only under `ROBOREV_HOST_AGENT=1`) and pairs `default_model` only when it lands on `default_agent` (a workflow model beside `auto` is never paired). `host` hands reviews to an attached host model and runs only when named here or as a backup, with `ROBOREV_HOST_AGENT=1` or inside a Cursor cloud agent where reviews run; listings show it only with `ROBOREV_HOST_AGENT=1` | Yes |
+| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `auto` picks the first available agent, other than the primary, that can run the job, with no model; `host` is that last resort only under `ROBOREV_HOST_AGENT=1`. CI, panel, fix and goal reviews pin that choice when queued and keep it, even when nothing was found; other jobs resolve it at failover | Yes |
 | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
@@ -1152,6 +1152,8 @@ filter_branch = false             # Show all branches on startup (default: curre
     If you have it set and `hide_closed_by_default` is not present, the old value is
     used automatically. No action is required, but new configs should use the new
     name.
+
+Host as an automatic pick: `host` is auto-eligible (an `auto` agent or backup, a CI or fix pin, the last resort of a failover) only with the explicit marker `ROBOREV_HOST_AGENT=1`. Detecting a Cursor cloud agent (`CURSOR_AGENT=1` plus a `CLOUD_AGENT_*` variable) never makes `host` an automatic pick; there it runs only when named. Without the marker, failover skips `host` and tries the next agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
 
 ### Review Search Embeddings
 
