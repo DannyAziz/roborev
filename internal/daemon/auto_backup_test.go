@@ -173,6 +173,72 @@ func TestFixJobPinsAutoBackup(t *testing.T) {
 	assert.True(t, stored.BackupAuto, "the pin records that it came from auto")
 }
 
+// Ordinary /api/enqueue pins an "auto" backup and the worker honors that
+// pin. Mutant pin: if BackupAgent/BackupAuto are only set when
+// experiment != nil, these jobs store BackupAuto false and failover
+// re-resolves auto from workflow config.
+func TestOrdinaryEnqueuePinsAutoBackup(t *testing.T) {
+	t.Run("stores and uses a concrete pin", func(t *testing.T) {
+		noHostMarker(t)
+		server, db, _ := newTestServer(t)
+		cfg := server.configWatcher.Config()
+		cfg.DefaultBackupAgent = "auto"
+		stubAgentPathWithGit(t, "claude")
+		repo := testutil.NewGitRepo(t)
+		repo.CommitFile("main.go", "package main\n", "add main")
+		job := enqueueViaHTTP(t, server, EnqueueRequest{
+			RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test", Panel: config.PanelNone,
+		})
+		stored, err := db.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "test", stored.Agent)
+		assert.Equal(t, "claude-code", stored.BackupAgent, "auto is pinned at ordinary enqueue")
+		assert.Empty(t, stored.BackupModel)
+		assert.True(t, stored.BackupAuto, "the pin records that it came from auto")
+
+		cfg.DefaultBackupAgent = ""
+		pool := NewWorkerPool(db, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+		claimed, err := db.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, claimed, claimed.Agent, "test broke")
+		final, err := db.GetJobByID(claimed.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusQueued, final.Status)
+		assert.Equal(t, "claude-code", final.Agent, "the stored pin is used, not the emptied workflow backup")
+	})
+
+	t.Run("empty pin stays frozen", func(t *testing.T) {
+		noHostMarker(t)
+		server, db, _ := newTestServer(t)
+		cfg := server.configWatcher.Config()
+		cfg.DefaultBackupAgent = "auto"
+		stubAgentPathWithGit(t)
+		repo := testutil.NewGitRepo(t)
+		repo.CommitFile("main.go", "package main\n", "add main")
+		job := enqueueViaHTTP(t, server, EnqueueRequest{
+			RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test", Panel: config.PanelNone,
+		})
+		stored, err := db.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "test", stored.Agent)
+		assert.Empty(t, stored.BackupAgent)
+		assert.True(t, stored.BackupAuto)
+
+		stubAgentPathWithGit(t, "claude")
+		pool := NewWorkerPool(db, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+		claimed, err := db.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, claimed, claimed.Agent, "test broke")
+		final, err := db.GetJobByID(claimed.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusFailed, final.Status)
+		assert.Equal(t, "test", final.Agent, "the empty pin is not re-resolved")
+		assert.Contains(t, final.Error, "found no available agent when the job was queued")
+	})
+}
+
 // Goal-review enqueue pins an "auto" backup to a goal-capable agent.
 func TestGoalReviewPinsAutoBackup(t *testing.T) {
 	noHostMarker(t)

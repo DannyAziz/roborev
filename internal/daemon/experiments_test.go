@@ -249,7 +249,7 @@ func TestExperimentPersistsLocalReviewBackupPlans(t *testing.T) {
 	}
 }
 
-func TestNonExperimentLocalReviewsKeepRuntimeBackupResolution(t *testing.T) {
+func TestNonExperimentLocalReviewsPinBackupAtEnqueue(t *testing.T) {
 	server, db, _ := newTestServer(t)
 	server.configWatcher.Config().ReviewBackupAgent = "claude-code"
 	server.configWatcher.Config().ReviewBackupModel = "runtime-backup-model"
@@ -260,8 +260,8 @@ func TestNonExperimentLocalReviewsKeepRuntimeBackupResolution(t *testing.T) {
 		RepoPath: standaloneRepo.Path(), GitRef: "HEAD",
 		Branch: "feature/standalone-backup", Agent: "test", Panel: config.PanelNone,
 	})
-	assert.Empty(t, job.BackupAgent)
-	assert.Empty(t, job.BackupModel)
+	assert.Equal(t, "claude-code", job.BackupAgent)
+	assert.Equal(t, "runtime-backup-model", job.BackupModel)
 
 	panelRepo := testutil.NewGitRepo(t)
 	panelRepo.WriteFile(".roborev.toml", panelTOML)

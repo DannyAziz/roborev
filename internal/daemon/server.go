@@ -3176,10 +3176,10 @@ func (s *Server) enqueueSingleAgent(
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
+	o.BackupAgent = execution.BackupAgent
+	o.BackupModel = execution.BackupModel
+	o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
 	if in.experiment != nil {
-		o.BackupAgent = execution.BackupAgent
-		o.BackupModel = execution.BackupModel
-		o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
 		assignment, assignErr := storageAssignmentForExperiment(
 			in.experiment, experimentPlanForJob(o),
 		)
