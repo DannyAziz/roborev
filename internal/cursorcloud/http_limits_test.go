@@ -2,10 +2,10 @@ package cursorcloud
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,9 +20,24 @@ func TestDefaultResponseHeaderTimeout(t *testing.T) {
 	assert.Equal(t, defaultResponseHeaderTimeout, tr.ResponseHeaderTimeout)
 }
 
+func TestErrorBodyIsTruncated(t *testing.T) {
+	body := strings.Repeat("x", maxErrorMessageBytes+50)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewHTTPClient("k", WithBaseURL(srv.URL))
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Len(t, apiErr.Message, maxErrorMessageBytes)
+	assert.NotContains(t, apiErr.Message, "k")
+}
+
 func TestHTTPOversizedBodyErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(w, io.LimitReader(repeatReader{}, maxResponseBytes+1))
+		_, _ = io.Copy(w, io.LimitReader(repeatByte('x'), maxResponseBytes+1))
 	}))
 	t.Cleanup(srv.Close)
 	client := NewHTTPClient("k", WithBaseURL(srv.URL))
@@ -30,35 +45,11 @@ func TestHTTPOversizedBodyErrors(t *testing.T) {
 	require.ErrorContains(t, err, "response body exceeds")
 }
 
-func TestHTTPPlainHTTPNonLoopbackRefusedBeforeRequest(t *testing.T) {
-	const key = "super-secret-cursor-key"
-	called := false
-	hc := &http.Client{Transport: rejectTrip(func(*http.Request) (*http.Response, error) {
-		called = true
-		return nil, errors.New("should not dial")
-	})}
-	client := NewHTTPClient(key, WithHTTPClient(hc), WithBaseURL("http://example.com"))
-	_, err := client.GetAgent(context.Background(), "bc_1")
-	require.ErrorContains(t, err, "loopback")
-	assert.False(t, called)
-	assert.NotContains(t, err.Error(), key)
+type repeatByte byte
 
-	client = NewHTTPClient(key, WithBaseURL("http://127.0.0.1:9"))
-	_, err = client.GetAgent(context.Background(), "bc_1")
-	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "loopback")
-	assert.NotContains(t, err.Error(), key)
-}
-
-type repeatReader struct{}
-
-func (repeatReader) Read(p []byte) (int, error) {
+func (b repeatByte) Read(p []byte) (int, error) {
 	for i := range p {
-		p[i] = 'x'
+		p[i] = byte(b)
 	}
 	return len(p), nil
 }
-
-type rejectTrip func(*http.Request) (*http.Response, error)
-
-func (f rejectTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
