@@ -1162,13 +1162,13 @@ marker, an explicit host is an error, failover skips `host` and tries the next
 agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
 
 `host` ignores agentic mode and `allow_unsafe_agents`. It does not run a shell
-agent, so those settings do not give it tools. The handoff is a
-prompt-injection surface: `prompt.md` contains the review prompt, including the
-change under review, and the attached model is asked to follow it. A commit can
-put instructions in that change. Anyone who can write the handoff directory can
-also replace `prompt.md` or plant `answer.md`, which roborev reads as the
-review. Point `ROBOREV_HOST_DIR` at a directory only the daemon's user can
-write. roborev logs a warning when that directory is group- or world-writable.
+agent, so those settings do not give it tools. The handoff is a prompt-injection
+surface: `prompt.md` contains the review prompt, including the change under
+review, and the attached model is asked to follow it. A commit can put
+instructions in that change. Anyone who can write the handoff directory can also
+replace `prompt.md` or plant `answer.md`, which roborev reads as the review.
+Point `ROBOREV_HOST_DIR` at a directory only the daemon's user can write.
+roborev logs a warning when that directory is group- or world-writable.
 
 ### Review Search Embeddings
 
