@@ -68,13 +68,23 @@ func TestHTTPCreateAndGet(t *testing.T) {
 		Title:  "ignored-by-v0",
 	})
 	require.NoError(t, err)
+	// v0 launch returns CREATING, which is not in the contract status set.
+	// The client passes that status through unchanged.
+	assert.Equal(t, cursorcloud.AgentStatus("CREATING"), created.Status)
+	assert.NotEqual(t, cursorcloud.StatusRunning, created.Status)
 	assert.Equal(t, cursorcloud.Agent{
 		ID: "bc_1", Status: cursorcloud.AgentStatus("CREATING"), Title: "Review widgets",
 	}, created)
+	// CreateAgentRequest.Title is not sent on v0. The body has no title, and
+	// the response name is mapped to Agent.Title.
 	_, hasTitle := gotBody["title"]
 	assert.False(t, hasTitle)
 	_, hasName := gotBody["name"]
 	assert.False(t, hasName)
+	assert.Equal(t, "Review widgets", created.Title)
+	body, err := json.Marshal(gotBody)
+	require.NoError(t, err)
+	assert.NotContains(t, string(body), "ignored-by-v0")
 	assert.Equal(t, "review this commit", gotBody["prompt"].(map[string]any)["text"])
 	assert.Equal(t, "claude-4-sonnet", gotBody["model"])
 	source := gotBody["source"].(map[string]any)
@@ -147,8 +157,11 @@ func TestHTTPFinalMessage(t *testing.T) {
 			"messages": []map[string]string{{"type": "user_message", "text": "only user"}},
 		})
 	})
-	_, err = empty.FinalMessage(context.Background(), "bc_1")
+	// FinalMessage errors when the conversation has no assistant_message.
+	// It does not return an empty message as a successful review.
+	text, err = empty.FinalMessage(context.Background(), "bc_1")
 	require.ErrorContains(t, err, "no assistant message")
+	assert.Empty(t, text)
 	assertNoKey(t, err)
 }
 
