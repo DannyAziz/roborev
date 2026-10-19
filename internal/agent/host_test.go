@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -281,12 +282,7 @@ func TestHostHiddenFromSelectionAndListings(t *testing.T) {
 }
 
 func contains(names []string, want string) bool {
-	for _, name := range names {
-		if name == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(names, want)
 }
 
 func hostTestAgent(dir string, timeout time.Duration) *HostAgent {
@@ -332,7 +328,7 @@ func fakeHost(t *testing.T, dir string, answer func(handoffSeen) string) <-chan 
 			select {
 			case <-done:
 				return
-			case <-time.After(time.Millisecond):
+			case <-time.After(time.Millisecond): //nolint:kennlint // polls for handoff files the agent under test writes; not a deadline assertion
 			}
 		}
 	}()
@@ -401,7 +397,7 @@ func TestHostAgentTimeout(t *testing.T) {
 	assert.Contains(t, err.Error(), "host handoff timeout")
 	assert.Contains(t, err.Error(), "after 40ms")
 	assert.True(t, IsUnavailable(err), "host timeout is non-retryable")
-	assert.False(t, errors.Is(err, context.DeadlineExceeded), "not reported as the job timeout")
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "not reported as the job timeout")
 
 	entries, readErr := os.ReadDir(dir)
 	require.NoError(t, readErr)
@@ -577,7 +573,7 @@ func TestHostAnswerErrorAtDeadlineIsReported(t *testing.T) {
 	}()
 	_, err := waitForHostAnswer(context.Background(), answerPath, 200*time.Millisecond, time.Hour)
 	require.ErrorContains(t, err, "not a regular file")
-	assert.False(t, errors.As(err, new(*HostTimeoutError)), "reported as the read error, not a timeout")
+	require.NotErrorAs(t, err, new(*HostTimeoutError), "reported as the read error, not a timeout")
 	assert.True(t, IsUnavailable(err))
 }
 
@@ -674,7 +670,7 @@ func TestHostHandoffDirsAreUniqueAndContained(t *testing.T) {
 	for range n {
 		wg.Go(func() {
 			out, err := hostTestAgent(dir, 5*time.Second).Review(context.Background(), "/repo", "../../escape", "p", nil)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, "ok", out)
 		})
 	}
