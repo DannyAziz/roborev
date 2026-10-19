@@ -351,12 +351,10 @@ const (
 )
 
 // Allows is the one rule for when host may answer: only
-// ROBOREV_HOST_AGENT=1. Detection of a Cursor cloud agent never
-// substitutes for the marker, including when host is named.
+// ROBOREV_HOST_AGENT=1. Named requests, listings, and automatic picks all
+// require that marker, so detection never substitutes for it. use does not
+// change the result.
 func (m HostMarker) Allows(use HostUse) bool {
-	if use == HostNamed {
-		return m.Explicit
-	}
 	return m.Explicit
 }
 
