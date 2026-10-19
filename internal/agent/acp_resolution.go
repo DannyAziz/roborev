@@ -190,9 +190,7 @@ func GetPreferredOrBackupWithConfig(
 	if strings.TrimSpace(repoPath) != "" {
 		repoCfg, _ = config.LoadRepoConfig(repoPath)
 	}
-	return GetPreferredOrBackupWithConfigFromConfig(
-		repoCfg, preferred, cfg, backups...,
-	)
+	return GetPreferredOrBackupEligible(repoCfg, preferred, cfg, nil, backups...)
 }
 
 // GetPreferredOrBackupWithConfigFromConfig is the config-taking core of
@@ -201,6 +199,20 @@ func GetPreferredOrBackupWithConfigFromConfig(
 	repoCfg *config.RepoConfig,
 	preferred string,
 	cfg *config.Config,
+	backups ...string,
+) (Agent, error) {
+	return GetPreferredOrBackupEligible(repoCfg, preferred, cfg, nil, backups...)
+}
+
+// GetPreferredOrBackupEligible is GetPreferredOrBackupWithConfigFromConfig
+// with an auto-backup capability filter. Named preferred and named backups
+// are unchanged; "auto" backup skips agents that eligible rejects. nil
+// eligible accepts any agent, matching ResolveAutoBackup.
+func GetPreferredOrBackupEligible(
+	repoCfg *config.RepoConfig,
+	preferred string,
+	cfg *config.Config,
+	eligible func(string) bool,
 	backups ...string,
 ) (Agent, error) {
 	backups, autoBackup := splitAuto(backups)
@@ -230,7 +242,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		if ok {
 			return backup, nil
 		}
-		return strictAutoBackupOr(repoCfg, cfg, rawPreferred, backups, autoBackup)
+		return strictAutoBackupOr(repoCfg, cfg, rawPreferred, backups, autoBackup, eligible)
 	}
 
 	if preferred != "" {
@@ -255,16 +267,17 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		return backup, nil
 	}
 
-	return strictAutoBackupOr(repoCfg, cfg, preferred, backups, autoBackup)
+	return strictAutoBackupOr(repoCfg, cfg, preferred, backups, autoBackup, eligible)
 }
 
 // strictAutoBackupOr resolves the "auto" backup of a strict lookup once the
 // named agents are unavailable: the normal order other than preferred, never
-// host, which a strict lookup only uses when it is named.
-func strictAutoBackupOr(repoCfg *config.RepoConfig, cfg *config.Config, preferred string, backups []string, autoBackup bool) (Agent, error) {
+// host, which a strict lookup only uses when it is named. eligible filters
+// that auto pick (nil accepts any).
+func strictAutoBackupOr(repoCfg *config.RepoConfig, cfg *config.Config, preferred string, backups []string, autoBackup bool, eligible func(string) bool) (Agent, error) {
 	named := backups
 	if autoBackup {
-		if name := resolveAutoBackup(repoCfg, cfg, preferred, nil, false); name != "" {
+		if name := resolveAutoBackup(repoCfg, cfg, preferred, eligible, false); name != "" {
 			return GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
 		}
 		named = append(slices.Clone(backups), agentname.Auto)

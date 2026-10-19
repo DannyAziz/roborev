@@ -264,3 +264,26 @@ func TestAutoBackupForCustomReview(t *testing.T) {
 	got := ResolveAutoBackup(nil, cfg, "codex", structuredEligible("custom"))
 	assert.Equal(t, "claude-code", got)
 }
+
+// Strict lookup with an "auto" backup must honor eligible: a goal review
+// with unavailable pi and Codex+Claude installed should pick Claude, not
+// Codex. Mutant pin: passing nil to resolveAutoBackup in strictAutoBackupOr
+// selects Codex.
+func TestStrictAutoBackupHonorsEligible(t *testing.T) {
+	setHostMarker(t, false)
+	stubPath(t, "codex", "claude")
+	cfg := &config.Config{}
+	skipCodex := func(name string) bool { return name != "codex" }
+
+	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "pi", cfg, "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "codex", a.Name(), "nil eligible keeps the first available agent")
+
+	a, err = GetPreferredOrBackupEligible(nil, "pi", cfg, skipCodex, "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", a.Name())
+
+	_, err = GetPreferredOrBackupEligible(nil, "pi", cfg, func(string) bool { return false }, "auto")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `preferred: "pi"`)
+}

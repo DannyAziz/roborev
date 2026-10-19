@@ -271,6 +271,29 @@ func TestGoalReviewPinsAutoBackup(t *testing.T) {
 	}
 }
 
+// Goal-review enqueue with unavailable pi and an auto backup must select
+// Claude, not reject the request after landing on Codex.
+func TestGoalReviewAutoBackupSkipsIncapablePrimary(t *testing.T) {
+	noHostMarker(t)
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile(".roborev.toml", "review_agent = \"pi\"\nreview_backup_agent = \"auto\"\n", "configure")
+	goalArtifacts(t, repo.Path())
+	stubAgentPathWithGit(t, "codex", "claude")
+
+	out, err := server.enqueueGoalReview(context.Background(), EnqueueRequest{RepoPath: repo.Path()})
+	require.NoError(t, err)
+	require.Less(t, out.Status, 300, "%v", out.Body)
+
+	jobs, err := db.ListJobs("", "", 0, 0, storage.WithJobType(storage.JobTypeGoalReview))
+	require.NoError(t, err)
+	require.NotEmpty(t, jobs)
+	stored, err := db.GetJobByID(jobs[0].ID)
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", stored.Agent)
+	assert.True(t, stored.BackupAuto)
+}
+
 // CI matrix enqueue pins an "auto" backup to a concrete agent with no model.
 func TestCIMatrixPinsAutoBackup(t *testing.T) {
 	noHostMarker(t)
