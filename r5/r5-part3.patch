@@ -1,0 +1,1817 @@
+From 8964d812c15767bf490962393ec623f1deffbbf3 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 19 Oct 2026 10:02:02 +0000
+Subject: [PATCH] Add the auto agent keyword; host is its last resort only with
+ the marker
+
+"auto" picks the first available agent other than the one it protects
+and able to run the job (goal reviews need a goal agent, custom reviews
+structured output). Host is its last resort only with
+ROBOREV_HOST_AGENT=1; a Cursor cloud agent alone never makes host an
+automatic pick, and without the marker host is skipped and the next
+agent tried. Strict enqueue with an auto backup never takes host.
+
+An auto backup is pinned at enqueue (experiment review, CI, panel, fix,
+goal, rerun) and the job records that the pin came from auto, so an
+empty pin stays final and an auto-pinned host runs after a restart only
+while ROBOREV_HOST_AGENT=1 is still set. --agent auto does not carry the
+configured review model over.
+---
+ docs/configuration.md                |   6 +-
+ internal/agent/acp_resolution.go     |  30 +-
+ internal/agent/agent.go              |   2 +-
+ internal/agent/auto.go               |  57 +++
+ internal/agent/host.go               |  22 +-
+ internal/agent/host_test.go          |  10 +
+ internal/agent/model_resolution.go   |  24 +-
+ internal/agent/model_source_test.go  | 266 +++++++++++++
+ internal/agent/schema_agent.go       |   7 +-
+ internal/agentname/agentname.go      |  12 +-
+ internal/config/budget.go            |   3 +
+ internal/config/config.go            |  21 +-
+ internal/config/model_source_test.go |  92 +++++
+ internal/daemon/auto_backup_test.go  | 546 +++++++++++++++++++++++++++
+ internal/daemon/ci_poller.go         |  31 +-
+ internal/daemon/goal_review.go       |   4 +-
+ internal/daemon/panel_enqueue.go     |   3 +-
+ internal/daemon/server.go            |  10 +-
+ internal/daemon/worker.go            |  74 +++-
+ internal/storage/db.go               |   8 +
+ internal/storage/job_columns.go      |   4 +-
+ internal/storage/jobs.go             |   8 +-
+ internal/storage/models.go           |   1 +
+ 23 files changed, 1212 insertions(+), 29 deletions(-)
+ create mode 100644 internal/agent/auto.go
+ create mode 100644 internal/agent/model_source_test.go
+ create mode 100644 internal/config/model_source_test.go
+ create mode 100644 internal/daemon/auto_backup_test.go
+
+diff --git a/docs/configuration.md b/docs/configuration.md
+index bee6922f..8b6946b7 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -1095,8 +1095,8 @@ filter_branch = false             # Show all branches on startup (default: curre
+ 
+ | Option | Type | Default | Description | Hot-Reload |
+ |--------|------|---------|-------------|------------|
+-| `default_agent` | string | auto-detect | Default AI agent to use | Yes |
+-| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
++| `default_agent` | string | auto-detect | Default AI agent to use. `auto` uses the availability order (with `host` as the last resort only under `ROBOREV_HOST_AGENT=1`) and pairs `default_model` only when it lands on `default_agent` (a workflow model beside `auto` is never paired). `host` hands reviews to an attached host model and runs only when named here or as a backup, with `ROBOREV_HOST_AGENT=1` or inside a Cursor cloud agent where reviews run; listings show it only with `ROBOREV_HOST_AGENT=1` | Yes |
++| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `auto` picks the first available agent, other than the primary, that can run the job, with no model; `host` is that last resort only under `ROBOREV_HOST_AGENT=1`. CI, panel, fix and goal reviews pin that choice when queued and keep it, even when nothing was found; other jobs resolve it at failover | Yes |
+ | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
+ | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
+ | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
+@@ -1153,6 +1153,8 @@ filter_branch = false             # Show all branches on startup (default: curre
+     used automatically. No action is required, but new configs should use the new
+     name.
+ 
++Host as an automatic pick: `host` is auto-eligible (an `auto` agent or backup, a CI or fix pin, the last resort of a failover) only with the explicit marker `ROBOREV_HOST_AGENT=1`. Detecting a Cursor cloud agent (`CURSOR_AGENT=1` plus a `CLOUD_AGENT_*` variable) never makes `host` an automatic pick; there it runs only when named. Without the marker, failover skips `host` and tries the next agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
++
+ ### Review Search Embeddings
+ 
+ Lexical review-history search needs no configuration and never calls an
+diff --git a/internal/agent/acp_resolution.go b/internal/agent/acp_resolution.go
+index 910f8f18..849cc34e 100644
+--- a/internal/agent/acp_resolution.go
++++ b/internal/agent/acp_resolution.go
+@@ -3,6 +3,7 @@ package agent
+ import (
+ 	"fmt"
+ 	"os/exec"
++	"slices"
+ 	"sort"
+ 	"strings"
+ 
+@@ -202,6 +203,12 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 	cfg *config.Config,
+ 	backups ...string,
+ ) (Agent, error) {
++	backups, autoBackup := splitAuto(backups)
++	if agentname.IsAuto(preferred) {
++		// No named preference: the normal availability order.
++		return GetAvailableWithConfigFromConfig(repoCfg, "", cfg, backups...)
++	}
++
+ 	rawPreferred := strings.TrimSpace(preferred)
+ 	preferred = resolveAlias(rawPreferred)
+ 	if err := requestedHostError(preferred); err != nil {
+@@ -223,7 +230,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 		if ok {
+ 			return backup, nil
+ 		}
+-		return nil, withSkippedHostNote(unavailablePreferredBackupError(rawPreferred, backups), backups)
++		return strictAutoBackupOr(repoCfg, cfg, rawPreferred, backups, autoBackup)
+ 	}
+ 
+ 	if preferred != "" {
+@@ -248,7 +255,21 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 		return backup, nil
+ 	}
+ 
+-	return nil, withSkippedHostNote(unavailablePreferredBackupError(preferred, backups), backups)
++	return strictAutoBackupOr(repoCfg, cfg, preferred, backups, autoBackup)
++}
++
++// strictAutoBackupOr resolves the "auto" backup of a strict lookup once the
++// named agents are unavailable: the normal order other than preferred, never
++// host, which a strict lookup only uses when it is named.
++func strictAutoBackupOr(repoCfg *config.RepoConfig, cfg *config.Config, preferred string, backups []string, autoBackup bool) (Agent, error) {
++	named := backups
++	if autoBackup {
++		if name := resolveAutoBackup(repoCfg, cfg, preferred, nil, false); name != "" {
++			return GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
++		}
++		named = append(slices.Clone(backups), agentname.Auto)
++	}
++	return nil, withSkippedHostNote(unavailablePreferredBackupError(preferred, named), backups)
+ }
+ 
+ // AvailableNamesFromConfig returns built-in and effective named ACP agents.
+@@ -316,6 +337,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
+ 	if rawName == "" {
+ 		return nil, fmt.Errorf("empty agent name")
+ 	}
++	if agentname.IsAuto(rawName) {
++		return GetAvailableWithConfigFromConfig(repoCfg, "", cfg)
++	}
+ 
+ 	if isConfiguredACPAgentNameFromConfig(rawName, cfg, repoCfg) {
+ 		configured, err := configuredACPAgentFromConfig(rawName, repoCfg, cfg)
+@@ -359,7 +383,7 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
+ // GetAvailableWithConfigFromConfig resolves an available agent using already
+ // loaded repo config, never reading repo config from the working tree.
+ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred string, cfg *config.Config, backups ...string) (Agent, error) {
+-	rawPreferred := strings.TrimSpace(preferred)
++	rawPreferred := strings.TrimSpace(withoutAuto(preferred))
+ 	preferred = resolveAlias(rawPreferred)
+ 	if err := requestedHostError(preferred); err != nil {
+ 		return nil, err
+diff --git a/internal/agent/agent.go b/internal/agent/agent.go
+index 11da5d3f..3ea4bcd2 100644
+--- a/internal/agent/agent.go
++++ b/internal/agent/agent.go
+@@ -280,7 +280,7 @@ func IsAvailable(name string) bool {
+ // default_backup_agent config without changing the global chain order.
+ func GetAvailable(preferred string, backups ...string) (Agent, error) {
+ 	// Resolve alias upfront for consistent comparisons
+-	preferred = resolveAlias(preferred)
++	preferred = resolveAlias(withoutAuto(preferred))
+ 	if err := requestedHostError(preferred); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/internal/agent/auto.go b/internal/agent/auto.go
+new file mode 100644
+index 00000000..69f857a8
+--- /dev/null
++++ b/internal/agent/auto.go
+@@ -0,0 +1,57 @@
++package agent
++
++import (
++	"fmt"
++	"slices"
++
++	"go.kenn.io/roborev/internal/agentname"
++	"go.kenn.io/roborev/internal/config"
++)
++
++// withoutAuto maps the "auto" selection keyword to "no named preference" so
++// it reaches the normal availability order instead of a registry lookup.
++func withoutAuto(name string) string {
++	if agentname.IsAuto(name) {
++		return ""
++	}
++	return name
++}
++
++// splitAuto removes "auto" from backups and reports whether it was present.
++func splitAuto(backups []string) ([]string, bool) {
++	if !slices.ContainsFunc(backups, agentname.IsAuto) {
++		return backups, false
++	}
++	return slices.DeleteFunc(slices.Clone(backups), agentname.IsAuto), true
++}
++
++// ResolveAutoBackup picks the concrete agent an "auto" backup stands for: the
++// first available agent in the normal order, other than exclude (the agent
++// the backup protects), that eligible accepts (nil accepts any), then host as
++// a last resort when ROBOREV_HOST_AGENT=1 allows an automatic pick. It returns
++// "" when nothing qualifies.
++func ResolveAutoBackup(repoCfg *config.RepoConfig, cfg *config.Config, exclude string, eligible func(string) bool) string {
++	return resolveAutoBackup(repoCfg, cfg, exclude, eligible, true)
++}
++
++func resolveAutoBackup(repoCfg *config.RepoConfig, cfg *config.Config, exclude string, eligible func(string) bool, lastResort bool) string {
++	exclude = resolveAlias(withoutAuto(exclude))
++	usable := func(name string) bool { return name != exclude && (eligible == nil || eligible(name)) }
++	for _, name := range append(slices.Clone(fallbackAgentOrder), Available()...) {
++		if name != "test" && name != hostAgentName && usable(name) && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
++			return name
++		}
++	}
++	if lastResort && usable(hostAgentName) && HostAllowed(HostAuto) {
++		return hostAgentName
++	}
++	return ""
++}
++
++// AutoBackupNotFound explains an "auto" backup that resolved to no agent.
++func AutoBackupNotFound() string {
++	if HostAllowed(HostAuto) {
++		return fmt.Sprintf("\nbackup %q found no available agent", agentname.Auto)
++	}
++	return fmt.Sprintf("\nbackup %q found no available agent; host is an automatic pick only with %s=1", agentname.Auto, HostMarkerEnv)
++}
+diff --git a/internal/agent/host.go b/internal/agent/host.go
+index 68f982ce..69a7ffe5 100644
+--- a/internal/agent/host.go
++++ b/internal/agent/host.go
+@@ -34,13 +34,20 @@ type HostAgent struct {
+ 	Dir          string
+ 	Timeout      time.Duration
+ 	PollInterval time.Duration
++	// Model is passed to the host as a hint; roborev cannot pick the host's
++	// model, so the host uses it only if it can.
++	Model string
+ }
+ 
+ func (a *HostAgent) Name() string                       { return hostAgentName }
+ func (a *HostAgent) WithReasoning(ReasoningLevel) Agent { return a }
+ func (a *HostAgent) WithAgentic(bool) Agent             { return a }
+-func (a *HostAgent) WithModel(string) Agent             { return a }
+-func (a *HostAgent) CommandLine() string                { return "host (file handoff in " + a.baseDir() + ")" }
++func (a *HostAgent) WithModel(model string) Agent {
++	c := *a
++	c.Model = strings.TrimSpace(model)
++	return &c
++}
++func (a *HostAgent) CommandLine() string { return "host (file handoff in " + a.baseDir() + ")" }
+ 
+ func (a *HostAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+ 	return a.handoff(ctx, repoPath, commitSHA, prompt, nil, output)
+@@ -54,6 +61,13 @@ func (a *HostAgent) ReviewWithSchema(ctx context.Context, repoPath, gitRef, prom
+ 	return jsontext.Value(raw), nil
+ }
+ 
++func (a *HostAgent) modelHint() string {
++	if a.Model == "" {
++		return ""
++	}
++	return fmt.Sprintf("Requested model (hint only): %s. Use it if you can choose your model; otherwise review with your current one.\n", a.Model)
++}
++
+ func (a *HostAgent) baseDir() string {
+ 	if a.Dir != "" {
+ 		return a.Dir
+@@ -133,12 +147,12 @@ func (a *HostAgent) handoff(ctx context.Context, repoPath, gitRef, prompt string
+ 
+ Repository: %s
+ Git ref: %s
+-
++%s
+ 1. Read prompt.md here and review the change it describes, using the repository above.
+ 2. Output format: %s
+ 3. Write the answer to answer.md.tmp, then rename it to answer.md (only a regular answer.md is read).
+ 4. roborev waits %s (the host handoff timeout, %s) for answer.md, then fails and removes this directory.
+-`, repoPath, gitRef, format, timeout, hostTimeoutEnv)
++`, repoPath, gitRef, a.modelHint(), format, timeout, hostTimeoutEnv)
+ 	if err := writeHandoffFile(jobDir, "instructions.md", []byte(instructions)); err != nil {
+ 		return "", err
+ 	}
+diff --git a/internal/agent/host_test.go b/internal/agent/host_test.go
+index 1504c8e4..0b3c10a0 100644
+--- a/internal/agent/host_test.go
++++ b/internal/agent/host_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
++	"slices"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -256,12 +257,18 @@ func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
+ 			{name: "named cli with backup", preferred: "codex", backups: []string{"claude"}},
+ 			{name: "named ACP", preferred: "acp.remote"},
+ 			{name: "named ACP with backup", preferred: "acp.remote", backups: []string{"gemini"}},
++			{name: "named cli with auto backup", preferred: "gemini", backups: []string{"auto"}},
++			{name: "named cli with backup and auto", preferred: "codex", backups: []string{"claude", "auto"}},
++			{name: "named ACP with auto backup", preferred: "acp.remote", backups: []string{"auto"}},
+ 		} {
+ 			t.Run(tc.name, func(t *testing.T) {
+ 				a, err := GetPreferredOrBackupWithConfigFromConfig(nil, tc.preferred, cfg, tc.backups...)
+ 				require.Error(t, err)
+ 				assert.Nil(t, a)
+ 				assert.Contains(t, err.Error(), "no configured agent available")
++				if slices.Contains(tc.backups, "auto") {
++					assert.Contains(t, err.Error(), "auto)", "the auto backup is named in the error")
++				}
+ 			})
+ 		}
+ 
+@@ -269,6 +276,9 @@ func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
+ 		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
+ 		require.NoError(t, err)
+ 		assert.Equal(t, "claude-code", a.Name(), "a named backup still wins over host")
++		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "gemini", cfg, "auto")
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name(), "an auto backup picks an available CLI agent")
+ 	})
+ }
+ 
+diff --git a/internal/agent/model_resolution.go b/internal/agent/model_resolution.go
+index eec4be00..43109039 100644
+--- a/internal/agent/model_resolution.go
++++ b/internal/agent/model_resolution.go
+@@ -3,6 +3,7 @@ package agent
+ import (
+ 	"strings"
+ 
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/config"
+ )
+ 
+@@ -189,7 +190,13 @@ func (w WorkflowConfig) ModelForSelectedAgent(
+ 		return model
+ 	}
+ 	var model string
+-	if w.RepoConfig != nil {
++	if agentname.IsAuto(w.PreferredAgent) && strings.TrimSpace(cliModel) == "" {
++		repoCfg := w.RepoConfig
++		if repoCfg == nil {
++			repoCfg, _ = config.LoadRepoConfig(w.RepoPath)
++		}
++		model = autoSelectionModel(selectedAgent, repoCfg, w.GlobalConfig)
++	} else if w.RepoConfig != nil {
+ 		model = ResolveWorkflowModelForAgentFromConfig(
+ 			selectedAgent, cliModel, w.RepoConfig,
+ 			w.GlobalConfig, w.Workflow, w.Reasoning,
+@@ -249,6 +256,9 @@ func ResolveWorkflowModelForAgentFromConfig(
+ 		)
+ 	}
+ 
++	if agentname.IsAuto(config.ResolveAgentForWorkflowFromConfig("", repoCfg, globalCfg, workflow, level)) {
++		return autoSelectionModel(selectedAgent, repoCfg, globalCfg)
++	}
+ 	defaultAgent := config.ResolveAgentFromConfig("", repoCfg, globalCfg)
+ 	if workflowModelComparableAgentNameFromConfig(selectedAgent, repoCfg, globalCfg) !=
+ 		workflowModelComparableAgentNameFromConfig(defaultAgent, repoCfg, globalCfg) {
+@@ -351,3 +361,15 @@ func (w WorkflowConfig) resolveACPAgentConfig(selectedAgent string) *config.ACPA
+ 	}
+ 	return &acpCfg
+ }
++
++// autoSelectionModel is the model for an agent that "auto" selected, from
++// config or --agent auto. A workflow model beside "auto" names no agent, so it
++// never pairs; default_model pairs only when auto lands on default_agent.
++func autoSelectionModel(selectedAgent string, repoCfg *config.RepoConfig, globalCfg *config.Config) string {
++	defaultAgent := config.ResolveAgentFromConfig("", repoCfg, globalCfg)
++	if workflowModelComparableAgentNameFromConfig(selectedAgent, repoCfg, globalCfg) !=
++		workflowModelComparableAgentNameFromConfig(defaultAgent, repoCfg, globalCfg) {
++		return ""
++	}
++	return config.ResolveModelFromConfig("", repoCfg, globalCfg)
++}
+diff --git a/internal/agent/model_source_test.go b/internal/agent/model_source_test.go
+new file mode 100644
+index 00000000..d7aaba9d
+--- /dev/null
++++ b/internal/agent/model_source_test.go
+@@ -0,0 +1,266 @@
++package agent
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agentname"
++	"go.kenn.io/roborev/internal/config"
++)
++
++// resolveModelSource mirrors the daemon's single-review path: workflow
++// config, strict preferred-or-backup selection, then the paired model.
++func resolveModelSource(t *testing.T, cliAgent string, repoCfg *config.RepoConfig, cfg *config.Config) (Agent, string, error) {
++	t.Helper()
++	res, err := ResolveWorkflowConfigFromConfig(cliAgent, repoCfg, cfg, "review", "")
++	require.NoError(t, err)
++	a, err := GetPreferredOrBackupWithConfigFromConfig(repoCfg, res.PreferredAgent, cfg, res.BackupAgent)
++	if err != nil {
++		return nil, "", err
++	}
++	return a, res.ModelForSelectedAgent(a.Name(), ""), nil
++}
++
++func TestModelSourceSelection(t *testing.T) {
++	tests := []struct {
++		name      string
++		global    config.Config
++		repo      config.RepoConfig
++		cliAgent  string
++		path      []string
++		marker    bool
++		wantAgent string
++		wantModel string
++		wantErr   string
++		lastResor bool
++	}{
++		{name: "unset picks codex", path: []string{"codex", "claude"}, wantAgent: "codex"},
++		{name: "unset keeps strict codex error", path: []string{"claude"}, wantErr: `no configured agent available (preferred: "codex"`},
++		{name: "unset strict never falls back to host with marker", path: []string{"claude"}, marker: true, wantErr: `no configured agent available (preferred: "codex"`},
++		{name: "unset default_model pairs with codex", global: config.Config{DefaultModel: "gpt-x"}, path: []string{"codex"}, wantAgent: "codex", wantModel: "gpt-x"},
++
++		{name: "host with marker", global: config.Config{DefaultAgent: "host"}, path: []string{"codex"}, marker: true, wantAgent: "host"},
++		{name: "host without marker errors naming the marker", global: config.Config{DefaultAgent: "host"}, path: []string{"codex"}, wantErr: HostMarkerEnv},
++		{name: "host carries model hint", global: config.Config{DefaultAgent: "host", DefaultModel: "opus"}, marker: true, wantAgent: "host", wantModel: "opus"},
++
++		{name: "cli without model", global: config.Config{DefaultAgent: "claude"}, path: []string{"codex", "claude"}, wantAgent: "claude-code"},
++		{name: "cli with model", global: config.Config{DefaultAgent: "claude", DefaultModel: "sonnet"}, path: []string{"codex", "claude"}, wantAgent: "claude-code", wantModel: "sonnet"},
++		{name: "cli unavailable keeps strict error", global: config.Config{DefaultAgent: "claude"}, path: []string{"codex"}, wantErr: `no configured agent available (preferred: "claude-code"`},
++		{name: "cli unavailable keeps strict error with marker", global: config.Config{DefaultAgent: "claude"}, path: []string{"codex"}, marker: true, wantErr: `no configured agent available (preferred: "claude-code"`},
++
++		{name: "auto uses fallback order", global: config.Config{DefaultAgent: "auto"}, path: []string{"codex", "claude"}, wantAgent: "codex"},
++		{name: "auto reaches later agents", global: config.Config{DefaultAgent: "auto"}, path: []string{"gemini"}, wantAgent: "gemini"},
++		{name: "auto does not pair generic model", global: config.Config{DefaultAgent: "auto", DefaultModel: "sonnet"}, path: []string{"claude"}, wantAgent: "claude-code"},
++		{name: "auto does not pair generic model with host", global: config.Config{DefaultAgent: "auto", DefaultModel: "sonnet"}, marker: true, wantAgent: "host", lastResor: true},
++		{name: "auto tries backup before order", global: config.Config{DefaultAgent: "auto", DefaultBackupAgent: "claude"}, path: []string{"codex", "claude"}, wantAgent: "claude-code"},
++		{name: "auto with nothing and no marker", global: config.Config{DefaultAgent: "auto"}, wantErr: "no agents available"},
++		{name: "auto with nothing uses host as last resort", global: config.Config{DefaultAgent: "auto"}, marker: true, wantAgent: "host", lastResor: true},
++		{name: "auto with marker still prefers a CLI agent", global: config.Config{DefaultAgent: "auto"}, path: []string{"claude"}, marker: true, wantAgent: "claude-code"},
++		{name: "auto as backup widens strict lookup", global: config.Config{DefaultAgent: "claude", DefaultBackupAgent: "auto"}, path: []string{"gemini"}, wantAgent: "gemini"},
++		{name: "named primary with auto backup never becomes host", global: config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "auto"}, marker: true, wantErr: `no configured agent available (preferred: "gemini"`},
++		{name: "named primary with auto backup keeps strict error", global: config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "auto"}, wantErr: `no configured agent available (preferred: "gemini"`},
++
++		{name: "workflow auto does not pair review_model", global: config.Config{DefaultAgent: "claude", ReviewAgent: "auto", ReviewModel: "x"}, path: []string{"codex"}, wantAgent: "codex"},
++		{name: "workflow auto keeps default_model for the default agent", global: config.Config{DefaultAgent: "claude", DefaultModel: "sonnet", ReviewAgent: "auto", ReviewModel: "x"}, path: []string{"claude"}, wantAgent: "claude-code", wantModel: "sonnet"},
++		{name: "repo workflow auto does not pair global review_model", global: config.Config{ReviewModel: "x"}, repo: config.RepoConfig{ReviewAgent: "auto"}, path: []string{"gemini"}, wantAgent: "gemini"},
++		{name: "cli auto does not pair review_model", cliAgent: "auto", global: config.Config{DefaultAgent: "codex", ReviewAgent: "claude", ReviewModel: "x"}, path: []string{"gemini"}, wantAgent: "gemini"},
++		{name: "cli auto does not pair review_model with the workflow agent", cliAgent: "auto", global: config.Config{DefaultAgent: "codex", ReviewAgent: "claude", ReviewModel: "x"}, path: []string{"claude"}, wantAgent: "claude-code"},
++		{name: "cli auto keeps default_model for the default agent", cliAgent: "auto", global: config.Config{DefaultAgent: "codex", DefaultModel: "gpt-x", ReviewModel: "x"}, path: []string{"codex"}, wantAgent: "codex", wantModel: "gpt-x"},
++		{name: "cli agent over workflow auto does not take review_model", cliAgent: "codex", global: config.Config{DefaultAgent: "codex", ReviewAgent: "auto", ReviewModel: "x"}, path: []string{"codex"}, wantAgent: "codex"},
++		{name: "cli auto uses host only as last resort", cliAgent: "auto", global: config.Config{DefaultAgent: "host"}, marker: true, wantAgent: "host", lastResor: true},
++		{name: "cli auto without marker skips host", cliAgent: "auto", global: config.Config{DefaultAgent: "host"}, wantErr: "no agents available"},
++		{name: "named workflow agent still pairs review_model", global: config.Config{DefaultAgent: "auto", ReviewAgent: "gemini", ReviewModel: "x"}, path: []string{"gemini"}, wantAgent: "gemini", wantModel: "x"},
++
++		{name: "repo auto overrides global cli", global: config.Config{DefaultAgent: "claude"}, repo: config.RepoConfig{Agent: "auto"}, path: []string{"codex"}, wantAgent: "codex"},
++		{name: "repo host overrides global auto with marker", global: config.Config{DefaultAgent: "auto"}, repo: config.RepoConfig{Agent: "host", Model: "r"}, path: []string{"codex"}, marker: true, wantAgent: "host", wantModel: "r"},
++		{name: "repo host overrides global auto without marker errors", global: config.Config{DefaultAgent: "auto"}, repo: config.RepoConfig{Agent: "host", Model: "r"}, path: []string{"codex"}, wantErr: HostMarkerEnv},
++		{name: "repo cli overrides global host", global: config.Config{DefaultAgent: "host", DefaultModel: "g"}, repo: config.RepoConfig{Agent: "claude", Model: "sonnet"}, path: []string{"claude"}, wantAgent: "claude-code", wantModel: "sonnet"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			setHostMarker(t, tt.marker)
++			log := captureHostLastResortLog(t)
++			stubPath(t, tt.path...)
++			cfg, repo := tt.global, tt.repo
++
++			a, model, err := resolveModelSource(t, tt.cliAgent, &repo, &cfg)
++			if tt.wantErr != "" {
++				assert.Empty(t, log.String(), "host is never a last resort on an error")
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tt.wantErr)
++				assert.NotContains(t, err.Error(), "unknown agent")
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tt.wantAgent, a.Name())
++			assert.Equal(t, tt.wantModel, model)
++			assert.Equal(t, tt.lastResor, log.Len() > 0, "host last-resort log: %q", log.String())
++
++			if a.Name() == hostAgentName {
++				host, ok := a.WithModel(model).(*HostAgent)
++				require.True(t, ok)
++				assert.Equal(t, tt.wantModel, host.Model)
++			}
++		})
++	}
++}
++
++func TestAutoNeverReachesRegistryLookup(t *testing.T) {
++	setHostMarker(t, false)
++	stubPath(t, "claude")
++	cfg := &config.Config{}
++
++	_, err := Get(agentname.Auto)
++	require.Error(t, err, "auto is a keyword, never a registered agent")
++	assert.NotContains(t, Available(), agentname.Auto)
++	assert.NotContains(t, AvailableNamesFromConfig(nil, cfg), agentname.Auto)
++
++	check := func(label string, a Agent, err error) {
++		t.Helper()
++		require.NoError(t, err, label)
++		assert.Equal(t, "claude-code", a.Name(), label)
++	}
++	a, err := GetAvailable("auto")
++	check("GetAvailable", a, err)
++	a, err = GetAvailable("auto", "auto")
++	check("GetAvailable auto backup", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, " auto ", cfg)
++	check("GetAvailableWithConfigFromConfig", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "auto", nil)
++	check("GetAvailableWithConfigFromConfig nil cfg", a, err)
++	a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "auto", cfg)
++	check("GetPreferredOrBackupWithConfigFromConfig", a, err)
++	a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "auto")
++	check("GetPreferredOrBackupWithConfigFromConfig auto backup", a, err)
++	a, err = GetAvailableExactWithConfigFromConfig(nil, "auto", cfg)
++	check("GetAvailableExactWithConfigFromConfig", a, err)
++}
++
++// classify_agent = "auto" is rejected (config validation and the schema
++// resolver) rather than resolved: the classifier needs a named schema agent.
++func TestAutoRejectedForClassifier(t *testing.T) {
++	setHostMarker(t, false)
++	stubPath(t, "claude")
++	_, err := GetAvailableSchemaExactWithConfig("auto", &config.Config{})
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "not supported")
++	assert.NotContains(t, err.Error(), "not registered")
++}
++
++func TestAutoKeywordValidation(t *testing.T) {
++	_, builtIn := agentname.BuiltIn("auto")
++	assert.False(t, builtIn, "auto is a keyword, not a built-in agent")
++	require.NoError(t, agentname.ValidateReference("auto"))
++	assert.True(t, agentname.IsAuto(" auto "))
++	assert.False(t, agentname.IsAuto("autox"))
++	assert.False(t, agentname.IsAuto(""))
++	assert.Equal(t, "claude-code", CanonicalName("claude"), "other names unchanged")
++	assert.Error(t, agentname.ValidateReference("bogus"))
++}
++
++// An "auto" backup reaches host only as the last resort, and only under
++// ROBOREV_HOST_AGENT=1: detection alone never makes host an automatic pick.
++func TestResolveAutoBackup(t *testing.T) {
++	cfg := &config.Config{}
++	tests := []struct {
++		name     string
++		path     []string
++		exclude  string
++		want     string
++		explicit string
++	}{
++		{name: "first available other than the primary", path: []string{"codex", "claude"}, exclude: "codex", want: "claude-code"},
++		{name: "primary not in order keeps first", path: []string{"codex", "claude"}, exclude: "gemini", want: "codex"},
++		{name: "alias exclude", path: []string{"claude", "gemini"}, exclude: "claude", want: "gemini"},
++		{name: "only the primary", path: []string{"codex"}, exclude: "codex", want: "", explicit: "host"},
++		{name: "nothing installed", exclude: "codex", want: "", explicit: "host"},
++		{name: "host primary never backs itself up", exclude: "host", want: ""},
++		{name: "marker never beats a CLI agent", path: []string{"codex", "claude"}, exclude: "codex", want: "claude-code"},
++		{name: "host primary with a CLI", path: []string{"claude"}, exclude: "host", want: "claude-code"},
++	}
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		for _, tt := range tests {
++			t.Run(tt.name, func(t *testing.T) {
++				stubPath(t, tt.path...)
++				want := tt.want
++				if mode.explicit && tt.explicit != "" {
++					want = tt.explicit
++				}
++				assert.Equal(t, want, ResolveAutoBackup(nil, cfg, tt.exclude, nil))
++				assert.Equal(t, mode.explicit, !strings.Contains(AutoBackupNotFound(), HostMarkerEnv))
++			})
++		}
++	})
++}
++
++func TestHostModelHint(t *testing.T) {
++	registered, err := Get(hostAgentName)
++	require.NoError(t, err)
++	withModel := registered.WithModel(" opus ")
++	assert.Empty(t, registered.(*HostAgent).Model, "registered host agent is not mutated")
++	assert.Equal(t, "opus", withModel.(*HostAgent).Model)
++
++	for _, model := range []string{"", "opus"} {
++		t.Run("model="+model, func(t *testing.T) {
++			dir := t.TempDir()
++			a := hostTestAgent(dir, 5*time.Second).WithModel(model)
++			instructions := make(chan string, 1)
++			go func() {
++				defer close(instructions)
++				for range 2000 {
++					matches, _ := filepath.Glob(filepath.Join(dir, "*", "instructions.md"))
++					if len(matches) == 1 {
++						body, _ := os.ReadFile(matches[0])
++						instructions <- string(body)
++						d := filepath.Dir(matches[0])
++						_ = os.WriteFile(filepath.Join(d, "answer.md.tmp"), []byte("LGTM"), 0o600)
++						_ = os.Rename(filepath.Join(d, "answer.md.tmp"), filepath.Join(d, "answer.md"))
++						return
++					}
++					time.Sleep(2 * time.Millisecond)
++				}
++			}()
++			out, err := a.Review(context.Background(), "/repo", "HEAD", "prompt", nil)
++			require.NoError(t, err)
++			assert.Equal(t, "LGTM", out)
++			instr := <-instructions
++			assert.Contains(t, instr, "answer.md")
++			if model == "" {
++				assert.NotContains(t, instr, "Requested model")
++			} else {
++				assert.Contains(t, instr, "Requested model (hint only): opus.")
++			}
++		})
++	}
++}
++
++func structuredEligible(reviewType string) func(string) bool {
++	return func(name string) bool {
++		a, err := Get(name)
++		return err == nil && ValidateStructuredReviewSelection(reviewType, a) == nil
++	}
++}
++
++// An "auto" backup on a custom review passes enqueue validation and only
++// resolves to an agent the caller's eligibility check accepts.
++func TestAutoBackupForCustomReview(t *testing.T) {
++	setHostMarker(t, false)
++	resolution := WorkflowConfig{BackupAgent: "auto"}
++	require.NoError(t, ValidateStructuredReviewBackup("custom", resolution, "codex"))
++
++	cfg := &config.Config{}
++	stubPath(t, "gemini")
++	assert.Equal(t, "gemini", ResolveAutoBackup(nil, cfg, "codex", structuredEligible("")), "a built-in review takes any agent")
++	assert.Empty(t, ResolveAutoBackup(nil, cfg, "codex", structuredEligible("custom")), "gemini cannot run a custom review")
++
++	stubPath(t, "gemini", "claude")
++	got := ResolveAutoBackup(nil, cfg, "codex", structuredEligible("custom"))
++	assert.Equal(t, "claude-code", got)
++}
+diff --git a/internal/agent/schema_agent.go b/internal/agent/schema_agent.go
+index d6d38f0c..97297619 100644
+--- a/internal/agent/schema_agent.go
++++ b/internal/agent/schema_agent.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"strings"
+ 
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/config"
+ )
+ 
+@@ -78,7 +79,8 @@ func ValidateStructuredReviewBackup(
+ 	selectedAgent string,
+ ) error {
+ 	backupName := strings.TrimSpace(resolution.BackupAgent)
+-	if config.IsBuiltInReviewType(reviewType) || backupName == "" ||
++	// An "auto" backup is pinned to a structured-capable agent at enqueue.
++	if config.IsBuiltInReviewType(reviewType) || backupName == "" || agentname.IsAuto(backupName) ||
+ 		resolution.AgentMatches(selectedAgent, backupName) {
+ 		return nil
+ 	}
+@@ -113,6 +115,9 @@ func IsSchemaAgent(a Agent) bool {
+ // schema-capable agent and checks availability using the same config-aware
+ // command override rules as normal review execution.
+ func GetAvailableSchemaExactWithConfig(name string, cfg *config.Config) (SchemaAgent, error) {
++	if agentname.IsAuto(name) {
++		return nil, fmt.Errorf("classifier %q is not supported; name a schema-capable agent such as claude-code", agentname.Auto)
++	}
+ 	canonical := resolveAlias(name)
+ 	registryMu.RLock()
+ 	a, ok := registry[canonical]
+diff --git a/internal/agentname/agentname.go b/internal/agentname/agentname.go
+index f4683080..c3817571 100644
+--- a/internal/agentname/agentname.go
++++ b/internal/agentname/agentname.go
+@@ -9,6 +9,16 @@ import (
+ 
+ const ACPPrefix = "acp."
+ 
++// Auto is an agent-valued setting, not an agent: it asks for roborev's normal
++// availability order instead of a named agent. It resolves to host only as the last resort
++// under ROBOREV_HOST_AGENT=1.
++const Auto = "auto"
++
++// IsAuto reports whether name is the Auto selection keyword.
++func IsAuto(name string) bool {
++	return strings.TrimSpace(name) == Auto
++}
++
+ var canonicalByName = map[string]string{
+ 	"codex":       "codex",
+ 	"claude-code": "claude-code",
+@@ -68,7 +78,7 @@ func ValidateReference(name string) error {
+ 	if name == "" {
+ 		return nil
+ 	}
+-	if _, builtIn := BuiltIn(name); builtIn {
++	if _, builtIn := BuiltIn(name); builtIn || name == Auto {
+ 		return nil
+ 	}
+ 	if _, canonicalACP := ACPConfigName(name); canonicalACP {
+diff --git a/internal/config/budget.go b/internal/config/budget.go
+index aad765bc..2131e59c 100644
+--- a/internal/config/budget.go
++++ b/internal/config/budget.go
+@@ -43,6 +43,9 @@ func (b BudgetConfig) Validate() error {
+ 		if canonical == "test" {
+ 			return fmt.Errorf("budget.agent_costs: the test agent cannot be used for budget routing")
+ 		}
++		if canonical == agentname.Auto {
++			return fmt.Errorf("budget.agent_costs: %q is a selection keyword, not an agent", agentname.Auto)
++		}
+ 		if canonical == "host" {
+ 			return fmt.Errorf("budget.agent_costs: the host agent cannot be used for budget routing")
+ 		}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 8f8fec16..18ad0c16 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -536,7 +536,10 @@ func validateAgentReferences(cfg any) error {
+ 		if err := agentname.ValidateReference(name); err != nil {
+ 			return fmt.Errorf("%s: %w", path, err)
+ 		}
+-		return validateClassifierReference(path, name)
++		if err := validateClassifierReference(path, name); err != nil {
++			return err
++		}
++		return validateAutoReference(path, name)
+ 	})
+ }
+ 
+@@ -553,6 +556,22 @@ func validateClassifierReference(path, name string) error {
+ 	return nil
+ }
+ 
++// validateAutoReference accepts "auto" only in the top-level agent and
++// workflow agent keys. The classifier needs a named schema-capable agent, and
++// nested agents (panels, subagents, experiments) are always explicit.
++func validateAutoReference(path, name string) error {
++	if !agentname.IsAuto(name) {
++		return nil
++	}
++	if isClassifierKey(path) {
++		return fmt.Errorf("%s: %q is not supported for the classifier; name a schema-capable agent such as claude-code", path, agentname.Auto)
++	}
++	if strings.ContainsAny(path, ".[") {
++		return fmt.Errorf("%s: %q is only supported in default_agent, agent and workflow agent keys", path, agentname.Auto)
++	}
++	return nil
++}
++
+ // walkAgentReferences calls visit for every agent name a config struct sets:
+ // string fields tagged "agent" or "*_agent", "agents" slices, and the keys of
+ // "reviews" maps. The path is the dotted TOML key that holds the name.
+diff --git a/internal/config/model_source_test.go b/internal/config/model_source_test.go
+new file mode 100644
+index 00000000..9b1734ee
+--- /dev/null
++++ b/internal/config/model_source_test.go
+@@ -0,0 +1,92 @@
++package config
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestModelSourceValuesPassValidation(t *testing.T) {
++	for _, value := range []string{"auto", "host", "claude", "codex"} {
++		t.Run(value, func(t *testing.T) {
++			dir := t.TempDir()
++			globalPath := filepath.Join(dir, "config.toml")
++			require.NoError(t, os.WriteFile(globalPath, []byte("default_agent = \""+value+"\"\ndefault_backup_agent = \""+value+"\"\nreview_agent = \""+value+"\"\ndefault_model = \"m1\"\n"), 0o600))
++			global, err := LoadGlobalFrom(globalPath)
++			require.NoError(t, err)
++			require.NoError(t, global.Validate())
++			assert.Equal(t, value, ResolveAgent("", "", global))
++
++			repo := t.TempDir()
++			require.NoError(t, os.WriteFile(filepath.Join(repo, ".roborev.toml"), []byte("agent = \""+value+"\"\nbackup_agent = \""+value+"\"\n"), 0o600))
++			require.NoError(t, ValidateRepoConfig(repo))
++
++			viaSet := &Config{}
++			require.NoError(t, SetConfigValue(viaSet, "default_agent", value))
++			require.NoError(t, viaSet.Validate())
++			assert.Equal(t, value, viaSet.DefaultAgent)
++		})
++	}
++}
++
++// classify_agent = "auto" is rejected, not resolved: the classifier needs a
++// named schema-capable agent. Nested agent keys are always explicit.
++func TestAutoRejectedOutsideTopLevelAgentKeys(t *testing.T) {
++	tests := []struct {
++		name, toml, want string
++	}{
++		{name: "classify_agent", toml: "classify_agent = \"auto\"\n", want: "classify_agent: \"auto\" is not supported for the classifier"},
++		{name: "classify_backup_agent", toml: "classify_backup_agent = \"auto\"\n", want: "classify_backup_agent: \"auto\" is not supported for the classifier"},
++		{name: "nested ci synthesis agent", toml: "[ci]\nsynthesis_agent = \"auto\"\n", want: "ci.synthesis_agent: \"auto\" is only supported in default_agent"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "config.toml")
++			require.NoError(t, os.WriteFile(path, []byte(tt.toml), 0o600))
++			global, err := LoadGlobalFrom(path)
++			if err == nil {
++				err = global.Validate()
++			}
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tt.want)
++		})
++	}
++
++	repo := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(repo, ".roborev.toml"), []byte("classify_agent = \"auto\"\n"), 0o600))
++	err := ValidateRepoConfig(repo)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "not supported for the classifier")
++}
++
++func TestModelSourceRepoOverridesGlobal(t *testing.T) {
++	tests := []struct {
++		name, global, globalModel, repo, repoModel string
++		wantAgent, wantModel                       string
++	}{
++		{name: "unset", wantAgent: "codex"},
++		{name: "global only", global: "host", globalModel: "g", wantAgent: "host", wantModel: "g"},
++		{name: "repo auto over global host", global: "host", globalModel: "g", repo: "auto", wantAgent: "auto", wantModel: "g"},
++		{name: "repo host over global auto", global: "auto", repo: "host", repoModel: "r", wantAgent: "host", wantModel: "r"},
++		{name: "repo cli over global host", global: "host", repo: "claude", repoModel: "sonnet", wantAgent: "claude", wantModel: "sonnet"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			global := &Config{DefaultAgent: tt.global, DefaultModel: tt.globalModel}
++			repo := &RepoConfig{Agent: tt.repo, Model: tt.repoModel}
++			assert.Equal(t, tt.wantAgent, ResolveAgentFromConfig("", repo, global))
++			assert.Equal(t, tt.wantModel, ResolveModelFromConfig("", repo, global))
++			assert.Equal(t, "gemini", ResolveAgentFromConfig("gemini", repo, global), "explicit flag still wins")
++		})
++	}
++}
++
++func TestBudgetRejectsAutoAgentCost(t *testing.T) {
++	b := BudgetConfig{Enabled: true, DailyLimitCents: 100, AgentCosts: map[string]int{"auto": 5}}
++	err := b.Validate()
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "selection keyword")
++}
+diff --git a/internal/daemon/auto_backup_test.go b/internal/daemon/auto_backup_test.go
+new file mode 100644
+index 00000000..6240d60e
+--- /dev/null
++++ b/internal/daemon/auto_backup_test.go
+@@ -0,0 +1,546 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++	"uuid"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/config"
++	"go.kenn.io/roborev/internal/storage"
++	"go.kenn.io/roborev/internal/testutil"
++)
++
++func stubAgentPath(t *testing.T, commands ...string) {
++	t.Helper()
++	dir := t.TempDir()
++	for _, c := range commands {
++		require.NoError(t, os.WriteFile(filepath.Join(dir, c), []byte("#!/bin/sh\nexit 1\n"), 0o755))
++	}
++	t.Setenv("PATH", dir)
++}
++
++// An "auto" backup is pinned at enqueue to a concrete agent other than the
++// selected one, and never carries the configured backup model.
++func TestAutoBackupPinnedAtEnqueueWithoutModel(t *testing.T) {
++	noHostMarker(t)
++	stubAgentPath(t, "codex", "claude")
++	cfg := config.DefaultConfig()
++	cfg.DefaultAgent = "codex"
++	cfg.DefaultBackupAgent = "auto"
++	cfg.DefaultModel = "gpt-x"
++	cfg.DefaultBackupModel = "sonnet"
++	repoCfg := &config.RepoConfig{}
++	res, err := agent.ResolveWorkflowConfigFromConfig("", repoCfg, cfg, "review", "")
++	require.NoError(t, err)
++
++	name, model := backupExecutionForSelectedAgent(res, "", "codex", repoCfg, cfg)
++	assert.Equal(t, "claude-code", name)
++	assert.Empty(t, model, "auto backup must not get the generic backup model")
++
++	name, model = backupExecutionForSelectedAgent(res, "", "claude-code", repoCfg, cfg)
++	assert.Equal(t, "codex", name)
++	assert.Empty(t, model)
++
++	stubAgentPath(t, "codex")
++	name, model = backupExecutionForSelectedAgent(res, "", "codex", repoCfg, cfg)
++	assert.Empty(t, name, "nothing other than the primary: no backup")
++	assert.Empty(t, model)
++}
++
++// An "auto" backup fails over at most once: after the hop, the job does not
++// re-resolve auto back to the agent that failed first and does not get a
++// fresh set of retries. FailoverJob resets retry_count, so the second failure
++// is checked at retry 0 (the normal case) as well as after a retry.
++func TestAutoBackupFailsOverOnceWithoutResettingRetries(t *testing.T) {
++	for _, tc := range []struct {
++		name        string
++		workflow    string
++		storedAgent string
++		storedModel string
++	}{
++		{name: "workflow auto backup", workflow: "auto"},
++		{name: "stored auto backup", storedAgent: "auto", storedModel: "sonnet"},
++	} {
++		for _, retries := range []int{0, 1} {
++			t.Run(fmt.Sprintf("%s/retries=%d", tc.name, retries), func(t *testing.T) {
++				noHostMarker(t)
++				wtc := newWorkerTestContext(t, 1)
++				cfg := config.DefaultConfig()
++				cfg.DefaultBackupAgent = tc.workflow
++				cfg.DefaultBackupModel = "sonnet"
++				wtc.reconfigurePool(cfg)
++				sha := testutil.GetHeadSHA(t, wtc.TmpDir)
++				commit, err := wtc.DB.GetOrCreateCommit(wtc.Repo.ID, sha, "Author", "Subject", time.Now())
++				require.NoError(t, err)
++				_, err = wtc.DB.EnqueueJob(storage.EnqueueOpts{
++					RepoID: wtc.Repo.ID, CommitID: commit.ID, GitRef: sha, Agent: "codex",
++					BackupAgent: tc.storedAgent, BackupModel: tc.storedModel,
++				})
++				require.NoError(t, err)
++				stubAgentPath(t, "codex", "claude")
++
++				job, err := wtc.DB.ClaimJob(testWorkerID)
++				require.NoError(t, err)
++				require.NotNil(t, job)
++				wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "codex broke")
++
++				hopped, err := wtc.DB.GetJobByID(job.ID)
++				require.NoError(t, err)
++				assert.Equal(t, storage.JobStatusQueued, hopped.Status)
++				assert.Equal(t, "claude-code", hopped.Agent, "auto resolves to an agent other than the failed one")
++				assert.Empty(t, hopped.Model, "auto backup gets no configured model")
++				assert.Equal(t, 0, hopped.RetryCount, "FailoverJob resets retries")
++
++				job, err = wtc.DB.ClaimJob(testWorkerID)
++				require.NoError(t, err)
++				require.NotNil(t, job)
++				require.Equal(t, 0, job.RetryCount)
++				if retries > 0 {
++					_, err = wtc.DB.Exec(`UPDATE review_jobs SET retry_count = ? WHERE id = ?`, retries, job.ID)
++					require.NoError(t, err)
++					job.RetryCount = retries
++				}
++				wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "claude broke")
++
++				final, err := wtc.DB.GetJobByID(job.ID)
++				require.NoError(t, err)
++				assert.Equal(t, storage.JobStatusFailed, final.Status, "no second hop back to codex")
++				assert.Equal(t, "claude-code", final.Agent)
++				assert.Equal(t, retries, final.RetryCount, "retries are not reset by a second failover")
++				again, err := wtc.DB.ClaimJob(testWorkerID)
++				require.NoError(t, err)
++				assert.Nil(t, again, "the failed job is not re-run")
++			})
++		}
++	}
++}
++
++// A rerun that selects "auto" stores the concrete agent auto resolved to.
++func TestRerunSelectedAutoIsPinned(t *testing.T) {
++	noHostMarker(t)
++	stubAgentPath(t, "claude")
++	cfg := config.DefaultConfig()
++	job := &storage.ReviewJob{
++		Agent: "codex", JobType: storage.JobTypeReview,
++		ReviewType: config.ReviewTypeDefault, RepoPath: t.TempDir(),
++	}
++	opts, err := resolveRerunOpts(job, cfg, nil, "auto")
++	require.NoError(t, err)
++	assert.Equal(t, "claude-code", opts.Agent)
++
++	stubAgentPath(t)
++	_, err = resolveRerunOpts(job, cfg, nil, "auto")
++	require.Error(t, err, "auto with nothing available is an error, not a stored 'auto'")
++}
++
++func stubAgentPathWithGit(t *testing.T, commands ...string) {
++	t.Helper()
++	gitPath, err := exec.LookPath("git")
++	require.NoError(t, err)
++	stubAgentPath(t, commands...)
++	require.NoError(t, os.Symlink(gitPath, filepath.Join(os.Getenv("PATH"), "git")))
++}
++
++// Fix-job enqueue pins an "auto" fix backup to a concrete agent.
++func TestFixJobPinsAutoBackup(t *testing.T) {
++	noHostMarker(t)
++	fixture := setupFixJobFixture(t, "repo-fix-auto", "fix-auto-abc")
++	fixture.server.configWatcher.Config().FixBackupAgent = "auto"
++	stubAgentPathWithGit(t, "claude")
++
++	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/fix", fixJobRequest{ParentJobID: fixture.reviewJob.ID})
++	w := httptest.NewRecorder()
++	fixture.server.httpServer.Handler.ServeHTTP(w, req)
++	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
++	var fixJob storage.ReviewJob
++	testutil.DecodeJSON(t, w, &fixJob)
++	stored, err := fixture.db.GetJobByID(fixJob.ID)
++	require.NoError(t, err)
++	assert.Equal(t, "test", stored.Agent)
++	assert.Equal(t, "claude-code", stored.BackupAgent, "auto is pinned at enqueue")
++	assert.Empty(t, stored.BackupModel)
++	assert.True(t, stored.BackupAuto, "the pin records that it came from auto")
++}
++
++// Goal-review enqueue pins an "auto" backup to a goal-capable agent.
++func TestGoalReviewPinsAutoBackup(t *testing.T) {
++	noHostMarker(t)
++	server, db, _ := newTestServer(t)
++	registerGoalReviewPi(t, server.configWatcher.Config())
++	repo := testutil.NewGitRepo(t)
++	repo.CommitFile(".roborev.toml", "review_agent = \"pi\"\nreview_backup_agent = \"auto\"\n", "configure")
++	goalArtifacts(t, repo.Path())
++	for _, tc := range []struct {
++		path []string
++		want string
++	}{
++		{path: []string{"claude"}, want: "claude-code"},
++		{path: []string{"codex"}, want: ""},
++		{path: []string{"codex", "claude"}, want: "claude-code"},
++	} {
++		stubAgentPathWithGit(t, tc.path...)
++		out, err := server.enqueueGoalReview(context.Background(), EnqueueRequest{RepoPath: repo.Path()})
++		require.NoError(t, err)
++		require.Less(t, out.Status, 300, "%v", out.Body)
++		jobs, err := db.ListJobs("", "", 0, 0, storage.WithJobType(storage.JobTypeGoalReview))
++		require.NoError(t, err)
++		require.NotEmpty(t, jobs)
++		stored, err := db.GetJobByID(jobs[0].ID)
++		require.NoError(t, err)
++		assert.Equal(t, "pi", stored.Agent)
++		assert.Equal(t, tc.want, stored.BackupAgent, "codex cannot run a goal review, so it is never pinned")
++		assert.True(t, stored.BackupAuto, "the pin records that it came from auto")
++	}
++}
++
++// CI matrix enqueue pins an "auto" backup to a concrete agent with no model.
++func TestCIMatrixPinsAutoBackup(t *testing.T) {
++	noHostMarker(t)
++	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
++	h.Cfg.DefaultBackupAgent = "auto"
++	h.Cfg.DefaultBackupModel = "sonnet"
++	stubAgentPath(t, "codex", "claude")
++	name, _, backup, backupModel, err := h.Poller.resolveMatrixMemberAgent(
++		h.Repo, nil, h.Cfg, config.AgentReviewType{Agent: "codex", ReviewType: "default"}, "thorough",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, "codex", name)
++	assert.Equal(t, "claude-code", backup)
++	assert.Empty(t, backupModel)
++	assert.True(t, backupIsAuto(nil, h.Cfg, config.WorkflowForReviewType("default")), "CI member opts record the auto pin")
++}
++
++type daemonHostMode struct {
++	name            string
++	set             func(*testing.T) string
++	named, explicit bool
++}
++
++var daemonHostModes = []daemonHostMode{
++	{name: "neither", set: noHostMarker},
++	{name: "marker 0", set: func(t *testing.T) string {
++		dir := noHostMarker(t)
++		t.Setenv(agent.HostMarkerEnv, "0")
++		t.Setenv("CURSOR_AGENT", "1")
++		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++		return dir
++	}},
++	{name: "detected only", named: true, set: func(t *testing.T) string {
++		dir := noHostMarker(t)
++		t.Setenv("CURSOR_AGENT", "1")
++		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++		return dir
++	}},
++	{name: "explicit marker", named: true, explicit: true, set: func(t *testing.T) string {
++		dir := noHostMarker(t)
++		t.Setenv(agent.HostMarkerEnv, "1")
++		return dir
++	}},
++}
++
++// The host ruling, end to end at the daemon: host runs where it is named
++// (primary or named backup) with ROBOREV_HOST_AGENT=1 or in a Cursor cloud
++// agent, and is an automatic pick (the auto primary, a CI blank agent, an auto
++// backup resolved at failover) only with ROBOREV_HOST_AGENT=1. Strict enqueue
++// with an auto backup never takes host. No agent CLI is on PATH, and no
++// handoff dir is created.
++func TestHostRulingByMarkerMode(t *testing.T) {
++	for _, mode := range daemonHostModes {
++		t.Run(mode.name, func(t *testing.T) {
++			hostDir := mode.set(t)
++			stubAgentPathWithGit(t)
++			named, auto := "", ""
++			if mode.named {
++				named = "host"
++			}
++			if mode.explicit {
++				auto = "host"
++			}
++			for _, row := range []struct {
++				name, agent, backup, want string
++			}{
++				{"explicit host primary", "host", "", named},
++				{"explicit host backup", "codex", "host", named},
++				{"unset agent", "", "", ""},
++				{"unset agent with auto backup", "", "auto", ""},
++				{"named primary with auto backup", "gemini", "auto", ""},
++				{"auto primary", "auto", "", auto},
++				{"strict named primary unavailable", "codex", "", ""},
++			} {
++				t.Run(row.name, func(t *testing.T) {
++					server, db, tmpDir := newTestServer(t)
++					cfg := server.configWatcher.Config()
++					cfg.DefaultAgent, cfg.DefaultBackupAgent = row.agent, row.backup
++					repoDir := filepath.Join(tmpDir, "repo")
++					testutil.InitTestGitRepo(t, repoDir)
++					req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{RepoPath: repoDir, GitRef: "HEAD"})
++					w := httptest.NewRecorder()
++					server.httpServer.Handler.ServeHTTP(w, req)
++					jobs, err := db.ListJobs("", "", 0, 0)
++					require.NoError(t, err)
++					if row.want == "" {
++						assert.GreaterOrEqual(t, w.Code, 400, w.Body.String())
++						assert.Empty(t, jobs, "nothing is enqueued")
++						return
++					}
++					require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
++					require.Len(t, jobs, 1)
++					assert.Equal(t, row.want, jobs[0].Agent)
++				})
++			}
++			t.Run("CI blank agent", func(t *testing.T) {
++				h := newCIPollerHarness(t, "git@github.com:acme/api.git")
++				name, _, _, _, err := h.Poller.resolveMatrixMemberAgent(
++					h.Repo, nil, h.Cfg, config.AgentReviewType{Agent: "", ReviewType: "default"}, "thorough",
++				)
++				if auto == "" {
++					assert.Error(t, err)
++					return
++				}
++				require.NoError(t, err)
++				assert.Equal(t, auto, name)
++			})
++			t.Run("auto backup resolution", func(t *testing.T) {
++				assert.Equal(t, auto, agent.ResolveAutoBackup(nil, config.DefaultConfig(), "codex", nil))
++			})
++			t.Run("rerun auto", func(t *testing.T) {
++				job := &storage.ReviewJob{
++					Agent: "codex", JobType: storage.JobTypeReview,
++					ReviewType: config.ReviewTypeDefault, RepoPath: t.TempDir(),
++				}
++				opts, err := resolveRerunOpts(job, config.DefaultConfig(), nil, "auto")
++				if err == nil && !mode.explicit {
++					assert.NotEqual(t, "host", opts.Agent)
++				}
++			})
++			assert.NoDirExists(t, hostDir)
++		})
++	}
++}
++
++// enqueueCodexJob queues a codex review with the given stored backup.
++func enqueueCodexJob(t *testing.T, wtc *workerTestContext, backup string, backupAuto bool) *storage.ReviewJob {
++	t.Helper()
++	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
++	commit, err := wtc.DB.GetOrCreateCommit(wtc.Repo.ID, sha, "Author", "Subject", time.Now())
++	require.NoError(t, err)
++	_, err = wtc.DB.EnqueueJob(storage.EnqueueOpts{
++		RepoID: wtc.Repo.ID, CommitID: commit.ID, GitRef: sha, Agent: "codex",
++		BackupAgent: backup, BackupAuto: backupAuto,
++	})
++	require.NoError(t, err)
++	job, err := wtc.DB.ClaimJob(testWorkerID)
++	require.NoError(t, err)
++	require.NotNil(t, job)
++	return job
++}
++
++// Runtime failover by marker mode. With ROBOREV_HOST_AGENT=1 an auto backup
++// that finds no CLI agent fails over to host. Without the marker, host is
++// skipped and the next agent is tried; when none is left the job fails with an
++// error naming ROBOREV_HOST_AGENT. A named host backup runs wherever host may
++// be named. No handoff dir is created: the job is only requeued.
++func TestHostFailoverByMarkerMode(t *testing.T) {
++	for _, mode := range daemonHostModes {
++		for _, tc := range []struct {
++			name, workflow, stored string
++			backupAuto             bool
++			path                   []string
++			want                   string
++		}{
++			{name: "workflow auto backup with nothing installed", workflow: "auto"},
++			{name: "stored auto backup with nothing installed", stored: "auto"},
++			{name: "workflow auto backup tries the next agent", workflow: "auto", path: []string{"claude"}, want: "claude-code"},
++			{name: "named host backup", stored: "host"},
++			{name: "named host backup from workflow", workflow: "host"},
++			{name: "empty auto pin", backupAuto: true},
++		} {
++			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
++				hostDir := mode.set(t)
++				want := tc.want
++				switch {
++				case want != "" || tc.backupAuto:
++				case agentNameIsHost(tc.stored) || agentNameIsHost(tc.workflow):
++					if mode.named {
++						want = "host"
++					}
++				case mode.explicit:
++					want = "host"
++				}
++				wtc := newWorkerTestContext(t, 1)
++				cfg := config.DefaultConfig()
++				cfg.DefaultBackupAgent = tc.workflow
++				wtc.reconfigurePool(cfg)
++				job := enqueueCodexJob(t, wtc, tc.stored, tc.backupAuto)
++				stubAgentPath(t, tc.path...)
++
++				wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "codex broke")
++
++				final, err := wtc.DB.GetJobByID(job.ID)
++				require.NoError(t, err)
++				if want != "" {
++					assert.Equal(t, storage.JobStatusQueued, final.Status)
++					assert.Equal(t, want, final.Agent)
++				} else {
++					assert.Equal(t, storage.JobStatusFailed, final.Status)
++					assert.Equal(t, "codex", final.Agent, "no failover to host")
++					if tc.backupAuto {
++						assert.Contains(t, final.Error, "found no available agent when the job was queued")
++					} else {
++						assert.Contains(t, final.Error, agent.HostMarkerEnv)
++					}
++				}
++				assert.NoDirExists(t, hostDir)
++			})
++		}
++	}
++}
++
++func agentNameIsHost(name string) bool { return agent.CanonicalName(name) == "host" }
++
++// An empty auto pin is final: an agent that became available after enqueue
++// is not picked up at failover.
++func TestEmptyAutoPinIsFrozen(t *testing.T) {
++	noHostMarker(t)
++	wtc := newWorkerTestContext(t, 1)
++	cfg := config.DefaultConfig()
++	cfg.DefaultBackupAgent = "auto"
++	wtc.reconfigurePool(cfg)
++	job := enqueueCodexJob(t, wtc, "", true)
++	stubAgentPath(t, "codex", "claude")
++
++	wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "codex broke")
++
++	final, err := wtc.DB.GetJobByID(job.ID)
++	require.NoError(t, err)
++	assert.Equal(t, storage.JobStatusFailed, final.Status)
++	assert.Equal(t, "codex", final.Agent, "the empty pin is not re-resolved")
++	assert.Contains(t, final.Error, "found no available agent when the job was queued")
++}
++
++// A host backup that auto pinned under ROBOREV_HOST_AGENT=1 runs after a
++// restart only while that marker is still set: a Cursor cloud agent alone
++// never makes host an automatic pick. A named host backup is honored wherever
++// host may be named.
++func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
++	for _, mode := range daemonHostModes {
++		t.Run(mode.name, func(t *testing.T) {
++			hostDir := mode.set(t)
++			wtc := newWorkerTestContext(t, 1)
++			stubAgentPath(t)
++			wantAuto, wantNamed := "", ""
++			if mode.explicit {
++				wantAuto = "host"
++			}
++			if mode.named {
++				wantNamed = "host"
++			}
++			auto := &storage.ReviewJob{Agent: "codex", BackupAgent: "host", BackupAuto: true}
++			assert.Equal(t, wantAuto, wtc.Pool.resolveBackupAgent(auto))
++			named := &storage.ReviewJob{Agent: "codex", BackupAgent: "host"}
++			assert.Equal(t, wantNamed, wtc.Pool.resolveBackupAgent(named))
++			assert.NoDirExists(t, hostDir)
++		})
++	}
++}
++
++// An experiment's single review pins its backup at enqueue and records
++// whether the pin came from auto, including an empty pin; a named backup is
++// not marked.
++func TestExperimentReviewRecordsAutoPin(t *testing.T) {
++	for _, tc := range []struct {
++		name, backup string
++		path         []string
++		wantBackup   string
++		wantAuto     bool
++	}{
++		{name: "auto pinned", backup: "auto", path: []string{"codex"}, wantBackup: "codex", wantAuto: true},
++		{name: "auto pinned empty", backup: "auto", wantAuto: true},
++		{name: "named backup", backup: "claude-code", path: []string{"codex"}, wantBackup: "claude-code"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			noHostMarker(t)
++			server, db, _ := newTestServer(t)
++			enabled, ratio := true, 1.0
++			server.configWatcher.Config().Experiments = map[string]config.ExperimentDefinition{
++				"backup-v1": {
++					Enabled: &enabled, Ratio: &ratio,
++					Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowReview},
++					Config:    map[string]any{"backup_agent": tc.backup},
++				},
++			}
++			repo := testutil.NewGitRepo(t)
++			repo.CommitFile("review.go", "package review\n", "add review")
++			stubAgentPathWithGit(t, tc.path...)
++			job := enqueueViaHTTP(t, server, EnqueueRequest{
++				RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test", Panel: config.PanelNone,
++			})
++			stored, err := db.GetJobByID(job.ID)
++			require.NoError(t, err)
++			assert.Equal(t, tc.wantBackup, stored.BackupAgent)
++			assert.Equal(t, tc.wantAuto, stored.BackupAuto)
++		})
++	}
++}
++
++// Panel members and CI panel members record an auto pin.
++func TestPanelMembersRecordAutoPin(t *testing.T) {
++	noHostMarker(t)
++	stubAgentPath(t, "codex", "claude")
++	cfg := config.DefaultConfig()
++	cfg.DefaultBackupAgent = "auto"
++	members := []config.ResolvedMember{{Name: "m1", Agent: "codex"}}
++
++	opts, err := panelMemberOpts(targetDescriptor{}, "p", uuid.New(), members, nil, cfg)
++	require.NoError(t, err)
++	require.Len(t, opts, 1)
++	assert.Equal(t, "claude-code", opts[0].BackupAgent)
++	assert.True(t, opts[0].BackupAuto, "panel member")
++
++	p := &CIPoller{}
++	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
++		return "prebuilt prompt", nil
++	}
++	memberOpts, _, err := p.buildPanelOpts(context.Background(), buildPanelOptsInput{
++		repo: &storage.Repo{ID: 1, RootPath: t.TempDir()}, repoCfg: &config.RepoConfig{}, cfg: cfg,
++		ghRepo: "acme/api", gitRef: "base..head", synth: config.SynthesisSpec{Agent: "codex"},
++		members: []config.ResolvedMember{{Name: "m1", Agent: "codex", BackupAgent: "claude-code"}},
++	})
++	require.NoError(t, err)
++	require.Len(t, memberOpts, 1)
++	assert.True(t, memberOpts[0].BackupAuto, "CI panel member")
++}
++
++// An auto backup resolved at failover only picks an agent that can run the
++// job: goal reviews need a goal agent, custom reviews structured output.
++func TestWorkerAutoBackupHonorsReviewType(t *testing.T) {
++	for _, tc := range []struct {
++		name, reviewType, primary string
++		path                      []string
++		want                      string
++	}{
++		{name: "custom skips gemini", reviewType: "custom", primary: "claude-code", path: []string{"gemini"}},
++		{name: "default takes gemini", reviewType: config.ReviewTypeDefault, primary: "claude-code", path: []string{"gemini"}, want: "gemini"},
++		{name: "goal skips codex", reviewType: config.ReviewTypeGoal, primary: "pi", path: []string{"codex"}},
++		{name: "goal takes claude", reviewType: config.ReviewTypeGoal, primary: "pi", path: []string{"codex", "claude"}, want: "claude-code"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			noHostMarker(t)
++			wtc := newWorkerTestContext(t, 1)
++			stubAgentPath(t, tc.path...)
++			job := &storage.ReviewJob{Agent: tc.primary, ReviewType: tc.reviewType, BackupAgent: "auto"}
++			assert.Equal(t, tc.want, wtc.Pool.resolveBackupAgent(job))
++		})
++	}
++}
+diff --git a/internal/daemon/ci_poller.go b/internal/daemon/ci_poller.go
+index ac4428ba..ff0193ca 100644
+--- a/internal/daemon/ci_poller.go
++++ b/internal/daemon/ci_poller.go
+@@ -24,6 +24,7 @@ import (
+ 	googlegithub "github.com/google/go-github/v91/github"
+ 
+ 	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/config"
+ 	gitpkg "go.kenn.io/roborev/internal/git"
+ 	ghpkg "go.kenn.io/roborev/internal/github"
+@@ -1284,14 +1285,14 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
+ 		model = override
+ 	}
+ 	backupAgent, backupModel := backupExecutionForSelectedAgent(
+-		resolution, resolvedAgent, repoCfg, cfg,
++		resolution, member.ReviewType, resolvedAgent, repoCfg, cfg,
+ 	)
+ 	return resolvedAgent, model, backupAgent, backupModel, nil
+ }
+ 
+ func backupExecutionForSelectedAgent(
+ 	resolution agent.WorkflowConfig,
+-	selectedAgent string,
++	reviewType, selectedAgent string,
+ 	repoCfg *config.RepoConfig,
+ 	cfg *config.Config,
+ ) (string, string) {
+@@ -1299,10 +1300,31 @@ func backupExecutionForSelectedAgent(
+ 	if backupAgent == "" || resolution.AgentMatches(selectedAgent, backupAgent) {
+ 		return "", ""
+ 	}
++	// An "auto" backup is pinned to a concrete agent other than the selected
++	// one now, so failover is a single hop. It gets no model: configured
++	// backup models name a model for a specific agent, not whatever auto finds.
++	if agentname.IsAuto(backupAgent) {
++		name := agent.ResolveAutoBackup(repoCfg, cfg, selectedAgent, autoBackupEligible(reviewType))
++		if resolution.AgentMatches(selectedAgent, name) {
++			return "", ""
++		}
++		return name, ""
++	}
+ 	return agent.StorageNameFromConfig(backupAgent, repoCfg, cfg),
+ 		resolution.ModelForSelectedAgent(backupAgent, "")
+ }
+ 
++// pinnedAutoBackup is the concrete agent an "auto" workflow backup stands for
++// at enqueue, so failover is a single hop. Named workflow backups keep
++// failover-time resolution.
++func pinnedAutoBackup(resolution agent.WorkflowConfig, reviewType, selectedAgent string) string {
++	if !agentname.IsAuto(strings.TrimSpace(resolution.BackupAgent)) {
++		return ""
++	}
++	name, _ := backupExecutionForSelectedAgent(resolution, reviewType, selectedAgent, resolution.RepoConfig, resolution.GlobalConfig)
++	return name
++}
++
+ // resolveMatrixMemberAgent resolves the effective agent and model for one
+ // matrix entry through workflow config, honoring the test agentResolverFn seam.
+ func (p *CIPoller) resolveMatrixMemberAgent(
+@@ -1358,7 +1380,7 @@ func (p *CIPoller) resolveMatrixMemberAgent(
+ 		)
+ 	}
+ 	backupAgent, backupModel := backupExecutionForSelectedAgent(
+-		resolution, resolvedAgent, repoCfg, cfg,
++		resolution, entry.ReviewType, resolvedAgent, repoCfg, cfg,
+ 	)
+ 	ciModel := cfg.CI.Model
+ 	if config.ExperimentOverridesWorkflowModel(repoCfg, workflow, reasoning) {
+@@ -1538,7 +1560,7 @@ func (p *CIPoller) maybeAppendDesignMember(
+ 				designModel = override
+ 			}
+ 			backupAgent, backupModel = backupExecutionForSelectedAgent(
+-				resolution, designAgent, repoCfg, cfg,
++				resolution, config.ReviewTypeDesign, designAgent, repoCfg, cfg,
+ 			)
+ 		}
+ 		return append(members, config.ResolvedMember{
+@@ -1684,6 +1706,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
+ 			Model:                 m.Model,
+ 			BackupAgent:           m.BackupAgent,
+ 			BackupModel:           m.BackupModel,
++			BackupAuto:            backupIsAuto(in.repoCfg, in.cfg, config.WorkflowForReviewType(m.ReviewType)),
+ 			Provider:              m.Provider,
+ 			Reasoning:             m.Reasoning,
+ 			ReviewType:            m.ReviewType,
+diff --git a/internal/daemon/goal_review.go b/internal/daemon/goal_review.go
+index cf6e7da4..97efb48c 100644
+--- a/internal/daemon/goal_review.go
++++ b/internal/daemon/goal_review.go
+@@ -16,6 +16,7 @@ import (
+ 	gitrepo "go.kenn.io/kit/git/repo"
+ 
+ 	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/config"
+ 	"go.kenn.io/roborev/internal/goalreview"
+ 	"go.kenn.io/roborev/internal/kata"
+@@ -84,7 +85,8 @@ func (s *Server) enqueueGoalReviewWithConfig(ctx context.Context, req EnqueueReq
+ 	if filepath.Clean(root) != filepath.Clean(mainRoot) {
+ 		worktree = root
+ 	}
+-	job, err := s.db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, GitRef: snapshot.ID(), Branch: gitrepo.CurrentBranch(ctx, root), Agent: a.Name(), Model: resolution.ModelForSelectedAgent(a.Name(), req.Model), Provider: req.Provider, RequestedModel: req.Model, RequestedProvider: req.Provider, Reasoning: reasoning, ReviewType: config.ReviewTypeGoal, JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true, Label: "Superpowers " + snapshot.Stage + " review", WorktreePath: worktree, Source: req.Source})
++	backup := pinnedAutoBackup(resolution, config.ReviewTypeGoal, a.Name())
++	job, err := s.db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, GitRef: snapshot.ID(), Branch: gitrepo.CurrentBranch(ctx, root), Agent: a.Name(), BackupAgent: backup, BackupAuto: agentname.IsAuto(resolution.BackupAgent), Model: resolution.ModelForSelectedAgent(a.Name(), req.Model), Provider: req.Provider, RequestedModel: req.Model, RequestedProvider: req.Provider, Reasoning: reasoning, ReviewType: config.ReviewTypeGoal, JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true, Label: "Superpowers " + snapshot.Stage + " review", WorktreePath: worktree, Source: req.Source})
+ 	if err != nil {
+ 		return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+ 	}
+diff --git a/internal/daemon/panel_enqueue.go b/internal/daemon/panel_enqueue.go
+index 0c470458..e3ddba36 100644
+--- a/internal/daemon/panel_enqueue.go
++++ b/internal/daemon/panel_enqueue.go
+@@ -697,6 +697,7 @@ func panelMemberOpts(
+ 		if err != nil {
+ 			return nil, fmt.Errorf("panel member %q: %w", m.Name, err)
+ 		}
++		o.BackupAuto = backupIsAuto(repoCfg, cfg, workflowForPanelReviewType(m.ReviewType))
+ 		o.Provider = m.Provider
+ 		o.Reasoning, o.ReviewType = m.Reasoning, m.ReviewType
+ 		o.PanelRunUUID, o.PanelRole = &runUUID, storage.PanelRoleMember
+@@ -752,7 +753,7 @@ func resolvePanelMemberExecution(
+ 		model = override
+ 	}
+ 	backupAgent, backupModel := backupExecutionForSelectedAgent(
+-		resolution, selectedName, repoCfg, cfg,
++		resolution, m.ReviewType, selectedName, repoCfg, cfg,
+ 	)
+ 	return selectedName, model, backupAgent, backupModel, nil
+ }
+diff --git a/internal/daemon/server.go b/internal/daemon/server.go
+index 24f06c89..c4acb0b4 100644
+--- a/internal/daemon/server.go
++++ b/internal/daemon/server.go
+@@ -30,6 +30,7 @@ import (
+ 
+ 	"go.kenn.io/roborev/internal/agent"
+ 	"go.kenn.io/roborev/internal/agenthook"
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/autofix"
+ 	"go.kenn.io/roborev/internal/backfill"
+ 	"go.kenn.io/roborev/internal/config"
+@@ -1050,6 +1051,10 @@ func resolveRerunOpts(
+ 				return storage.ReenqueueOpts{}, err
+ 			}
+ 		}
++		if agentname.IsAuto(selectedAgent) {
++			// Pin auto to the agent it resolved to, as enqueue does.
++			selectedAgent = selected.Name()
++		}
+ 		storageName := agent.StorageNameFromConfig(
+ 			agent.CanonicalName(selectedAgent), resolution.RepoConfig, cfg,
+ 		)
+@@ -3143,7 +3148,7 @@ func (s *Server) resolveSingleAgent(
+ 		return resolvedSingleAgent{}, out
+ 	}
+ 	backupAgent, backupModel := backupExecutionForSelectedAgent(
+-		resolution, agentName, in.repoCfg, in.cfg,
++		resolution, in.req.ReviewType, agentName, in.repoCfg, in.cfg,
+ 	)
+ 	return resolvedSingleAgent{
+ 		Agent:       agentName,
+@@ -3174,6 +3179,7 @@ func (s *Server) enqueueSingleAgent(
+ 	if in.experiment != nil {
+ 		o.BackupAgent = execution.BackupAgent
+ 		o.BackupModel = execution.BackupModel
++		o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
+ 		assignment, assignErr := storageAssignmentForExperiment(
+ 			in.experiment, experimentPlanForJob(o),
+ 		)
+@@ -3686,6 +3692,8 @@ func (s *Server) humaFixJob(
+ 		Agentic:      true,
+ 		Label:        fmt.Sprintf("fix #%d", req.ParentJobID),
+ 		JobType:      storage.JobTypeFix,
++		BackupAgent:  pinnedAutoBackup(resolution, "", agentName),
++		BackupAuto:   agentname.IsAuto(resolution.BackupAgent),
+ 		ParentJobID:  req.ParentJobID,
+ 		WorktreePath: worktreePath,
+ 		MinSeverity:  fixMinSev,
+diff --git a/internal/daemon/worker.go b/internal/daemon/worker.go
+index c0a5650e..f82439ae 100644
+--- a/internal/daemon/worker.go
++++ b/internal/daemon/worker.go
+@@ -21,6 +21,7 @@ import (
+ 	gitworktree "go.kenn.io/kit/git/worktree"
+ 
+ 	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/agentname"
+ 	"go.kenn.io/roborev/internal/backfill"
+ 	"go.kenn.io/roborev/internal/config"
+ 	gitpkg "go.kenn.io/roborev/internal/git"
+@@ -1904,6 +1905,16 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+ 	if job.FrozenExperimentPlan != nil && job.BackupAgent == "" {
+ 		return ""
+ 	}
++	if job.BackupAuto && (job.BackupAgent == "" ||
++		agent.CanonicalName(job.BackupAgent) == "host" && !agent.HostAllowed(agent.HostAuto)) {
++		// An "auto" pin is final, even an empty one. A host that auto pinned
++		// under ROBOREV_HOST_AGENT=1 runs only while that marker is still
++		// set: a Cursor cloud agent alone never makes host an automatic pick.
++		return ""
++	}
++	if agentname.IsAuto(job.BackupAgent) {
++		return wp.resolveAutoBackupAgent(job)
++	}
+ 	if job.BackupAgent != "" {
+ 		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
+ 			return ""
+@@ -1934,6 +1945,9 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+ 	if backup == "" {
+ 		return ""
+ 	}
++	if agentname.IsAuto(backup) {
++		return wp.resolveAutoBackupAgent(job)
++	}
+ 	// Resolve exactly the configured backup using the config-aware path so
+ 	// command overrides and configured ACP aliases participate in failover
+ 	// without falling through to unrelated agents.
+@@ -1950,9 +1964,13 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+ 	return resolved.Name()
+ }
+ 
+-// skippedHostBackupNote names the marker when the job's stored or workflow
+-// backup is host but this daemon has no host model.
++// skippedHostBackupNote explains a missing backup on the final error: a
++// stored or workflow host backup this daemon cannot run, or an "auto" backup
++// that found no agent.
+ func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
++	if job.BackupAuto && job.BackupAgent == "" {
++		return fmt.Sprintf("\nbackup %q found no available agent when the job was queued", agentname.Auto)
++	}
+ 	backup := job.BackupAgent
+ 	if backup == "" && job.FrozenExperimentPlan == nil {
+ 		configRoot := job.RepoPath
+@@ -1963,9 +1981,56 @@ func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
+ 			backup = res.BackupAgent
+ 		}
+ 	}
++	if agentname.IsAuto(backup) && !job.BudgetRoutingLocked {
++		if wp.resolveAutoBackupAgent(job) == "" {
++			return agent.AutoBackupNotFound()
++		}
++	}
+ 	return agent.SkippedHostBackupNote(backup)
+ }
+ 
++// resolveAutoBackupAgent resolves an "auto" backup to a concrete agent other
++// than the one that just failed and able to run the job. FailoverJob resets
++// retry_count and sets budget_routing_locked, so a job that already failed
++// over (or was rerouted) does not hop again: re-resolving auto there could
++// pick the agent that failed first and loop between the two with fresh
++// retries.
++func (wp *WorkerPool) resolveAutoBackupAgent(job *storage.ReviewJob) string {
++	if job.BudgetRoutingLocked {
++		return ""
++	}
++	configRoot := job.RepoPath
++	if job.IsGoalReviewJob() {
++		configRoot = GoalReviewConfigRepoPath(job)
++	}
++	var repoCfg *config.RepoConfig
++	if strings.TrimSpace(configRoot) != "" {
++		repoCfg, _ = config.LoadRepoConfig(configRoot)
++	}
++	return agent.ResolveAutoBackup(repoCfg, wp.cfgGetter.Config(), job.Agent, autoBackupEligible(job.ReviewType))
++}
++
++// autoBackupEligible accepts the agents that can run a job of reviewType:
++// goal reviews need a goal-review agent, custom reviews structured output.
++func autoBackupEligible(reviewType string) func(string) bool {
++	return func(name string) bool {
++		a, err := agent.Get(name)
++		if err != nil {
++			return false
++		}
++		if reviewType == config.ReviewTypeGoal {
++			return goalreview.ValidateAgent(a) == nil
++		}
++		return agent.ValidateStructuredReviewSelection(reviewType, a) == nil
++	}
++}
++
++// backupIsAuto reports whether workflow's backup is "auto", which enqueue
++// pins; the job records that so the pin, even an empty one, stays final.
++func backupIsAuto(repoCfg *config.RepoConfig, cfg *config.Config, workflow string) bool {
++	return agentname.IsAuto(config.ResolveBackupAgentForWorkflowFromConfig(repoCfg, cfg, workflow))
++}
++
+ // resolveBackupModel returns the frozen experiment value when present.
+ // Ordinary jobs retain the workflow-config fallback.
+ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
+@@ -1975,6 +2040,9 @@ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
+ 	if job.FrozenExperimentPlan != nil {
+ 		return job.BackupModel
+ 	}
++	if agentname.IsAuto(job.BackupAgent) {
++		return ""
++	}
+ 	if job.BackupAgent != "" {
+ 		return job.BackupModel
+ 	}
+@@ -1996,7 +2064,7 @@ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
+ 		return ""
+ 	}
+ 	backup := strings.TrimSpace(resolution.BackupAgent)
+-	if backup == "" {
++	if backup == "" || agentname.IsAuto(backup) {
+ 		return ""
+ 	}
+ 	// Resolve the model for the concrete backup agent through the same
+diff --git a/internal/storage/db.go b/internal/storage/db.go
+index 691fa368..4171a55c 100644
+--- a/internal/storage/db.go
++++ b/internal/storage/db.go
+@@ -1129,6 +1129,14 @@ func (db *DB) migrate() error {
+ 			return fmt.Errorf("add budget_routing_locked column: %w", err)
+ 		}
+ 	}
++	// Local like budget_routing_locked: the backup came from an "auto" pin.
++	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'backup_auto'`).Scan(&count)
++	if err == nil && count == 0 {
++		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN backup_auto INTEGER NOT NULL DEFAULT 0`)
++	}
++	if err != nil {
++		return fmt.Errorf("add backup_auto column: %w", err)
++	}
+ 	for _, column := range []string{"budget_original_agent", "budget_original_backup_agent", "budget_original_backup_model"} {
+ 		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = ?`, column).Scan(&count)
+ 		if err != nil {
+diff --git a/internal/storage/job_columns.go b/internal/storage/job_columns.go
+index 18e36530..9cb9cd06 100644
+--- a/internal/storage/job_columns.go
++++ b/internal/storage/job_columns.go
+@@ -45,7 +45,7 @@ const jobSelectColumnsBase = `
+ 		       COALESCE(j.output_prefix, ''), j.parent_job_id, j.token_usage, COALESCE(j.worktree_path, ''), j.command_line,
+ 		       COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
+ 		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''), j.source_machine_id,
+-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0), COALESCE(j.non_voting, 0), j.budget_routing_locked,
++		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0), COALESCE(j.non_voting, 0), j.budget_routing_locked, j.backup_auto,
+ 		       j.budget_original_agent, j.budget_original_backup_agent, j.budget_original_backup_model,
+ 		       r.root_path, r.name, c.subject,
+ 		       j.dirty_files, j.analysis_type, j.analysis_files, j.analysis_commit_sha, `
+@@ -79,7 +79,7 @@ func jobScanDestinations(j *ReviewJob, f *reviewJobScanFields) []any {
+ 		&f.OutputPrefix, &f.ParentJobID, &f.TokenUsage, &f.WorktreePath, &f.CommandLine,
+ 		&f.MinSeverity, &f.BackupAgent, &f.BackupModel,
+ 		&f.SkipReason, &f.Source, &f.SourceMachineID,
+-		&f.PanelRunUUID, &f.PanelRole, &f.PanelName, &f.PanelMemberName, &f.PanelMemberIndex, &f.PanelMemberConfig, &f.ClaimBlocked, &f.NonVoting, &j.BudgetRoutingLocked,
++		&f.PanelRunUUID, &f.PanelRole, &f.PanelName, &f.PanelMemberName, &f.PanelMemberIndex, &f.PanelMemberConfig, &f.ClaimBlocked, &f.NonVoting, &j.BudgetRoutingLocked, &j.BackupAuto,
+ 		&j.BudgetOriginalAgent, &j.BudgetOriginalBackupAgent, &j.BudgetOriginalBackupModel,
+ 		&j.RepoPath, &j.RepoName, &f.CommitSubject,
+ 		&f.DirtyFiles, &f.AnalysisType, &f.AnalysisFiles, &f.AnalysisCommitSHA,
+diff --git a/internal/storage/jobs.go b/internal/storage/jobs.go
+index 10c0fd54..04024880 100644
+--- a/internal/storage/jobs.go
++++ b/internal/storage/jobs.go
+@@ -102,6 +102,7 @@ type EnqueueOpts struct {
+ 	// backup agent/model when the worker fails this job over to a backup.
+ 	BackupAgent string
+ 	BackupModel string
++	BackupAuto  bool // BackupAgent is the enqueue-time pin of an "auto" backup
+ 	// Panel relation (subagent review panels).
+ 	PanelRunUUID          *uuid.UUID                 // Groups member + synthesis jobs of one run
+ 	PanelRole             string                     // "", "member", or "synthesis"
+@@ -310,8 +311,8 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
+ 			status, job_type, review_type, patch_id, diff_content, dirty_files, prompt, agentic, prompt_prebuilt, output_prefix,
+ 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
+ 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, non_voting, claim_blocked, source,
+-			analysis_type, analysis_files, analysis_commit_sha)
+-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++			analysis_type, analysis_files, analysis_commit_sha, backup_auto)
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+ 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
+ 		sessionResumedInt, opts.ResumeSourceJobUUID,
+ 		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
+@@ -321,7 +322,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
+ 		uid, machineID, nowStr, opts.WorktreePath, normalizeMinSeverityForWrite(opts.MinSeverity), opts.BackupAgent, opts.BackupModel,
+ 		opts.PanelRunUUID, nullString(opts.PanelRole), nullString(opts.PanelName),
+ 		nullString(opts.PanelMemberName), opts.PanelMemberIndex, nullString(opts.PanelMemberConfigJSON), nonVotingInt, claimBlockedInt, nullString(opts.Source),
+-		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA))
++		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA), opts.BackupAuto)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -361,6 +362,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
+ 		MinSeverity:           normalizeMinSeverityForWrite(opts.MinSeverity),
+ 		BackupAgent:           opts.BackupAgent,
+ 		BackupModel:           opts.BackupModel,
++		BackupAuto:            opts.BackupAuto,
+ 		PanelRunUUID:          opts.PanelRunUUID,
+ 		PanelRole:             opts.PanelRole,
+ 		PanelName:             opts.PanelName,
+diff --git a/internal/storage/models.go b/internal/storage/models.go
+index 78679e42..f3e954a2 100644
+--- a/internal/storage/models.go
++++ b/internal/storage/models.go
+@@ -156,6 +156,7 @@ type ReviewJob struct {
+ 	ReusableSessionTarget string `json:"-"`
+ 
+ 	BudgetRoutingLocked       bool   `json:"-"` // Local retry/failover scheduling guard
++	BackupAuto                bool   `json:"-"` // BackupAgent is an "auto" pin, even if empty
+ 	BudgetOriginalAgent       string `json:"-"` // Pre-budget choice restored on manual rerun
+ 	BudgetOriginalBackupAgent string `json:"-"`
+ 	BudgetOriginalBackupModel string `json:"-"`
+-- 
+2.43.0
+

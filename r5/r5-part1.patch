@@ -1,0 +1,2575 @@
+From c3c7c0b5ad616a959d5480a5aeddf4d18d15623f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 19 Oct 2026 11:07:21 +0000
+Subject: [PATCH] Add host review backend gated on ROBOREV_HOST_AGENT=1
+
+The host agent hands a review to the model driving the current shell
+through a file handoff. Handoff files are published atomically and the
+answer is read only as a regular file, opened without blocking.
+
+ROBOREV_HOST_AGENT=1 attaches a host. The rule lives in
+HostMarker.Allows, and here every use needs the marker. Without it,
+naming host is a hard error on every resolver. Automatic selection
+never reaches host in this commit.
+
+check-agents never smoke-tests host, and budget routing rejects it, so
+this commit is safe on its own.
+---
+ cmd/roborev/check_agents.go            |    6 +
+ cmd/roborev/check_agents_test.go       |   39 +
+ cmd/roborev/completions.go             |    2 +-
+ cmd/roborev/completions_test.go        |   24 +
+ internal/agent/acp_resolution.go       |   17 +-
+ internal/agent/agent.go                |   11 +-
+ internal/agent/host.go                 |  356 ++++++++
+ internal/agent/host_fifo_other_test.go |    7 +
+ internal/agent/host_fifo_unix_test.go  |    7 +
+ internal/agent/host_test.go            |  694 +++++++++++++++
+ internal/agent/spec.go                 |    3 +
+ internal/agentname/agentname.go        |    1 +
+ internal/config/budget.go              |    3 +
+ internal/config/budget_test.go         |    1 +
+ internal/daemon/default_path_test.go   | 1090 ++++++++++++++++++++++++
+ internal/review/host_runner_test.go    |   60 ++
+ 16 files changed, 2316 insertions(+), 5 deletions(-)
+ create mode 100644 internal/agent/host.go
+ create mode 100644 internal/agent/host_fifo_other_test.go
+ create mode 100644 internal/agent/host_fifo_unix_test.go
+ create mode 100644 internal/agent/host_test.go
+ create mode 100644 internal/daemon/default_path_test.go
+ create mode 100644 internal/review/host_runner_test.go
+
+diff --git a/cmd/roborev/check_agents.go b/cmd/roborev/check_agents.go
+index 84257488..0f18683e 100644
+--- a/cmd/roborev/check_agents.go
++++ b/cmd/roborev/check_agents.go
+@@ -62,6 +62,12 @@ Examples:
+ 				if agentFilter != "" && name != agentFilter {
+ 					continue
+ 				}
++				if name == "host" {
++					// A smoke test would block on a handoff nobody answers.
++					fmt.Printf("  - %-14s not smoke-tested: reviews are handed off to the attached host model\n", name)
++					skipped++
++					continue
++				}
+ 
+ 				a, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
+ 				if err != nil {
+diff --git a/cmd/roborev/check_agents_test.go b/cmd/roborev/check_agents_test.go
+index 7cbfb7c9..4548441b 100644
+--- a/cmd/roborev/check_agents_test.go
++++ b/cmd/roborev/check_agents_test.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -47,3 +48,41 @@ func TestCheckAgentsDiscoversRepoACPAgentFromNestedDirectory(t *testing.T) {
+ 	assert.Regexp(t, `(?m)^  - acp\.goose\s+agent "acp\.goose" command "missing-nested-goose-acp" unavailable:`, output)
+ 	assert.Contains(t, output, "1 skipped")
+ }
++
++func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
++	for _, tc := range []struct {
++		marker, filter string
++		want, notWant  string
++	}{
++		{marker: "1", want: `(?m)^  - host\s+not smoke-tested`},
++		{marker: "1", filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
++		{marker: "0", notWant: `(?m)^  . host\s`},
++	} {
++		t.Run(fmt.Sprintf("marker=%s/filter=%s", tc.marker, tc.filter), func(t *testing.T) {
++			setupConfigEnv(t, "", "")
++			t.Setenv("ROBOREV_HOST_AGENT", tc.marker)
++			hostDir := filepath.Join(t.TempDir(), "host")
++			t.Setenv("ROBOREV_HOST_DIR", hostDir)
++			t.Setenv("ROBOREV_HOST_TIMEOUT", "1h")
++			t.Setenv("PATH", t.TempDir())
++
++			cmd := checkAgentsCmd()
++			args := []string{"--timeout", "1"}
++			if tc.filter != "" {
++				args = append(args, "--agent", tc.filter)
++			}
++			cmd.SetArgs(args)
++			cmd.SilenceUsage, cmd.SilenceErrors = true, true
++			output := captureOutput(t, cmd.Execute)
++
++			if tc.want != "" {
++				assert.Regexp(t, tc.want, output)
++			}
++			if tc.notWant != "" {
++				assert.NotRegexp(t, tc.notWant, output)
++			}
++			assert.NotRegexp(t, `(?m)^  \? host`, output, "host is never smoke-tested")
++			assert.NoDirExists(t, hostDir)
++		})
++	}
++}
+diff --git a/cmd/roborev/completions.go b/cmd/roborev/completions.go
+index 13a79857..e3b2041a 100644
+--- a/cmd/roborev/completions.go
++++ b/cmd/roborev/completions.go
+@@ -17,7 +17,7 @@ func registerAgentCompletion(cmd *cobra.Command) {
+ 	if err := cmd.RegisterFlagCompletionFunc("agent", func(cmd *cobra.Command, _ []string, _ string) ([]cobra.Completion, cobra.ShellCompDirective) {
+ 		cfg, err := config.LoadGlobal()
+ 		if err != nil {
+-			return agent.Available(), cobra.ShellCompDirectiveNoFileComp
++			return agent.ListedAgentNames(), cobra.ShellCompDirectiveNoFileComp
+ 		}
+ 		repoCfg, _, _ := loadCommandRepoConfig(cmd)
+ 		return agent.AvailableNamesFromConfig(repoCfg, cfg), cobra.ShellCompDirectiveNoFileComp
+diff --git a/cmd/roborev/completions_test.go b/cmd/roborev/completions_test.go
+index 960350b2..a27f269f 100644
+--- a/cmd/roborev/completions_test.go
++++ b/cmd/roborev/completions_test.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/spf13/cobra"
+@@ -69,3 +70,26 @@ func TestAgentFlagCompletionUsesCommandRepoFlag(t *testing.T) {
+ 	assert.NotContains(t, got, cobra.Completion("acp.goose"))
+ 	assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+ }
++
++func TestAgentFlagCompletionListsHostOnlyWithMarker(t *testing.T) {
++	for _, tc := range []struct {
++		name, globalTOML string
++	}{
++		{name: "config", globalTOML: ""},
++		{name: "fallback", globalTOML: "default_agent = [broken\n"},
++	} {
++		for _, marker := range []string{"0", "1"} {
++			t.Run(tc.name+"/marker="+marker, func(t *testing.T) {
++				env := setupConfigEnv(t, tc.globalTOML, "")
++				t.Chdir(env.RepoDir)
++				t.Setenv("ROBOREV_HOST_AGENT", marker)
++				cmd := reviewCmd()
++				completion, ok := cmd.GetFlagCompletionFunc("agent")
++				require.True(t, ok)
++				got, _ := completion(cmd, nil, "")
++				assert.Contains(t, got, cobra.Completion("codex"))
++				assert.Equal(t, marker == "1", slices.Contains(got, cobra.Completion("host")), "%v", got)
++			})
++		}
++	}
++}
+diff --git a/internal/agent/acp_resolution.go b/internal/agent/acp_resolution.go
+index 76f4d983..a619f95c 100644
+--- a/internal/agent/acp_resolution.go
++++ b/internal/agent/acp_resolution.go
+@@ -159,6 +159,10 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
+ 	if !ok {
+ 		return false
+ 	}
++	if name == hostAgentName {
++		// Only a lookup that names host gets here: automatic picks skip it.
++		return HostAllowed(HostNamed)
++	}
+ 	ca, ok := a.(CommandAgent)
+ 	if !ok {
+ 		return true // non-command agents (e.g. test) are always available
+@@ -200,6 +204,9 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ ) (Agent, error) {
+ 	rawPreferred := strings.TrimSpace(preferred)
+ 	preferred = resolveAlias(rawPreferred)
++	if err := requestedHostError(preferred); err != nil {
++		return nil, err
++	}
+ 
+ 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
+ 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
+@@ -246,7 +253,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 
+ // AvailableNamesFromConfig returns built-in and effective named ACP agents.
+ func AvailableNamesFromConfig(repoCfg *config.RepoConfig, cfg *config.Config) []string {
+-	known := Available()
++	known := ListedAgentNames()
+ 	for name := range config.ResolveACPAgentConfigsFromConfig(repoCfg, cfg) {
+ 		known = append(known, namedACPAgentName(name))
+ 	}
+@@ -322,6 +329,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
+ 	}
+ 
+ 	canonical := resolveAlias(rawName)
++	if err := requestedHostError(canonical); err != nil {
++		return nil, err
++	}
+ 	a, err := Get(canonical)
+ 	if err != nil {
+ 		return nil, &UnknownAgentError{
+@@ -351,6 +361,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
+ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred string, cfg *config.Config, backups ...string) (Agent, error) {
+ 	rawPreferred := strings.TrimSpace(preferred)
+ 	preferred = resolveAlias(rawPreferred)
++	if err := requestedHostError(preferred); err != nil {
++		return nil, err
++	}
+ 
+ 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
+ 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
+@@ -432,7 +445,7 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
+ 
+ 	var available []string
+ 	for _, name := range Available() {
+-		if name != "test" && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
++		if name != "test" && name != hostAgentName && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
+ 			available = append(available, name)
+ 		}
+ 	}
+diff --git a/internal/agent/agent.go b/internal/agent/agent.go
+index 2d61d323..02a1c905 100644
+--- a/internal/agent/agent.go
++++ b/internal/agent/agent.go
+@@ -257,6 +257,10 @@ func IsAvailable(name string) bool {
+ 	if !ok {
+ 		return false
+ 	}
++	if name == hostAgentName {
++		// Only a lookup that names host gets here: automatic picks skip it.
++		return HostAllowed(HostNamed)
++	}
+ 
+ 	// Check if agent implements CommandAgent interface
+ 	if ca, ok := a.(CommandAgent); ok {
+@@ -277,6 +281,9 @@ func IsAvailable(name string) bool {
+ func GetAvailable(preferred string, backups ...string) (Agent, error) {
+ 	// Resolve alias upfront for consistent comparisons
+ 	preferred = resolveAlias(preferred)
++	if err := requestedHostError(preferred); err != nil {
++		return nil, err
++	}
+ 
+ 	// Reject unknown agent names (typos, config mistakes).
+ 	// Known-but-unavailable agents still fall back below.
+@@ -285,7 +292,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
+ 		_, ok := registry[preferred]
+ 		registryMu.RUnlock()
+ 		if !ok {
+-			known := Available()
++			known := ListedAgentNames()
+ 			sort.Strings(known)
+ 			return nil, &UnknownAgentError{
+ 				Name:  preferred,
+@@ -327,7 +334,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
+ 	// recursive RLock deadlocks once a Register call is waiting.
+ 	var available []string
+ 	for _, name := range Available() {
+-		if name != "test" && IsAvailable(name) {
++		if name != "test" && name != hostAgentName && IsAvailable(name) {
+ 			available = append(available, name)
+ 		}
+ 	}
+diff --git a/internal/agent/host.go b/internal/agent/host.go
+new file mode 100644
+index 00000000..62a5ff18
+--- /dev/null
++++ b/internal/agent/host.go
+@@ -0,0 +1,356 @@
++package agent
++
++import (
++	"context"
++	"encoding/json/jsontext"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"slices"
++	"strings"
++	"syscall"
++	"time"
++
++	"go.kenn.io/roborev/internal/config"
++)
++
++const (
++	hostAgentName = "host"
++	// HostMarkerEnv attaches a host model; see HostMarker.Allows.
++	HostMarkerEnv           = "ROBOREV_HOST_AGENT"
++	hostTimeoutEnv          = "ROBOREV_HOST_TIMEOUT"
++	defaultHostTimeout      = 10 * time.Minute
++	defaultHostPollInterval = 500 * time.Millisecond
++	maxHostJobLabel         = 40
++)
++
++// HostAgent hands the review to the model driving the current shell through
++// prompt.md, schema.json and instructions.md in a fresh job directory, then
++// waits for the host to rename its answer into answer.md.
++type HostAgent struct {
++	Dir          string
++	Timeout      time.Duration
++	PollInterval time.Duration
++}
++
++func (a *HostAgent) Name() string                       { return hostAgentName }
++func (a *HostAgent) WithReasoning(ReasoningLevel) Agent { return a }
++func (a *HostAgent) WithAgentic(bool) Agent             { return a }
++func (a *HostAgent) WithModel(string) Agent             { return a }
++func (a *HostAgent) CommandLine() string                { return "host (file handoff in " + a.baseDir() + ")" }
++
++func (a *HostAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
++	return a.handoff(ctx, repoPath, commitSHA, prompt, nil, output)
++}
++
++func (a *HostAgent) ReviewWithSchema(ctx context.Context, repoPath, gitRef, prompt string, schema jsontext.Value, output io.Writer) (jsontext.Value, error) {
++	raw, err := a.handoff(ctx, repoPath, gitRef, prompt, schema, output)
++	if err != nil {
++		return nil, err
++	}
++	return jsontext.Value(raw), nil
++}
++
++func (a *HostAgent) baseDir() string {
++	if a.Dir != "" {
++		return a.Dir
++	}
++	if dir := os.Getenv("ROBOREV_HOST_DIR"); dir != "" {
++		return dir
++	}
++	return filepath.Join(config.DataDir(), "host")
++}
++
++func (a *HostAgent) timeout() (time.Duration, error) {
++	if a.Timeout > 0 {
++		return a.Timeout, nil
++	}
++	raw := strings.TrimSpace(os.Getenv(hostTimeoutEnv))
++	if raw == "" {
++		return defaultHostTimeout, nil
++	}
++	d, err := time.ParseDuration(raw)
++	if err != nil || d <= 0 {
++		return 0, fmt.Errorf("host agent: invalid %s %q: want a positive duration such as 10m", hostTimeoutEnv, raw)
++	}
++	return d, nil
++}
++
++func (a *HostAgent) pollInterval() time.Duration {
++	if a.PollInterval > 0 {
++		return a.PollInterval
++	}
++	return defaultHostPollInterval
++}
++
++var unsafeJobChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
++
++// hostJobLabel turns a git ref into a short directory-name prefix that cannot
++// escape the handoff directory or hide the job.
++func hostJobLabel(gitRef string) string {
++	label := unsafeJobChars.ReplaceAllString(gitRef, "_")
++	if len(label) > maxHostJobLabel {
++		label = label[:maxHostJobLabel]
++	}
++	label = strings.TrimLeft(label, ".")
++	if label == "" {
++		return "review"
++	}
++	return label
++}
++
++func (a *HostAgent) handoff(ctx context.Context, repoPath, gitRef, prompt string, schema jsontext.Value, output io.Writer) (string, error) {
++	timeout, err := a.timeout()
++	if err != nil {
++		return "", err
++	}
++	base := a.baseDir()
++	if err := os.MkdirAll(base, 0o700); err != nil {
++		return "", fmt.Errorf("host agent: create handoff dir: %w", err)
++	}
++	jobDir, err := os.MkdirTemp(base, hostJobLabel(gitRef)+"-")
++	if err != nil {
++		return "", fmt.Errorf("host agent: create job dir: %w", err)
++	}
++	defer os.RemoveAll(jobDir)
++
++	if err := writeHandoffFile(jobDir, "prompt.md", []byte(prompt)); err != nil {
++		return "", err
++	}
++	format := "Plain-text review in the format requested at the end of prompt.md."
++	if len(schema) > 0 {
++		if err := writeHandoffFile(jobDir, "schema.json", schema); err != nil {
++			return "", err
++		}
++		format = "Exactly one JSON document that validates against schema.json " +
++			"(no prose, no code fences). Keep schema_version as given in the schema; " +
++			"a fail verdict needs at least one finding."
++	}
++	instructions := fmt.Sprintf(`# roborev host review handoff
++
++Repository: %s
++Git ref: %s
++
++1. Read prompt.md here and review the change it describes, using the repository above.
++2. Output format: %s
++3. Write the answer to answer.md.tmp, then rename it to answer.md (only a regular answer.md is read).
++4. roborev waits %s (the host handoff timeout, %s) for answer.md, then fails and removes this directory.
++`, repoPath, gitRef, format, timeout, hostTimeoutEnv)
++	if err := writeHandoffFile(jobDir, "instructions.md", []byte(instructions)); err != nil {
++		return "", err
++	}
++	answerPath := filepath.Join(jobDir, "answer.md")
++	if output != nil {
++		fmt.Fprintf(output, "host agent: handoff written to %s\nhost agent: waiting up to %s for %s\n", jobDir, timeout, answerPath)
++	}
++	return waitForHostAnswer(ctx, answerPath, timeout, a.pollInterval())
++}
++
++// writeHandoffFile publishes name atomically (synced temp file, then rename),
++// so the host never reads a partial file. A planted file at name is refused.
++func writeHandoffFile(dir, name string, data []byte) error {
++	final := filepath.Join(dir, name)
++	err := fmt.Errorf("already exists")
++	if _, statErr := os.Lstat(final); errors.Is(statErr, os.ErrNotExist) {
++		err = writeSyncedTemp(dir, name, data, final)
++	}
++	if err != nil {
++		return fmt.Errorf("host agent: write %s: %w", name, err)
++	}
++	return nil
++}
++
++func writeSyncedTemp(dir, name string, data []byte, final string) error {
++	f, err := os.CreateTemp(dir, "."+name+".tmp-*")
++	if err != nil {
++		return err
++	}
++	_, err = f.Write(data)
++	err = errors.Join(err, f.Sync(), f.Close())
++	if err == nil {
++		err = os.Rename(f.Name(), final)
++	}
++	if err != nil {
++		_ = os.Remove(f.Name())
++	}
++	return err
++}
++
++// HostTimeoutError is the host handoff timeout, distinct from the job timeout.
++type HostTimeoutError struct {
++	AnswerPath string
++	Timeout    time.Duration
++}
++
++func (e *HostTimeoutError) Error() string {
++	return fmt.Sprintf("host agent: host handoff timeout: no answer at %s after %s (%s)", e.AnswerPath, e.Timeout, hostTimeoutEnv)
++}
++
++func waitForHostAnswer(ctx context.Context, answerPath string, timeout, poll time.Duration) (string, error) {
++	deadline := time.NewTimer(timeout)
++	defer deadline.Stop()
++	ticker := time.NewTicker(poll)
++	defer ticker.Stop()
++	for {
++		answer, ready, err := readHostAnswer(answerPath)
++		if err != nil {
++			return "", MarkUnavailable(err)
++		}
++		if ready {
++			return answer, nil
++		}
++		select {
++		case <-ctx.Done():
++			return "", fmt.Errorf("host agent: waiting for %s: %w", answerPath, ctx.Err())
++		case <-deadline.C:
++			if answer, ready, err := readHostAnswer(answerPath); err != nil || ready {
++				return answer, MarkUnavailable(err)
++			}
++			return "", MarkUnavailable(&HostTimeoutError{AnswerPath: answerPath, Timeout: timeout})
++		case <-ticker.C:
++		}
++	}
++}
++
++// readHostAnswer reads answer.md once renamed into place; temp files are never
++// read, and a symlink or other non-regular file is refused, not followed.
++func readHostAnswer(answerPath string) (string, bool, error) {
++	info, err := os.Lstat(answerPath)
++	if errors.Is(err, os.ErrNotExist) {
++		return "", false, nil
++	}
++	if err == nil {
++		err = notRegular(answerPath, info)
++	}
++	if err != nil {
++		return "", false, err
++	}
++	beforeHostAnswerOpen(answerPath)
++	f, opened, err := openRegularFile(answerPath)
++	if err != nil {
++		return "", false, err
++	}
++	defer f.Close()
++	if !os.SameFile(info, opened) {
++		return "", false, fmt.Errorf("host agent: refusing %s: replaced while reading", answerPath)
++	}
++	data, err := io.ReadAll(f)
++	if err != nil {
++		return "", false, fmt.Errorf("host agent: read answer: %w", err)
++	}
++	answer := stripCodeFence(strings.TrimSpace(string(data)))
++	if answer == "" {
++		return "", false, fmt.Errorf("host agent: %s is empty", answerPath)
++	}
++	return answer, true, nil
++}
++
++// beforeHostAnswerOpen is a test seam between the Lstat and the open.
++var beforeHostAnswerOpen = func(string) {}
++
++// openRegularFile opens path without blocking (a FIFO swapped in after the
++// Lstat cannot hang the poll loop) and refuses anything but a regular file.
++func openRegularFile(path string) (*os.File, os.FileInfo, error) {
++	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		return nil, nil, fmt.Errorf("host agent: read answer: %w", err)
++	}
++	info, err := f.Stat()
++	if err == nil {
++		err = notRegular(path, info)
++	}
++	if err != nil {
++		f.Close()
++		return nil, nil, err
++	}
++	return f, info, nil
++}
++
++func notRegular(path string, info os.FileInfo) error {
++	if info.Mode().IsRegular() {
++		return nil
++	}
++	return fmt.Errorf("host agent: refusing %s: not a regular file (%s)", path, info.Mode().Type())
++}
++
++func stripCodeFence(s string) string {
++	if !strings.HasPrefix(s, "```") || !strings.HasSuffix(s, "```") {
++		return s
++	}
++	s = strings.TrimSuffix(s, "```")
++	if nl := strings.IndexByte(s, '\n'); nl >= 0 {
++		s = s[nl+1:]
++	}
++	return strings.TrimSpace(s)
++}
++
++// HostMarker says how a host model is attached: Explicit is
++// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case).
++type HostMarker struct {
++	Explicit bool
++	Why      string
++}
++
++// ReadHostMarker reads the host marker from the environment.
++func ReadHostMarker() HostMarker {
++	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v {
++	case "1", "true", "yes", "on":
++		return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
++	}
++	return HostMarker{}
++}
++
++// HostUse is how a caller would reach host.
++type HostUse int
++
++const (
++	HostNamed  HostUse = iota // the primary agent or a named backup
++	HostListed                // a listing, completion or health check
++	HostAuto                  // auto, auto-selection or a last resort
++)
++
++// Allows is the one rule for when host may answer: always ROBOREV_HOST_AGENT=1.
++func (m HostMarker) Allows(use HostUse) bool {
++	return m.Explicit
++}
++
++// HostAllowed is ReadHostMarker().Allows(use).
++func HostAllowed(use HostUse) bool { return ReadHostMarker().Allows(use) }
++
++// HostUnavailableError: host was requested but no host model is attached.
++// It is deterministic for the environment, so callers must not retry it.
++type HostUnavailableError struct{}
++
++func (e *HostUnavailableError) Error() string {
++	return fmt.Sprintf("agent %q hands reviews to a host model, but none is attached: set %s=1 in the environment roborev runs in (restart the daemon from it), or choose a CLI agent", hostAgentName, HostMarkerEnv)
++}
++
++// IsHostUnavailable reports whether err is a HostUnavailableError.
++func IsHostUnavailable(err error) bool {
++	_, ok := errors.AsType[*HostUnavailableError](err)
++	return ok
++}
++
++// requestedHostError fails a request naming host when host is not allowed.
++func requestedHostError(name string) error {
++	if resolveAlias(strings.TrimSpace(name)) != hostAgentName || HostAllowed(HostNamed) {
++		return nil
++	}
++	return &HostUnavailableError{}
++}
++
++// ListedAgentNames lists registered agents to offer; host only with ROBOREV_HOST_AGENT=1.
++func ListedAgentNames() []string {
++	names := Available()
++	if HostAllowed(HostListed) {
++		return names
++	}
++	return slices.DeleteFunc(names, func(name string) bool { return name == hostAgentName })
++}
++
++func init() {
++	Register(&HostAgent{})
++}
+diff --git a/internal/agent/host_fifo_other_test.go b/internal/agent/host_fifo_other_test.go
+new file mode 100644
+index 00000000..2f73ac6e
+--- /dev/null
++++ b/internal/agent/host_fifo_other_test.go
+@@ -0,0 +1,7 @@
++//go:build !unix
++
++package agent
++
++import "errors"
++
++func mkfifo(string) error { return errors.New("mkfifo unsupported") }
+diff --git a/internal/agent/host_fifo_unix_test.go b/internal/agent/host_fifo_unix_test.go
+new file mode 100644
+index 00000000..a0c9a188
+--- /dev/null
++++ b/internal/agent/host_fifo_unix_test.go
+@@ -0,0 +1,7 @@
++//go:build unix
++
++package agent
++
++import "syscall"
++
++func mkfifo(path string) error { return syscall.Mkfifo(path, 0o600) }
+diff --git a/internal/agent/host_test.go b/internal/agent/host_test.go
+new file mode 100644
+index 00000000..6fe5d3c5
+--- /dev/null
++++ b/internal/agent/host_test.go
+@@ -0,0 +1,694 @@
++package agent
++
++import (
++	"context"
++	"encoding/json/jsontext"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/config"
++)
++
++// setHostMarker forces the explicit host marker on, or leaves no marker of
++// either kind: ROBOREV_HOST_AGENT unset and no Cursor cloud detection.
++func setHostMarker(t *testing.T, on bool) {
++	t.Helper()
++	if on {
++		t.Setenv(HostMarkerEnv, "1")
++		return
++	}
++	unsetForTest(t, HostMarkerEnv)
++	unsetForTest(t, "CURSOR_AGENT")
++	clearCloudAgentEnv(t)
++}
++
++// setDetectedHostOnly simulates a Cursor cloud agent shell with no explicit
++// ROBOREV_HOST_AGENT.
++func setDetectedHostOnly(t *testing.T) {
++	t.Helper()
++	unsetForTest(t, HostMarkerEnv)
++	t.Setenv("CURSOR_AGENT", "1")
++	t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++}
++
++type hostMode struct {
++	name     string
++	set      func(t *testing.T)
++	explicit bool
++	detected bool
++}
++
++// named reports whether host is accepted when chosen by name in this mode.
++func (m hostMode) named() bool { return m.explicit || m.detected }
++
++// listed reports whether host is offered in listings in this mode.
++func (m hostMode) listed() bool { return m.explicit }
++
++var hostModes = []hostMode{
++	{name: "no marker", set: func(t *testing.T) { setHostMarker(t, false) }},
++	{name: "marker 0 inside a Cursor cloud agent", set: func(t *testing.T) {
++		setDetectedHostOnly(t)
++		t.Setenv(HostMarkerEnv, "0")
++	}},
++	{name: "Cursor cloud agent shell", set: setDetectedHostOnly},
++	{name: "explicit marker", set: func(t *testing.T) { setHostMarker(t, true) }, explicit: true},
++}
++
++func eachHostMode(t *testing.T, fn func(t *testing.T, mode hostMode)) {
++	t.Helper()
++	for _, mode := range hostModes {
++		t.Run(mode.name, func(t *testing.T) {
++			mode.set(t)
++			fn(t, mode)
++		})
++	}
++}
++
++// unsetForTest removes key for the duration of t; t.Setenv restores it.
++func unsetForTest(t *testing.T, key string) {
++	t.Helper()
++	t.Setenv(key, "")
++	require.NoError(t, os.Unsetenv(key))
++}
++
++func clearCloudAgentEnv(t *testing.T) {
++	t.Helper()
++	for _, kv := range os.Environ() {
++		if key, _, _ := strings.Cut(kv, "="); strings.HasPrefix(key, "CLOUD_AGENT_") {
++			unsetForTest(t, key)
++		}
++	}
++}
++
++func stubPath(t *testing.T, commands ...string) {
++	t.Helper()
++	dir := t.TempDir()
++	for _, c := range commands {
++		require.NoError(t, os.WriteFile(filepath.Join(dir, c), []byte("#!/bin/sh\n"), 0o755))
++	}
++	t.Setenv("PATH", dir)
++}
++
++func requireHostUnavailable(t *testing.T, label string, a Agent, err error) {
++	t.Helper()
++	require.Error(t, err, label)
++	assert.Nil(t, a, label)
++	assert.True(t, IsHostUnavailable(err), "%s: %v", label, err)
++	assert.Contains(t, err.Error(), HostMarkerEnv, label)
++}
++
++func TestHostUnavailableSurvivesWrapping(t *testing.T) {
++	err := fmt.Errorf("review: %w", fmt.Errorf("agent: %w", &HostUnavailableError{}))
++	assert.True(t, IsHostUnavailable(err))
++	var target *HostUnavailableError
++	require.ErrorAs(t, err, &target)
++	assert.Contains(t, err.Error(), HostMarkerEnv)
++	assert.False(t, IsHostUnavailable(errors.New("agent \"host\" unavailable")), "only the typed error counts")
++	assert.False(t, IsHostUnavailable(nil))
++}
++
++func TestReadHostMarker(t *testing.T) {
++	setHostMarker(t, false)
++	assert.Equal(t, HostMarker{}, ReadHostMarker())
++
++	setDetectedHostOnly(t)
++	assert.Equal(t, HostMarker{}, ReadHostMarker(), "a Cursor cloud agent shell alone attaches nothing")
++
++	for _, v := range []string{"", "  ", "0", "false", "OFF", "no", "bogus"} {
++		t.Setenv(HostMarkerEnv, v)
++		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%q", HostMarkerEnv, v)
++	}
++	for _, v := range []string{"1", "true", "TRUE", " Yes ", "on"} {
++		t.Setenv(HostMarkerEnv, v)
++		m := ReadHostMarker()
++		assert.True(t, m.Explicit, "%s=%q", HostMarkerEnv, v)
++		assert.Contains(t, m.Why, HostMarkerEnv)
++	}
++}
++
++// The ruling lives in HostMarker.Allows: every use of host needs
++// ROBOREV_HOST_AGENT=1.
++func TestHostMarkerAllows(t *testing.T) {
++	for _, tc := range []struct {
++		marker              HostMarker
++		named, listed, auto bool
++	}{
++		{marker: HostMarker{}},
++		{marker: HostMarker{Explicit: true}, named: true, listed: true, auto: true},
++	} {
++		assert.Equal(t, tc.named, tc.marker.Allows(HostNamed), "%+v named", tc.marker)
++		assert.Equal(t, tc.listed, tc.marker.Allows(HostListed), "%+v listed", tc.marker)
++		assert.Equal(t, tc.auto, tc.marker.Allows(HostAuto), "%+v automatic pick", tc.marker)
++	}
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		assert.Equal(t, mode.named(), HostAllowed(HostNamed))
++		assert.Equal(t, mode.listed(), HostAllowed(HostListed))
++		assert.Equal(t, mode.explicit, HostAllowed(HostAuto))
++	})
++}
++
++func TestHostAvailabilityIsMarkerGated(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		assert.Equal(t, mode.named(), IsAvailable("host"))
++		assert.Equal(t, mode.named(), isAvailableWithConfig("host", &config.Config{}))
++		assert.Equal(t, mode.named(), isAvailableWithConfigFromConfig("host", nil, &config.Config{}))
++	})
++}
++
++// R1: an explicitly chosen primary host with no marker is a hard error on
++// every resolver, and never falls back to another agent.
++func TestExplicitHostWithoutMarkerErrors(t *testing.T) {
++	setHostMarker(t, false)
++	hostDir := filepath.Join(t.TempDir(), "handoff")
++	t.Setenv("ROBOREV_HOST_DIR", hostDir)
++	stubPath(t, "codex", "claude")
++	cfg := &config.Config{}
++
++	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "host", cfg)
++	requireHostUnavailable(t, "strict", a, err)
++	a, err = GetPreferredOrBackupWithConfigFromConfig(nil, " host ", cfg, "claude")
++	requireHostUnavailable(t, "strict with backup", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg)
++	requireHostUnavailable(t, "non-strict", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg, "claude")
++	requireHostUnavailable(t, "non-strict with backup", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "host", nil)
++	requireHostUnavailable(t, "non-strict nil config", a, err)
++	a, err = GetAvailable("host")
++	requireHostUnavailable(t, "GetAvailable", a, err)
++	a, err = GetAvailable("host", "codex")
++	requireHostUnavailable(t, "GetAvailable with backup", a, err)
++	a, err = GetAvailableExactWithConfigFromConfig(nil, "host", cfg)
++	requireHostUnavailable(t, "exact", a, err)
++
++	assert.NoDirExists(t, hostDir, "resolution never creates a handoff dir")
++}
++
++// An explicitly named host resolves in every mode that allows naming it.
++func TestExplicitHostAgent(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		if !mode.named() {
++			return
++		}
++		stubPath(t, "claude")
++		cfg := &config.Config{}
++		for label, lookup := range map[string]func() (Agent, error){
++			"strict":       func() (Agent, error) { return GetPreferredOrBackupWithConfigFromConfig(nil, "host", cfg) },
++			"non-strict":   func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "host", cfg) },
++			"GetAvailable": func() (Agent, error) { return GetAvailable("host") },
++			"exact":        func() (Agent, error) { return GetAvailableExactWithConfigFromConfig(nil, "host", cfg) },
++		} {
++			a, err := lookup()
++			require.NoError(t, err, label)
++			assert.Equal(t, "host", a.Name(), label)
++		}
++	})
++}
++
++// R4: a strict lookup for a named agent never answers with host unless host
++// itself was named, whatever the marker.
++func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		stubPath(t)
++		cfg := &config.Config{ACP: config.ACPAgentConfigs{"remote": {Command: "missing-acp"}}}
++
++		for _, tc := range []struct {
++			name      string
++			preferred string
++			backups   []string
++		}{
++			{name: "named cli", preferred: "codex"},
++			{name: "named cli with backup", preferred: "codex", backups: []string{"claude"}},
++			{name: "named ACP", preferred: "acp.remote"},
++			{name: "named ACP with backup", preferred: "acp.remote", backups: []string{"gemini"}},
++		} {
++			t.Run(tc.name, func(t *testing.T) {
++				a, err := GetPreferredOrBackupWithConfigFromConfig(nil, tc.preferred, cfg, tc.backups...)
++				require.Error(t, err)
++				assert.Nil(t, a)
++				assert.Contains(t, err.Error(), "no configured agent available")
++			})
++		}
++
++		stubPath(t, "claude")
++		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name(), "a named backup still wins over host")
++	})
++}
++
++// R3: host is never picked by auto-selection and is listed only with
++// ROBOREV_HOST_AGENT=1, not on Cursor cloud detection alone. Every
++// UnknownAgentError known-list follows the same rule.
++func TestHostHiddenFromSelectionAndListings(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		marker := mode.listed()
++		stubPath(t, "claude")
++		cfg := &config.Config{}
++		a, err := GetAvailableWithConfigFromConfig(nil, "", cfg)
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++		a, err = GetAvailable("")
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++		a, err = GetAvailableWithConfigFromConfig(nil, "codex", cfg)
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++
++		assert.Equal(t, marker, contains(AvailableNamesFromConfig(nil, cfg), "host"))
++		for label, lookup := range map[string]func() error{
++			"GetAvailable": func() error { _, err := GetAvailable("bogus"); return err },
++			"non-strict":   func() error { _, err := GetAvailableWithConfigFromConfig(nil, "bogus", cfg); return err },
++			"strict":       func() error { _, err := GetPreferredOrBackupWithConfigFromConfig(nil, "bogus", cfg); return err },
++			"exact":        func() error { _, err := GetAvailableExactWithConfigFromConfig(nil, "bogus", cfg); return err },
++		} {
++			var unknown *UnknownAgentError
++			require.ErrorAs(t, lookup(), &unknown, label)
++			assert.Equal(t, marker, contains(unknown.Known, "host"), "%s known list: %v", label, unknown.Known)
++			assert.Contains(t, unknown.Known, "claude-code", label)
++		}
++	})
++}
++
++func contains(names []string, want string) bool {
++	for _, name := range names {
++		if name == want {
++			return true
++		}
++	}
++	return false
++}
++
++func hostTestAgent(dir string, timeout time.Duration) *HostAgent {
++	return &HostAgent{Dir: dir, Timeout: timeout, PollInterval: 5 * time.Millisecond}
++}
++
++// handoffSeen is what a test host read from one handoff directory.
++type handoffSeen struct {
++	dir, prompt, schema, instructions string
++}
++
++// fakeHost answers every handoff that appears under dir until the test ends.
++// It follows the host contract: instructions.md is published last, so once it
++// exists the handoff is complete; the answer is written to answer.md.tmp and
++// then renamed into place. Each answered handoff is sent on the channel.
++func fakeHost(t *testing.T, dir string, answer func(handoffSeen) string) <-chan handoffSeen {
++	t.Helper()
++	seen := make(chan handoffSeen, 16)
++	done := make(chan struct{})
++	stopped := make(chan struct{})
++	t.Cleanup(func() { close(done); <-stopped })
++	go func() {
++		defer close(stopped)
++		answered := map[string]bool{}
++		for {
++			matches, _ := filepath.Glob(filepath.Join(dir, "*", "instructions.md"))
++			for _, m := range matches {
++				d := filepath.Dir(m)
++				if answered[d] {
++					continue
++				}
++				answered[d] = true
++				h := handoffSeen{dir: d}
++				h.instructions = readFileString(m)
++				h.prompt = readFileString(filepath.Join(d, "prompt.md"))
++				h.schema = readFileString(filepath.Join(d, "schema.json"))
++				tmp := filepath.Join(d, "answer.md.tmp")
++				if os.WriteFile(tmp, []byte(answer(h)), 0o600) == nil {
++					_ = os.Rename(tmp, filepath.Join(d, "answer.md"))
++				}
++				seen <- h
++			}
++			select {
++			case <-done:
++				return
++			case <-time.After(time.Millisecond):
++			}
++		}
++	}()
++	return seen
++}
++
++func readFileString(path string) string {
++	b, _ := os.ReadFile(path)
++	return string(b)
++}
++
++func answerWith(answer string) func(handoffSeen) string {
++	return func(handoffSeen) string { return answer }
++}
++
++func TestHostAgentRoundTrip(t *testing.T) {
++	dir := t.TempDir()
++	a := hostTestAgent(dir, 5*time.Second)
++	schema := jsontext.Value(`{"type":"object"}`)
++	answer := `{"schema_version":2,"verdict":"pass","summary":"ok","findings":[]}`
++
++	handoffs := fakeHost(t, dir, answerWith("```json\n"+answer+"\n```\n"))
++
++	var out strings.Builder
++	raw, err := a.ReviewWithSchema(context.Background(), "/work/repo", "abc..def", "REVIEW PROMPT", schema, &out)
++	require.NoError(t, err)
++	assert.JSONEq(t, answer, string(raw))
++
++	seen := <-handoffs
++	jobDir := seen.dir
++	assert.True(t, strings.HasPrefix(filepath.Base(jobDir), "abc..def-"), jobDir)
++	assert.Equal(t, "REVIEW PROMPT", seen.prompt)
++	assert.JSONEq(t, string(schema), seen.schema)
++	assert.Contains(t, seen.instructions, "Repository: /work/repo\n")
++	assert.Contains(t, seen.instructions, "Git ref: abc..def\n")
++	assert.Contains(t, seen.instructions, "schema.json")
++	assert.Contains(t, seen.instructions, "host handoff timeout")
++	assert.Contains(t, out.String(), "waiting up to 5s")
++	assert.NoDirExists(t, jobDir, "handoff dir is removed after success")
++}
++
++func TestHostAgentPlainReviewPassesRepoPath(t *testing.T) {
++	dir := t.TempDir()
++	a := hostTestAgent(dir, 5*time.Second)
++	repo := t.TempDir()
++	handoffs := fakeHost(t, dir, answerWith("LGTM\n"))
++	got, err := a.Review(context.Background(), repo, "HEAD", "p", nil)
++	require.NoError(t, err)
++	assert.Equal(t, "LGTM", got)
++	instr := (<-handoffs).instructions
++	assert.Contains(t, instr, "Repository: "+repo+"\n")
++	assert.NotContains(t, instr, "schema.json")
++}
++
++func TestHostAgentTimeout(t *testing.T) {
++	dir := t.TempDir()
++	a := hostTestAgent(dir, 40*time.Millisecond)
++	start := time.Now()
++	_, err := a.Review(context.Background(), "/repo", "HEAD", "p", nil)
++	require.Error(t, err)
++	assert.GreaterOrEqual(t, time.Since(start), 40*time.Millisecond)
++
++	var timeoutErr *HostTimeoutError
++	require.ErrorAs(t, err, &timeoutErr)
++	assert.Equal(t, 40*time.Millisecond, timeoutErr.Timeout)
++	assert.Contains(t, err.Error(), "host handoff timeout")
++	assert.Contains(t, err.Error(), "after 40ms")
++	assert.True(t, IsUnavailable(err), "host timeout is non-retryable")
++	assert.False(t, errors.Is(err, context.DeadlineExceeded), "not reported as the job timeout")
++
++	entries, readErr := os.ReadDir(dir)
++	require.NoError(t, readErr)
++	assert.Empty(t, entries, "handoff dir is removed after failure")
++}
++
++// The handoff timeout bounds the wait even when the poll interval is longer,
++// and an answer that lands before the deadline is still read.
++func TestHostAgentPollBoundaries(t *testing.T) {
++	dir := t.TempDir()
++	a := &HostAgent{Dir: dir, Timeout: 60 * time.Millisecond, PollInterval: time.Hour}
++	fakeHost(t, dir, answerWith("late but in time"))
++	got, err := a.Review(context.Background(), "/repo", "HEAD", "p", nil)
++	require.NoError(t, err)
++	assert.Equal(t, "late but in time", got)
++
++	start := time.Now()
++	_, err = (&HostAgent{Dir: t.TempDir(), Timeout: 30 * time.Millisecond, PollInterval: time.Hour}).Review(context.Background(), "/repo", "HEAD", "p", nil)
++	require.ErrorAs(t, err, new(*HostTimeoutError))
++	assert.Less(t, time.Since(start), 5*time.Second)
++
++	assert.Equal(t, defaultHostPollInterval, (&HostAgent{}).pollInterval())
++	assert.Equal(t, defaultHostPollInterval, (&HostAgent{PollInterval: -1}).pollInterval())
++	assert.Equal(t, time.Millisecond, (&HostAgent{PollInterval: time.Millisecond}).pollInterval())
++}
++
++func TestHostAgentTimeoutFromEnv(t *testing.T) {
++	unsetForTest(t, hostTimeoutEnv)
++	d, err := (&HostAgent{}).timeout()
++	require.NoError(t, err)
++	assert.Equal(t, defaultHostTimeout, d)
++
++	t.Setenv(hostTimeoutEnv, " 90s ")
++	d, err = (&HostAgent{}).timeout()
++	require.NoError(t, err)
++	assert.Equal(t, 90*time.Second, d)
++	d, err = (&HostAgent{Timeout: time.Second}).timeout()
++	require.NoError(t, err)
++	assert.Equal(t, time.Second, d, "explicit timeout wins over the environment")
++
++	for _, bad := range []string{"bogus", "0", "0s", "-5s", "10"} {
++		t.Run(bad, func(t *testing.T) {
++			t.Setenv(hostTimeoutEnv, bad)
++			_, err := (&HostAgent{}).timeout()
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), hostTimeoutEnv)
++
++			dir := filepath.Join(t.TempDir(), "handoff")
++			_, err = (&HostAgent{Dir: dir}).Review(context.Background(), "/repo", "HEAD", "p", nil)
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), "invalid "+hostTimeoutEnv)
++			assert.NoDirExists(t, dir, "invalid timeout fails before any handoff dir exists")
++		})
++	}
++}
++
++func TestHostAgentIgnoresTempAndRefusesSymlink(t *testing.T) {
++	dir := t.TempDir()
++	answerPath := filepath.Join(dir, "answer.md")
++	require.NoError(t, os.WriteFile(answerPath+".tmp", []byte("partial"), 0o600))
++	_, ready, err := readHostAnswer(answerPath)
++	require.NoError(t, err)
++	assert.False(t, ready, "answer.md.tmp is never read")
++
++	require.NoError(t, os.WriteFile(answerPath, []byte("  \n"), 0o600))
++	_, _, err = readHostAnswer(answerPath)
++	require.Error(t, err)
++	assert.True(t, strings.HasSuffix(err.Error(), "is empty"))
++
++	require.NoError(t, os.Remove(answerPath))
++	require.NoError(t, os.Mkdir(answerPath, 0o700))
++	_, _, err = readHostAnswer(answerPath)
++	require.ErrorContains(t, err, "not a regular file")
++
++	if runtime.GOOS == "windows" {
++		t.Skip("symlinks need privileges on Windows")
++	}
++	require.NoError(t, os.Remove(answerPath))
++	target := filepath.Join(t.TempDir(), "secret")
++	require.NoError(t, os.WriteFile(target, []byte("do not read"), 0o600))
++	require.NoError(t, os.Symlink(target, answerPath))
++	_, _, err = readHostAnswer(answerPath)
++	require.ErrorContains(t, err, "not a regular file")
++
++	_, err = waitForHostAnswer(context.Background(), answerPath, time.Second, time.Millisecond)
++	require.ErrorContains(t, err, "not a regular file")
++	assert.True(t, IsUnavailable(err))
++}
++
++// A file swapped in between the Lstat and the open is refused.
++func TestHostAnswerReplacedBeforeOpenIsRefused(t *testing.T) {
++	dir := t.TempDir()
++	answerPath := filepath.Join(dir, "answer.md")
++	require.NoError(t, os.WriteFile(answerPath, []byte("first"), 0o600))
++	prev := beforeHostAnswerOpen
++	t.Cleanup(func() { beforeHostAnswerOpen = prev })
++	beforeHostAnswerOpen = func(path string) {
++		other := path + ".other"
++		require.NoError(t, os.WriteFile(other, []byte("second"), 0o600))
++		require.NoError(t, os.Rename(other, path))
++	}
++	_, ready, err := readHostAnswer(answerPath)
++	require.ErrorContains(t, err, "replaced while reading")
++	assert.False(t, ready)
++}
++
++// A FIFO at answer.md never blocks the reader: it is refused on open.
++func TestHostAnswerFIFOIsRefusedWithoutBlocking(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("no FIFOs on Windows")
++	}
++	fifo := filepath.Join(t.TempDir(), "answer.md")
++	require.NoError(t, mkfifo(fifo))
++	done := make(chan error, 1)
++	go func() {
++		f, _, err := openRegularFile(fifo)
++		if f != nil {
++			f.Close()
++		}
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		require.ErrorContains(t, err, "not a regular file")
++	case <-time.After(5 * time.Second):
++		t.Fatal("opening a FIFO answer blocked")
++	}
++
++	prev := beforeHostAnswerOpen
++	t.Cleanup(func() { beforeHostAnswerOpen = prev })
++	answerPath := filepath.Join(t.TempDir(), "answer.md")
++	require.NoError(t, os.WriteFile(answerPath, []byte("x"), 0o600))
++	beforeHostAnswerOpen = func(path string) {
++		require.NoError(t, os.Remove(path))
++		require.NoError(t, mkfifo(path))
++	}
++	go func() {
++		_, _, err := readHostAnswer(answerPath)
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		require.ErrorContains(t, err, "not a regular file")
++	case <-time.After(5 * time.Second):
++		t.Fatal("a FIFO swapped in after the Lstat blocked the reader")
++	}
++}
++
++// A read error during polling fails the wait at once instead of waiting out
++// the handoff timeout.
++func TestHostAnswerErrorFailsBeforeDeadline(t *testing.T) {
++	answerPath := filepath.Join(t.TempDir(), "answer.md")
++	require.NoError(t, os.Mkdir(answerPath, 0o700))
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	_, err := waitForHostAnswer(ctx, answerPath, time.Hour, time.Millisecond)
++	require.ErrorContains(t, err, "not a regular file")
++	assert.True(t, IsUnavailable(err))
++}
++
++// A read error found by the final check at the deadline is reported, not
++// masked as a timeout.
++func TestHostAnswerErrorAtDeadlineIsReported(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("symlinks need privileges on Windows")
++	}
++	answerPath := filepath.Join(t.TempDir(), "answer.md")
++	target := filepath.Join(t.TempDir(), "secret")
++	require.NoError(t, os.WriteFile(target, []byte("do not read"), 0o600))
++	go func() {
++		time.Sleep(10 * time.Millisecond)
++		_ = os.Symlink(target, answerPath)
++	}()
++	_, err := waitForHostAnswer(context.Background(), answerPath, 200*time.Millisecond, time.Hour)
++	require.ErrorContains(t, err, "not a regular file")
++	assert.False(t, errors.As(err, new(*HostTimeoutError)), "reported as the read error, not a timeout")
++	assert.True(t, IsUnavailable(err))
++}
++
++// Handoff files appear complete or not at all, and no temp file is left.
++func TestHandoffFilesArePublishedAtomically(t *testing.T) {
++	data := []byte(strings.Repeat("x", 4<<20))
++	for i := range 20 {
++		dir := t.TempDir()
++		name := fmt.Sprintf("prompt-%d.md", i)
++		stop := make(chan struct{})
++		partial := make(chan int, 1)
++		go func() {
++			for {
++				select {
++				case <-stop:
++					close(partial)
++					return
++				default:
++				}
++				if b, err := os.ReadFile(filepath.Join(dir, name)); err == nil && len(b) != len(data) {
++					partial <- len(b)
++					return
++				}
++			}
++		}()
++		require.NoError(t, writeHandoffFile(dir, name, data))
++		close(stop)
++		if n, ok := <-partial; ok {
++			t.Fatalf("reader saw a partial %s (%d of %d bytes)", name, n, len(data))
++		}
++		entries, err := os.ReadDir(dir)
++		require.NoError(t, err)
++		require.Len(t, entries, 1, "only the published file remains")
++		assert.Equal(t, name, entries[0].Name())
++	}
++}
++
++func TestHostAgentRefusesPlantedHandoffFile(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("symlinks need privileges on Windows")
++	}
++	dir := t.TempDir()
++	target := filepath.Join(t.TempDir(), "victim")
++	require.NoError(t, os.WriteFile(target, []byte("keep"), 0o600))
++	require.NoError(t, os.Symlink(target, filepath.Join(dir, "prompt.md")))
++	err := writeHandoffFile(dir, "prompt.md", []byte("overwrite"))
++	require.Error(t, err)
++	got, _ := os.ReadFile(target)
++	assert.Equal(t, "keep", string(got))
++	info, err := os.Lstat(filepath.Join(dir, "prompt.md"))
++	require.NoError(t, err)
++	assert.NotZero(t, info.Mode()&os.ModeSymlink, "the planted symlink is not replaced")
++
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "schema.json"), []byte("planted"), 0o600))
++	require.Error(t, writeHandoffFile(dir, "schema.json", []byte("{}")))
++	assert.Equal(t, "planted", readFileString(filepath.Join(dir, "schema.json")))
++}
++
++func TestHostAgentCancel(t *testing.T) {
++	dir := t.TempDir()
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() {
++		time.Sleep(20 * time.Millisecond)
++		cancel()
++	}()
++	_, err := hostTestAgent(dir, time.Minute).Review(ctx, "/repo", "HEAD", "p", nil)
++	require.ErrorIs(t, err, context.Canceled)
++	assert.False(t, IsUnavailable(err), "cancellation is not a host failure")
++	entries, _ := os.ReadDir(dir)
++	assert.Empty(t, entries)
++}
++
++func TestHostJobLabel(t *testing.T) {
++	for in, want := range map[string]string{
++		"abc123":                "abc123",
++		"abc..def":              "abc..def",
++		"../../etc/passwd":      "_.._etc_passwd",
++		"..":                    "review",
++		"":                      "review",
++		"feature/x y":           "feature_x_y",
++		`C:\windows\system`:     "C_windows_system",
++		".hidden":               "hidden",
++		strings.Repeat("a", 60): strings.Repeat("a", maxHostJobLabel),
++	} {
++		assert.Equal(t, want, hostJobLabel(in), "label for %q", in)
++	}
++}
++
++func TestHostHandoffDirsAreUniqueAndContained(t *testing.T) {
++	dir := t.TempDir()
++	const n = 4
++	handoffs := fakeHost(t, dir, answerWith("ok"))
++	var wg sync.WaitGroup
++	for range n {
++		wg.Go(func() {
++			out, err := hostTestAgent(dir, 5*time.Second).Review(context.Background(), "/repo", "../../escape", "p", nil)
++			assert.NoError(t, err)
++			assert.Equal(t, "ok", out)
++		})
++	}
++	wg.Wait()
++	got := map[string]bool{}
++	for range n {
++		got[(<-handoffs).dir] = true
++	}
++	assert.Len(t, got, n, "same-ref handoffs never share a dir")
++	for d := range got {
++		assert.Equal(t, dir, filepath.Dir(d), "job dir stays inside the handoff dir")
++	}
++	parent, _ := os.ReadDir(filepath.Dir(dir))
++	for _, e := range parent {
++		assert.NotEqual(t, "escape", e.Name())
++	}
++}
+diff --git a/internal/agent/spec.go b/internal/agent/spec.go
+index 7554a892..65eadbae 100644
+--- a/internal/agent/spec.go
++++ b/internal/agent/spec.go
+@@ -173,6 +173,9 @@ var allAgentSpecs = []agentSpec{
+ 		Name:           defaultACPName,
+ 		DefaultCommand: defaultACPCommand,
+ 	},
++	{
++		Name: hostAgentName,
++	},
+ 	{
+ 		Name: "test",
+ 	},
+diff --git a/internal/agentname/agentname.go b/internal/agentname/agentname.go
+index 04ed4dd8..f4683080 100644
+--- a/internal/agentname/agentname.go
++++ b/internal/agentname/agentname.go
+@@ -25,6 +25,7 @@ var canonicalByName = map[string]string{
+ 	"grok":        "grok",
+ 	"grok-build":  "grok",
+ 	"acp":         "acp",
++	"host":        "host",
+ 	"test":        "test",
+ }
+ 
+diff --git a/internal/config/budget.go b/internal/config/budget.go
+index 538a0627..a54c5f1d 100644
+--- a/internal/config/budget.go
++++ b/internal/config/budget.go
+@@ -43,6 +43,9 @@ func (b BudgetConfig) Validate() error {
+ 		if canonical == "test" {
+ 			return fmt.Errorf("budget.agent_costs: the test agent cannot be used for budget routing")
+ 		}
++		if canonical == "host" {
++			return fmt.Errorf("budget.agent_costs: the host agent runs only when named and cannot be used for budget routing")
++		}
+ 		if prior, ok := seen[canonical]; ok {
+ 			return fmt.Errorf("budget.agent_costs: %q and %q name the same agent", prior, name)
+ 		}
+diff --git a/internal/config/budget_test.go b/internal/config/budget_test.go
+index e3c9e663..afa59938 100644
+--- a/internal/config/budget_test.go
++++ b/internal/config/budget_test.go
+@@ -53,6 +53,7 @@ func TestBudgetValidation(t *testing.T) {
+ 		{"negative price", "[budget.agent_costs]\ncodex = -2"},
+ 		{"unknown agent", "[budget.agent_costs]\nunknown = 5"},
+ 		{"test agent", "[budget.agent_costs]\ntest = 1"},
++		{"host agent", "[budget.agent_costs]\nhost = 1"},
+ 		{"duplicate alias", "[budget.agent_costs]\nclaude = 5\nclaude-code = 12"},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+diff --git a/internal/daemon/default_path_test.go b/internal/daemon/default_path_test.go
+new file mode 100644
+index 00000000..2c13ad43
+--- /dev/null
++++ b/internal/daemon/default_path_test.go
+@@ -0,0 +1,1090 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/config"
++	"go.kenn.io/roborev/internal/storage"
++	"go.kenn.io/roborev/internal/testutil"
++)
++
++// defaultPathEnv clears every variable that can opt into the host agent, so
++// the test sees the environment of a user who never set it up.
++func defaultPathEnv(t *testing.T) {
++	t.Helper()
++	for _, kv := range os.Environ() {
++		key, _, _ := strings.Cut(kv, "=")
++		if key == "ROBOREV_HOST_AGENT" || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
++			t.Setenv(key, "")
++			require.NoError(t, os.Unsetenv(key))
++		}
++	}
++}
++
++func defaultPathStubs(t *testing.T, commands ...string) {
++	t.Helper()
++	dir := t.TempDir()
++	for _, c := range commands {
++		require.NoError(t, os.WriteFile(filepath.Join(dir, c), []byte("#!/bin/sh\nexit 1\n"), 0o755))
++	}
++	gitPath, err := exec.LookPath("git")
++	require.NoError(t, err)
++	require.NoError(t, os.Symlink(gitPath, filepath.Join(dir, "git")))
++	t.Setenv("PATH", dir)
++}
++
++func defaultPathResult(name string, err error) string {
++	if err != nil {
++		return "error: " + strings.ReplaceAll(err.Error(), "\n", " | ")
++	}
++	return name
++}
++
++// With no host or auto settings and no marker, agent resolution, CI pinning,
++// retries and failover match the upstream base byte for byte. The golden
++// transcript below was generated on 00316ee7 and must not change.
++func TestDefaultPathUnchanged(t *testing.T) {
++	configs := []struct {
++		name string
++		set  func(*config.Config)
++	}{
++		{"default config", func(*config.Config) {}},
++		{"named agent", func(c *config.Config) { c.DefaultAgent = "claude" }},
++		{"named agent with model", func(c *config.Config) { c.DefaultAgent = "claude"; c.DefaultModel = "sonnet" }},
++		{"backup agent", func(c *config.Config) { c.DefaultAgent = "codex"; c.DefaultBackupAgent = "claude" }},
++		{"backup agent with model", func(c *config.Config) {
++			c.DefaultAgent = "codex"
++			c.DefaultBackupAgent = "claude"
++			c.DefaultBackupModel = "sonnet"
++		}},
++		{"review workflow agent", func(c *config.Config) { c.ReviewAgent = "gemini"; c.ReviewModel = "pro" }},
++		{"fix pin", func(c *config.Config) { c.FixAgent = "codex"; c.FixBackupAgent = "gemini" }},
++		{"unknown agent", func(c *config.Config) { c.DefaultAgent = "bogus" }},
++	}
++	paths := [][]string{nil, {"codex"}, {"claude"}, {"codex", "claude"}, {"gemini"}, {"codex", "claude", "gemini"}}
++
++	var lines []string
++	add := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
++	for _, cc := range configs {
++		for _, path := range paths {
++			label := fmt.Sprintf("%s / PATH=%s", cc.name, strings.Join(path, ","))
++			t.Run(label, func(t *testing.T) {
++				defaultPathEnv(t)
++				defaultPathStubs(t, path...)
++				cfg := config.DefaultConfig()
++				cc.set(cfg)
++				repoCfg := &config.RepoConfig{}
++				add("== %s", label)
++				for _, workflow := range []string{"review", "fix"} {
++					res, err := agent.ResolveWorkflowConfigFromConfig("", repoCfg, cfg, workflow, "")
++					if err != nil {
++						add("%s workflow: %s", workflow, defaultPathResult("", err))
++						continue
++					}
++					add("%s workflow: preferred=%q backup=%q", workflow, res.PreferredAgent, res.BackupAgent)
++					var backups []string
++					if res.BackupAgent != "" {
++						backups = append(backups, res.BackupAgent)
++					}
++					a, err := agent.GetPreferredOrBackupWithConfigFromConfig(repoCfg, res.PreferredAgent, cfg, backups...)
++					name := ""
++					if err == nil {
++						name = a.Name() + " model=" + res.ModelForSelectedAgent(a.Name(), "")
++					}
++					add("%s strict: %s", workflow, defaultPathResult(name, err))
++					a, err = agent.GetAvailableWithConfigFromConfig(repoCfg, res.PreferredAgent, cfg, backups...)
++					if err == nil {
++						name = a.Name()
++					}
++					add("%s available: %s", workflow, defaultPathResult(name, err))
++					a, err = agent.GetAvailable(res.PreferredAgent, backups...)
++					if err == nil {
++						name = a.Name()
++					}
++					add("%s registry: %s", workflow, defaultPathResult(name, err))
++				}
++				add("names: %s", strings.Join(agent.AvailableNamesFromConfig(repoCfg, cfg), ","))
++
++				h := newCIPollerHarness(t, "git@github.com:acme/api.git")
++				for _, member := range []string{"", "codex", "claude"} {
++					name, model, backup, backupModel, err := h.Poller.resolveMatrixMemberAgent(
++						h.Repo, nil, cfg, config.AgentReviewType{Agent: member, ReviewType: "default"}, "thorough",
++					)
++					add("ci member %q: %s", member, defaultPathResult(fmt.Sprintf("agent=%s model=%s backup=%s backup_model=%s", name, model, backup, backupModel), err))
++				}
++
++				for _, stored := range []string{"", "claude", "gemini"} {
++					add("failover codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, false))
++					add("retry codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, true))
++				}
++			})
++		}
++	}
++
++	got := strings.Join(lines, "\n") + "\n"
++	if out := os.Getenv("ROBOREV_DEFAULT_PATH_GOLDEN"); out != "" {
++		require.NoError(t, os.WriteFile(out, []byte(got), 0o644))
++		return
++	}
++	assert.Equal(t, defaultPathGolden, got)
++}
++
++// defaultPathFailover fails a codex job once (non-retryable) or until it
++// stops being retried, and reports each state it passed through.
++func defaultPathFailover(t *testing.T, cfg *config.Config, storedBackup string, retry bool) string {
++	t.Helper()
++	wtc := newWorkerTestContext(t, 1)
++	wtc.reconfigurePool(cfg)
++	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
++	commit, err := wtc.DB.GetOrCreateCommit(wtc.Repo.ID, sha, "Author", "Subject", time.Now())
++	require.NoError(t, err)
++	_, err = wtc.DB.EnqueueJob(storage.EnqueueOpts{
++		RepoID: wtc.Repo.ID, CommitID: commit.ID, GitRef: sha, Agent: "codex", BackupAgent: storedBackup,
++	})
++	require.NoError(t, err)
++	var steps []string
++	for range 8 {
++		job, err := wtc.DB.ClaimJob(testWorkerID)
++		require.NoError(t, err)
++		if job == nil {
++			break
++		}
++		if retry {
++			wtc.Pool.failOrRetryAgentContext(context.Background(), testWorkerID, job, job.Agent, job.Agent+" broke")
++		} else {
++			wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, job.Agent+" broke")
++		}
++		after, err := wtc.DB.GetJobByID(job.ID)
++		require.NoError(t, err)
++		steps = append(steps, fmt.Sprintf("%s/%s/model=%s/retries=%d/error=%q", after.Status, after.Agent, after.Model, after.RetryCount, after.Error))
++		if after.Status != storage.JobStatusQueued {
++			break
++		}
++	}
++	return strings.Join(steps, " -> ")
++}
++
++const defaultPathGolden = `== default config / PATH=
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== default config / PATH=codex
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== default config / PATH=claude
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== default config / PATH=codex,claude
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== default config / PATH=gemini
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== default config / PATH=codex,claude,gemini
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=codex
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: codex
++review registry: codex
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=claude
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=codex,claude
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=gemini
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent / PATH=codex,claude,gemini
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=codex
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: codex
++review registry: codex
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=claude
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=sonnet
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=sonnet
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model=sonnet backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model=sonnet backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=codex,claude
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=sonnet
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=sonnet
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model=sonnet backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model=sonnet backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=gemini
++review workflow: preferred="claude" backup=""
++review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="claude" backup=""
++fix strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== named agent with model / PATH=codex,claude,gemini
++review workflow: preferred="claude" backup=""
++review strict: claude-code model=sonnet
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="claude" backup=""
++fix strict: claude-code model=sonnet
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model=sonnet backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model=sonnet backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=
++review workflow: preferred="codex" backup="claude"
++review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="codex" backup="claude"
++fix strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=codex
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=
++ci member "codex": agent=codex model= backup=claude backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=claude
++review workflow: preferred="codex" backup="claude"
++review strict: claude-code model=
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="codex" backup="claude"
++fix strict: claude-code model=
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": agent=claude-code model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=codex,claude
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=
++ci member "codex": agent=codex model= backup=claude backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=gemini
++review workflow: preferred="codex" backup="claude"
++review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup="claude"
++fix strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent / PATH=codex,claude,gemini
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=
++ci member "codex": agent=codex model= backup=claude backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=
++review workflow: preferred="codex" backup="claude"
++review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="codex" backup="claude"
++fix strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=codex
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=sonnet
++ci member "codex": agent=codex model= backup=claude backup_model=sonnet
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=claude
++review workflow: preferred="codex" backup="claude"
++review strict: claude-code model=sonnet
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="codex" backup="claude"
++fix strict: claude-code model=sonnet
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model=sonnet backup= backup_model=
++ci member "codex": agent=claude-code model=sonnet backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=sonnet/retries=0/error="" -> failed/claude-code/model=sonnet/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=sonnet/retries=0/error="" -> queued/claude-code/model=sonnet/retries=1/error="" -> queued/claude-code/model=sonnet/retries=2/error="" -> queued/claude-code/model=sonnet/retries=3/error="" -> failed/claude-code/model=sonnet/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=codex,claude
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=sonnet
++ci member "codex": agent=codex model= backup=claude backup_model=sonnet
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=sonnet/retries=0/error="" -> failed/claude-code/model=sonnet/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=sonnet/retries=0/error="" -> queued/claude-code/model=sonnet/retries=1/error="" -> queued/claude-code/model=sonnet/retries=2/error="" -> queued/claude-code/model=sonnet/retries=3/error="" -> failed/claude-code/model=sonnet/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=gemini
++review workflow: preferred="codex" backup="claude"
++review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup="claude"
++fix strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== backup agent with model / PATH=codex,claude,gemini
++review workflow: preferred="codex" backup="claude"
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="claude"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup=claude backup_model=sonnet
++ci member "codex": agent=codex model= backup=claude backup_model=sonnet
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": queued/claude-code/model=sonnet/retries=0/error="" -> failed/claude-code/model=sonnet/retries=0/error="claude-code broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=sonnet/retries=0/error="" -> queued/claude-code/model=sonnet/retries=1/error="" -> queued/claude-code/model=sonnet/retries=2/error="" -> queued/claude-code/model=sonnet/retries=3/error="" -> failed/claude-code/model=sonnet/retries=3/error="claude-code broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=
++review workflow: preferred="gemini" backup=""
++review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=codex
++review workflow: preferred="gemini" backup=""
++review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": agent=codex model=pro backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=claude
++review workflow: preferred="gemini" backup=""
++review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model=pro backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=codex,claude
++review workflow: preferred="gemini" backup=""
++review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": agent=codex model=pro backup= backup_model=
++ci member "claude": agent=claude-code model=pro backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=gemini
++review workflow: preferred="gemini" backup=""
++review strict: gemini model=pro
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup=""
++fix strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model=pro backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== review workflow agent / PATH=codex,claude,gemini
++review workflow: preferred="gemini" backup=""
++review strict: gemini model=pro
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup=""
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model=pro backup= backup_model=
++ci member "codex": agent=codex model=pro backup= backup_model=
++ci member "claude": agent=claude-code model=pro backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix workflow: preferred="codex" backup="gemini"
++fix strict: error: no configured agent available (preferred: "codex", backups: gemini) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix registry: error: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=codex
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="gemini"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=claude
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: claude-code
++review registry: claude-code
++fix workflow: preferred="codex" backup="gemini"
++fix strict: error: no configured agent available (preferred: "codex", backups: gemini) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++fix available: claude-code
++fix registry: claude-code
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=claude-code model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=codex,claude
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="gemini"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=gemini
++review workflow: preferred="codex" backup=""
++review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++review available: gemini
++review registry: gemini
++fix workflow: preferred="codex" backup="gemini"
++fix strict: gemini model=
++fix available: gemini
++fix registry: gemini
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=gemini model= backup= backup_model=
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== fix pin / PATH=codex,claude,gemini
++review workflow: preferred="codex" backup=""
++review strict: codex model=
++review available: codex
++review registry: codex
++fix workflow: preferred="codex" backup="gemini"
++fix strict: codex model=
++fix available: codex
++fix registry: codex
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": agent=codex model= backup= backup_model=
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=codex
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=claude
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=codex,claude
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=gemini
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": error: no review agent available for type=default: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++ci member "claude": error: no review agent available for type=default: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++== unknown agent / PATH=codex,claude,gemini
++review workflow: preferred="bogus" backup=""
++review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++review registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix workflow: preferred="bogus" backup=""
++fix strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix available: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++fix registry: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++names: acp,claude-code,codex,copilot,cursor,droid,gemini,grok,kilo,kiro,opencode,pi,test
++ci member "": error: no review agent available for type=default: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
++ci member "codex": agent=codex model= backup= backup_model=
++ci member "claude": agent=claude-code model= backup= backup_model=
++failover codex stored backup "": failed/codex/model=/retries=0/error="codex broke"
++retry codex stored backup "": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> failed/codex/model=/retries=3/error="codex broke"
++failover codex stored backup "claude": queued/claude-code/model=/retries=0/error="" -> failed/claude-code/model=/retries=0/error="claude-code broke"
++retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
++failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
++retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
++`
+diff --git a/internal/review/host_runner_test.go b/internal/review/host_runner_test.go
+new file mode 100644
+index 00000000..8cbc4241
+--- /dev/null
++++ b/internal/review/host_runner_test.go
+@@ -0,0 +1,60 @@
++package review
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/storage"
++)
++
++func TestRunAgentReviewHostRoundTrip(t *testing.T) {
++	dir := t.TempDir()
++	host := &agent.HostAgent{Dir: dir, Timeout: 5 * time.Second, PollInterval: 5 * time.Millisecond}
++	answer := `{"schema_version":2,"verdict":"fail","summary":"One bug.",
++  "findings":[{"severity":"high","problem":"Nil map write.","fix":"Initialize the map.","location":"a.go:3"}]}`
++
++	schemaCh := make(chan []byte, 1)
++	go func() {
++		for {
++			matches, _ := filepath.Glob(filepath.Join(dir, "*", "instructions.md"))
++			if len(matches) == 1 {
++				jobDir := filepath.Dir(matches[0])
++				schema, _ := os.ReadFile(filepath.Join(jobDir, "schema.json"))
++				schemaCh <- schema
++				tmp := filepath.Join(jobDir, "answer.md.tmp")
++				_ = os.WriteFile(tmp, []byte(answer), 0o600)
++				_ = os.Rename(tmp, filepath.Join(jobDir, "answer.md"))
++				return
++			}
++			time.Sleep(2 * time.Millisecond)
++		}
++	}()
++
++	var out strings.Builder
++	got, err := RunAgentReview(context.Background(), host, t.TempDir(), "HEAD", "prompt", "", "", &out)
++	require.NoError(t, err)
++	require.NotNil(t, got.Structured)
++	require.Len(t, got.Structured.Findings, 1)
++	assert.Equal(t, "a.go:3", got.Structured.Findings[0].Location)
++	assert.Equal(t, storage.VerdictFromPassed(false), got.Verdict)
++	assert.Contains(t, out.String(), "Nil map write.")
++	assert.JSONEq(t, string(CustomReviewSchema), string(<-schemaCh))
++}
++
++func TestRunAgentReviewHostTimeoutIsNonRetryable(t *testing.T) {
++	host := &agent.HostAgent{Dir: t.TempDir(), Timeout: 30 * time.Millisecond, PollInterval: 5 * time.Millisecond}
++	_, err := RunAgentReview(context.Background(), host, t.TempDir(), "HEAD", "prompt", "", "", nil)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "host handoff timeout")
++	assert.True(t, agent.IsUnavailable(err), "the worker fails over or fails without same-agent retries")
++	assert.False(t, errors.Is(err, context.DeadlineExceeded), "the worker must not label it as the job timeout")
++}
+-- 
+2.43.0
+

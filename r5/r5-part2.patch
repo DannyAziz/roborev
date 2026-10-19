@@ -1,0 +1,1531 @@
+From 4c17b8cf3430e5d32a56048db5766d0d9b52a657 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 19 Oct 2026 10:02:02 +0000
+Subject: [PATCH] Detect Cursor cloud hosts; host is an automatic pick only
+ with the marker
+
+A Cursor cloud agent shell (CURSOR_AGENT=1 plus CLOUD_AGENT_*) lets a
+host that is named as the primary or a backup run without
+ROBOREV_HOST_AGENT. It never makes host an automatic pick or lists it:
+only ROBOREV_HOST_AGENT=1 does both, and with it host is the non-strict
+last resort when no agent is available. Without any marker nothing
+changes unless config names host.
+
+A named host without a marker fails fast with no retry or failover, and
+a stored host backup is skipped with a note naming the marker. Only host
+synthesis errors take the typed retry path; other agents keep theirs.
+Doctor asks the daemon about host by name, so detection alone raises no
+false marker warning. Host cannot classify or be a budget substitute.
+---
+ cmd/roborev/check_agents.go         |   9 +
+ cmd/roborev/check_agents_test.go    |  20 ++-
+ cmd/roborev/doctor_agents.go        |  82 ++++++++-
+ cmd/roborev/doctor_checks.go        |   3 +
+ cmd/roborev/doctor_test.go          | 211 ++++++++++++++++++++++-
+ cmd/roborev/tui/host_picker_test.go |  36 ++++
+ internal/agent/acp_resolution.go    |  12 +-
+ internal/agent/agent.go             |   2 +-
+ internal/agent/diagnose.go          |   2 +
+ internal/agent/host.go              |  81 ++++++++-
+ internal/agent/host_test.go         | 185 +++++++++++++++++++-
+ internal/config/budget.go           |   2 +-
+ internal/config/budget_test.go      |  27 +++
+ internal/config/config.go           |  15 +-
+ internal/daemon/budget.go           |   7 +-
+ internal/daemon/budget_test.go      |  36 ++++
+ internal/daemon/host_agent_test.go  | 255 ++++++++++++++++++++++++++++
+ internal/daemon/synthesis_worker.go |   7 +-
+ internal/daemon/worker.go           |  43 ++++-
+ 19 files changed, 997 insertions(+), 38 deletions(-)
+ create mode 100644 cmd/roborev/tui/host_picker_test.go
+ create mode 100644 internal/daemon/host_agent_test.go
+
+diff --git a/cmd/roborev/check_agents.go b/cmd/roborev/check_agents.go
+index 0f18683e..afb58abc 100644
+--- a/cmd/roborev/check_agents.go
++++ b/cmd/roborev/check_agents.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"os/exec"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -45,6 +46,9 @@ Examples:
+ 			}
+ 
+ 			names := agent.AvailableNamesFromConfig(repoCfg, cfg)
++			if agentFilter == "host" && !slices.Contains(names, "host") {
++				names = append(names, "host")
++			}
+ 
+ 			timeout := time.Duration(timeoutSecs) * time.Second
+ 			smokePrompt := "Respond with exactly: OK"
+@@ -64,6 +68,11 @@ Examples:
+ 				}
+ 				if name == "host" {
+ 					// A smoke test would block on a handoff nobody answers.
++					if _, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg); err != nil {
++						fmt.Printf("  x %-14s FAIL: %s\n", name, err)
++						failed++
++						continue
++					}
+ 					fmt.Printf("  - %-14s not smoke-tested: reviews are handed off to the attached host model\n", name)
+ 					skipped++
+ 					continue
+diff --git a/cmd/roborev/check_agents_test.go b/cmd/roborev/check_agents_test.go
+index 4548441b..405eded9 100644
+--- a/cmd/roborev/check_agents_test.go
++++ b/cmd/roborev/check_agents_test.go
+@@ -52,15 +52,25 @@ func TestCheckAgentsDiscoversRepoACPAgentFromNestedDirectory(t *testing.T) {
+ func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		marker, filter string
++		detected       bool
+ 		want, notWant  string
++		wantErr        bool
+ 	}{
+ 		{marker: "1", want: `(?m)^  - host\s+not smoke-tested`},
+ 		{marker: "1", filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
++		{detected: true, notWant: `(?m)^  . host\s`},
++		{detected: true, filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
+ 		{marker: "0", notWant: `(?m)^  . host\s`},
++		{marker: "0", filter: "host", wantErr: true, want: `(?m)^  x host\s+FAIL: agent "host" hands reviews to a host model, but none is attached: set ROBOREV_HOST_AGENT=1`},
+ 	} {
+-		t.Run(fmt.Sprintf("marker=%s/filter=%s", tc.marker, tc.filter), func(t *testing.T) {
++		t.Run(fmt.Sprintf("marker=%s/detected=%v/filter=%s", tc.marker, tc.detected, tc.filter), func(t *testing.T) {
+ 			setupConfigEnv(t, "", "")
+ 			t.Setenv("ROBOREV_HOST_AGENT", tc.marker)
++			t.Setenv("CURSOR_AGENT", "")
++			if tc.detected {
++				t.Setenv("CURSOR_AGENT", "1")
++				t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++			}
+ 			hostDir := filepath.Join(t.TempDir(), "host")
+ 			t.Setenv("ROBOREV_HOST_DIR", hostDir)
+ 			t.Setenv("ROBOREV_HOST_TIMEOUT", "1h")
+@@ -73,8 +83,14 @@ func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
+ 			}
+ 			cmd.SetArgs(args)
+ 			cmd.SilenceUsage, cmd.SilenceErrors = true, true
+-			output := captureOutput(t, cmd.Execute)
++			var runErr error
++			output := captureOutput(t, func() error { runErr = cmd.Execute(); return runErr })
+ 
++			if tc.wantErr {
++				assert.Error(t, runErr, "an unavailable host must exit nonzero")
++			} else {
++				assert.NoError(t, runErr)
++			}
+ 			if tc.want != "" {
+ 				assert.Regexp(t, tc.want, output)
+ 			}
+diff --git a/cmd/roborev/doctor_agents.go b/cmd/roborev/doctor_agents.go
+index fbfeb83c..886961d2 100644
+--- a/cmd/roborev/doctor_agents.go
++++ b/cmd/roborev/doctor_agents.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"strings"
+ 
+ 	"go.kenn.io/roborev/internal/agent"
+@@ -80,6 +81,13 @@ func checkDoctorAgents(env *doctorEnv) []doctorCheck {
+ 			installed = append(installed, d)
+ 		}
+ 	}
++	if len(installed) == 0 && slices.Contains(doctorAgentNames(env), "host") {
++		// Listings show host only with ROBOREV_HOST_AGENT=1, but a host named
++		// in config also runs inside a Cursor cloud agent.
++		if v := env.viewAgent("host"); v.diag.Available {
++			installed = append(installed, v.diag)
++		}
++	}
+ 	if len(installed) == 0 {
+ 		out = append(out, doctorCheck{
+ 			ID: "agents.installed", Category: "agents", Status: doctorFail,
+@@ -116,11 +124,22 @@ func checkDoctorPathMismatch(env *doctorEnv, local []agent.Diagnosis) []doctorCh
+ 		daemonHas[doctorAgentKey(d.Name)] = d
+ 	}
+ 	var missing []string
++	pathMissing := false
+ 	for _, d := range local {
+ 		if !d.Available {
+ 			continue
+ 		}
+-		if dd, ok := daemonHas[doctorAgentKey(d.Name)]; ok && !dd.Available {
++		dd, ok := daemonHas[doctorAgentKey(d.Name)]
++		if doctorIsHost(d.Name) {
++			// The daemon lists host only with the explicit marker, so ask
++			// whether it would run host when named.
++			if !env.viewAgent(d.Name).diag.Available {
++				missing = append(missing, fmt.Sprintf("%s: %s=1 is set in this shell, but the daemon's environment has neither it nor a Cursor cloud agent, so a named host fails there", d.Name, agent.HostMarkerEnv))
++			}
++			continue
++		}
++		if ok && !dd.Available {
++			pathMissing = true
+ 			missing = append(missing, fmt.Sprintf("%s: found at %s in this shell, but not on the daemon's PATH", d.Name, d.Path))
+ 		}
+ 	}
+@@ -130,12 +149,17 @@ func checkDoctorPathMismatch(env *doctorEnv, local []agent.Diagnosis) []doctorCh
+ 			Summary: "the daemon can run every agent this shell can",
+ 		}}
+ 	}
+-	details := append(missing, "daemon PATH: "+env.daemonAgents.PathEnv)
++	details, fix, what := missing, fmt.Sprintf("run 'roborev daemon restart' from this shell so the daemon inherits %s", agent.HostMarkerEnv), "available"
++	if pathMissing {
++		what = "installed"
++		details = append(details, "daemon PATH: "+env.daemonAgents.PathEnv)
++		fix = "run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path"
++	}
+ 	return []doctorCheck{{
+ 		ID: "agents.daemon_path", Category: "agents", Status: doctorWarn,
+-		Summary: fmt.Sprintf("%s installed here cannot be run by the daemon", plural(len(missing), "agent")),
++		Summary: fmt.Sprintf("%s %s here cannot be run by the daemon", plural(len(missing), "agent"), what),
+ 		Details: details,
+-		Fix:     "run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path",
++		Fix:     fix,
+ 	}}
+ }
+ 
+@@ -255,6 +279,9 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
+ 	if primary.diag.Available {
+ 		c.Status = doctorOK
+ 		c.Summary = fmt.Sprintf("%s use %s (%s)", subject, primary.diag.Name, primary.diag.Path)
++		if doctorIsHost(primary.diag.Name) {
++			c.Summary = fmt.Sprintf("%s use %s (%s)", subject, primary.diag.Name, primary.diag.Command)
++		}
+ 		return c, reported
+ 	}
+ 	reported[doctorAgentKey(res.PreferredAgent)] = true
+@@ -271,6 +298,18 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
+ 		c.Fix = fmt.Sprintf("fix the agent name, or add an [acp.<name>] table if %s is meant to be a named ACP agent", res.PreferredAgent)
+ 		return c, reported
+ 	}
++	if doctorIsHost(res.PreferredAgent) {
++		// An explicit host without a host model is an error, never a
++		// reason to run the backup.
++		c.Status = doctorFail
++		c.Summary = fmt.Sprintf("%s will fail: agent host needs %s=1 or a Cursor cloud agent in %s", subject, agent.HostMarkerEnv, primary.where())
++		c.Details = details
++		if res.BackupAgent != "" {
++			c.Details = append(c.Details, fmt.Sprintf("backup %s is never tried, because an explicit host without a host model is an error", res.BackupAgent))
++		}
++		c.Fix = doctorAgentFix(env, res.PreferredAgent)
++		return c, reported
++	}
+ 	if res.BackupAgent != "" {
+ 		backup := env.viewAgent(res.BackupAgent)
+ 		if backup.diag.Available {
+@@ -290,7 +329,39 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
+ 	return c, reported
+ }
+ 
++func doctorIsHost(name string) bool {
++	return doctorAgentKey(name) == "host"
++}
++
++// doctorHostKeys names the config settings that select host.
++func (env *doctorEnv) doctorHostKeys() string {
++	var keys []string
++	for _, ref := range config.AgentReferences(env.global) {
++		if doctorIsHost(ref.Name) {
++			keys = append(keys, ref.Key)
++		}
++	}
++	if env.repoCfg != nil {
++		for _, ref := range config.AgentReferences(env.repoCfg) {
++			if doctorIsHost(ref.Name) {
++				keys = append(keys, ".roborev.toml "+ref.Key)
++			}
++		}
++	}
++	if len(keys) == 0 {
++		return "the agent setting"
++	}
++	return strings.Join(keys, " and ")
++}
++
+ func doctorAgentFix(env *doctorEnv, name string) string {
++	if doctorIsHost(name) {
++		change := fmt.Sprintf("or change %s to an installed CLI agent", env.doctorHostKeys())
++		if env.daemonAgents != nil && agent.Diagnose(env.repoCfg, name, env.global).Available {
++			return "a host model is attached in this shell; run 'roborev daemon restart' from this shell so the daemon inherits its environment, " + change
++		}
++		return fmt.Sprintf("set %s=1 in the environment the daemon runs in and run 'roborev daemon restart' from it, %s", agent.HostMarkerEnv, change)
++	}
+ 	local := agent.Diagnose(env.repoCfg, name, env.global)
+ 	if local.Available && env.daemonAgents != nil {
+ 		return fmt.Sprintf("%s is installed in this shell (%s); run 'roborev daemon restart' from this shell so the daemon inherits its PATH", name, local.Path)
+@@ -358,6 +429,9 @@ func checkDoctorConfiguredAgents(env *doctorEnv, skip map[string]bool) []doctorC
+ 		}}
+ 	}
+ 	fix := "install the agent, fix the name, or remove the setting; jobs routed to it fail"
++	if _, ok := keysByName["host"]; ok && !skip["host"] && !env.viewAgent("host").diag.Available {
++		fix += fmt.Sprintf("; host needs %s=1 where reviews run, or a Cursor cloud agent if host is named (a host backup is skipped until then)", agent.HostMarkerEnv)
++	}
+ 	if restartHelps {
+ 		fix = "some of these are installed in this shell; run 'roborev daemon restart' from it. Otherwise " + fix
+ 	}
+diff --git a/cmd/roborev/doctor_checks.go b/cmd/roborev/doctor_checks.go
+index adea1aca..f6f661df 100644
+--- a/cmd/roborev/doctor_checks.go
++++ b/cmd/roborev/doctor_checks.go
+@@ -99,6 +99,9 @@ func doctorAgentNames(env *doctorEnv) []string {
+ 	for _, ref := range env.experimentAgentReferences() {
+ 		add(ref.Name)
+ 	}
++	if agent.HostAllowed(agent.HostListed) {
++		add("host") // the daemon does not list host on detection alone
++	}
+ 	return names
+ }
+ 
+diff --git a/cmd/roborev/doctor_test.go b/cmd/roborev/doctor_test.go
+index be80fa09..e1080faf 100644
+--- a/cmd/roborev/doctor_test.go
++++ b/cmd/roborev/doctor_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"encoding/json/v2"
+ 	"errors"
++	"fmt"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -84,7 +85,40 @@ func writeFakeAgentBinary(t *testing.T, name string) string {
+ 	return dir
+ }
+ 
++// doctorHostModes are the four marker states: no marker of either kind,
++// ROBOREV_HOST_AGENT=0 inside a Cursor cloud agent, detection only, and =1.
++var doctorHostModes = []string{"none", "zero", "detected", "explicit"}
++
++func setDoctorHostMode(t *testing.T, mode string) {
++	t.Helper()
++	for _, kv := range os.Environ() {
++		if key, _, _ := strings.Cut(kv, "="); key == agent.HostMarkerEnv || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
++			t.Setenv(key, "")
++			require.NoError(t, os.Unsetenv(key))
++		}
++	}
++	if mode == "zero" || mode == "detected" {
++		t.Setenv("CURSOR_AGENT", "1")
++		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++	}
++	switch mode {
++	case "zero":
++		t.Setenv(agent.HostMarkerEnv, "0")
++	case "explicit":
++		t.Setenv(agent.HostMarkerEnv, "1")
++	}
++}
++
+ func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
++	for _, mode := range doctorHostModes {
++		t.Run(mode, func(t *testing.T) { testDoctorAgentsDaemonPathMismatch(t, mode) })
++	}
++}
++
++// Only ROBOREV_HOST_AGENT=1 lists host in this shell, so only that mode adds
++// a host line; detection alone must not raise a false marker warning.
++func testDoctorAgentsDaemonPathMismatch(t *testing.T, mode string) {
++	setDoctorHostMode(t, mode)
+ 	t.Setenv("PATH", writeFakeAgentBinary(t, "claude"))
+ 
+ 	env := &doctorEnv{
+@@ -111,9 +145,16 @@ func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
+ 
+ 	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
+ 	assert.Equal(doctorWarn, mismatch.Status)
+-	require.Len(t, mismatch.Details, 2)
++	want := 2
++	if mode == "explicit" {
++		want = 3
++		assert.Contains(mismatch.Details[1], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment has neither")
++	}
++	require.Len(t, mismatch.Details, want, "%q", mismatch.Details)
+ 	assert.Contains(mismatch.Details[0], "claude-code: found at ")
+-	assert.Equal("daemon PATH: /usr/bin:/bin", mismatch.Details[1])
++	assert.Equal("daemon PATH: /usr/bin:/bin", mismatch.Details[want-1])
++	assert.Equal(fmt.Sprintf("%s installed here cannot be run by the daemon", plural(want-1, "agent")), mismatch.Summary)
++	assert.Equal("run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path", mismatch.Fix)
+ 
+ 	review := findDoctorCheck(t, checks, "agents.review")
+ 	assert.Equal(doctorFail, review.Status)
+@@ -124,6 +165,24 @@ func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
+ 	assert.False(slices.ContainsFunc(checks, func(c doctorCheck) bool { return c.ID == "agents.configured" }), "%+v", checks)
+ }
+ 
++// Without host, the review summary keeps the upstream "use <agent> (<path>)"
++// form, even when the daemon reports no path.
++func TestDoctorReviewSummaryKeepsPathForm(t *testing.T) {
++	setDoctorHostMode(t, "neither")
++	for _, path := range []string{"/opt/bin/claude", ""} {
++		env := &doctorEnv{
++			ctx:    t.Context(),
++			global: &config.Config{DefaultAgent: "claude-code"},
++			ping:   &daemon.PingInfo{OK: true},
++			daemonAgents: &doctorDaemonAgents{Requested: []agent.Diagnosis{
++				{Name: "claude-code", Command: "claude", Path: path, Available: true},
++			}},
++		}
++		review, _ := checkDoctorReviewAgent(env, "reviews")
++		assert.Equal(t, "reviews use claude-code ("+path+")", review.Summary)
++	}
++}
++
+ func TestDoctorAgentsTrustsDaemonOverShell(t *testing.T) {
+ 	// The shell can run claude, but a daemon that did not resolve the name
+ 	// (for example an older daemon that predates the agent) must not be
+@@ -608,3 +667,151 @@ func TestDoctorDaemonTLS(t *testing.T) {
+ 	assert.Equal(t, "config.daemon_tls", checks[0].ID)
+ 	assert.Contains(t, checks[0].Details[0], "load daemon_tls client certificate")
+ }
++
++func TestDoctorAgentsExplicitHostWithoutMarker(t *testing.T) {
++	for _, mode := range []string{"none", "zero"} {
++		t.Run(mode, func(t *testing.T) {
++			setDoctorHostMode(t, mode)
++			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
++			env := &doctorEnv{
++				ctx:    t.Context(),
++				global: &config.Config{DefaultAgent: "host", ReviewBackupAgent: "gemini"},
++			}
++			review, _ := checkDoctorReviewAgent(env, "reviews")
++			assert.Equal(t, doctorFail, review.Status, "an explicit host never falls back to the backup")
++			assert.Contains(t, review.Summary, "agent host needs ROBOREV_HOST_AGENT=1 or a Cursor cloud agent in this shell")
++			assert.Contains(t, strings.Join(review.Details, "\n"), "backup gemini is never tried")
++			assert.Equal(t, "set ROBOREV_HOST_AGENT=1 in the environment the daemon runs in and run 'roborev daemon restart' from it, or change default_agent to an installed CLI agent", review.Fix)
++
++			for _, d := range agent.DiagnoseAll(env.repoCfg, env.global) {
++				assert.NotEqual(t, "host", d.Name, "host is not listed without a marker")
++			}
++		})
++	}
++}
++
++func TestDoctorAgentsHostBackupLabeledUnavailable(t *testing.T) {
++	for _, mode := range []string{"none", "zero"} {
++		t.Run(mode, func(t *testing.T) {
++			setDoctorHostMode(t, mode)
++			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
++			env := &doctorEnv{
++				ctx:    t.Context(),
++				global: &config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "host"},
++			}
++			configured := findDoctorCheck(t, checkDoctorAgents(env), "agents.configured")
++			assert.Equal(t, doctorWarn, configured.Status)
++			assert.Contains(t, strings.Join(configured.Details, "\n"), `host (set by default_backup_agent): agent "host" hands reviews to a host model, but none is attached`)
++			assert.Contains(t, configured.Fix, "host needs ROBOREV_HOST_AGENT=1 where reviews run, or a Cursor cloud agent if host is named")
++		})
++	}
++}
++
++// Detection alone runs a named host but never lists it, in the shell or the
++// daemon, so doctor reports host only through the review check.
++func TestDoctorAgentsHostUnderDetectionOnly(t *testing.T) {
++	setDoctorHostMode(t, "detected")
++	t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
++	env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
++	review, _ := checkDoctorReviewAgent(env, "reviews")
++	assert.Equal(t, doctorOK, review.Status)
++	assert.Regexp(t, `^reviews use host \(file handoff in .+\)$`, review.Summary)
++
++	local := agent.DiagnoseAll(env.repoCfg, env.global)
++	for _, d := range local {
++		assert.NotEqual(t, "host", d.Name, "detection alone does not list host")
++	}
++	installed := findDoctorCheck(t, checkDoctorAgents(env), "agents.installed")
++	assert.NotContains(t, installed.Summary, "host")
++
++	// A daemon started in the same shell runs a named host and lists the
++	// same agents, so there is no mismatch to warn about.
++	env.ping = &daemon.PingInfo{OK: true}
++	env.daemonAgents = &doctorDaemonAgents{
++		Agents:    local,
++		Requested: []agent.Diagnosis{agent.Diagnose(env.repoCfg, "host", env.global)},
++	}
++	checks := checkDoctorAgents(env)
++	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
++	assert.Equal(t, doctorOK, mismatch.Status, "%q", mismatch.Details)
++	assert.Equal(t, doctorOK, findDoctorCheck(t, checks, "agents.review").Status)
++}
++
++// A daemon that runs a named host raises no host mismatch, whichever marker
++// lets it.
++func TestDoctorAgentsNoHostMismatchWhenDaemonRunsHost(t *testing.T) {
++	for _, mode := range []string{"explicit", "detected"} {
++		t.Run(mode, func(t *testing.T) {
++			setDoctorHostMode(t, mode)
++			t.Setenv("PATH", t.TempDir())
++			env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
++			env.ping = &daemon.PingInfo{OK: true}
++			env.daemonAgents = &doctorDaemonAgents{
++				Agents:    agent.DiagnoseAll(env.repoCfg, env.global),
++				Requested: []agent.Diagnosis{agent.Diagnose(env.repoCfg, "host", env.global)},
++			}
++			mismatch := findDoctorCheck(t, checkDoctorAgents(env), "agents.daemon_path")
++			assert.Equal(t, doctorOK, mismatch.Status, "%q", mismatch.Details)
++		})
++	}
++}
++
++// With no CLI agent installed, a host named in config is what reviews run
++// on, so detection alone does not report that no agent is available; with
++// host not named, it does, and host is not offered.
++func TestDoctorAgentsOnlyNamedHostUnderDetection(t *testing.T) {
++	for _, tc := range []struct {
++		name, defaultAgent string
++		daemonUp           bool
++		want               doctorStatus
++		wantSummary        string
++	}{
++		{name: "named host, no daemon", defaultAgent: "host", want: doctorOK, wantSummary: "agents available to this shell: host"},
++		{name: "named host, daemon", defaultAgent: "host", daemonUp: true, want: doctorOK, wantSummary: "agents available to the daemon: host"},
++		{name: "host not named", defaultAgent: "codex", want: doctorFail, wantSummary: "no review agents are available to this shell"},
++		{name: "host not named, daemon", defaultAgent: "codex", daemonUp: true, want: doctorFail, wantSummary: "no review agents are available to the daemon"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			setDoctorHostMode(t, "detected")
++			t.Setenv("PATH", t.TempDir())
++			env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: tc.defaultAgent}}
++			if tc.daemonUp {
++				var requested []agent.Diagnosis
++				for _, name := range doctorAgentNames(env) {
++					requested = append(requested, agent.Diagnose(env.repoCfg, name, env.global))
++				}
++				env.ping = &daemon.PingInfo{OK: true}
++				env.daemonAgents = &doctorDaemonAgents{Agents: agent.DiagnoseAll(env.repoCfg, env.global), Requested: requested}
++			}
++			installed := findDoctorCheck(t, checkDoctorAgents(env), "agents.installed")
++			assert.Equal(t, tc.want, installed.Status)
++			assert.Equal(t, tc.wantSummary, installed.Summary)
++		})
++	}
++}
++
++func TestDoctorAgentsHostWithMarker(t *testing.T) {
++	t.Setenv(agent.HostMarkerEnv, "1")
++	t.Setenv("PATH", t.TempDir())
++	env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
++	review, _ := checkDoctorReviewAgent(env, "reviews")
++	assert.Equal(t, doctorOK, review.Status)
++	assert.Regexp(t, `^reviews use host \(file handoff in .+\)$`, review.Summary)
++
++	// A daemon without the marker leaves host out of its agent list (as
++	// DiagnoseAll does) and reports it as unavailable when asked by name.
++	env.ping = &daemon.PingInfo{OK: true}
++	env.daemonAgents = &doctorDaemonAgents{
++		Agents:    nil,
++		Requested: []agent.Diagnosis{{Name: "host", Error: (&agent.HostUnavailableError{}).Error()}},
++	}
++	checks := checkDoctorAgents(env)
++	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
++	assert.Contains(t, mismatch.Details[0], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment has neither it nor a Cursor cloud agent")
++	assert.NotContains(t, strings.Join(mismatch.Details, "\n"), "PATH")
++	assert.Equal(t, "run 'roborev daemon restart' from this shell so the daemon inherits ROBOREV_HOST_AGENT", mismatch.Fix)
++	review = findDoctorCheck(t, checks, "agents.review")
++	assert.Equal(t, doctorFail, review.Status)
++	assert.Contains(t, review.Summary, "in the daemon")
++	assert.Equal(t, "a host model is attached in this shell; run 'roborev daemon restart' from this shell so the daemon inherits its environment, or change default_agent to an installed CLI agent", review.Fix)
++}
+diff --git a/cmd/roborev/tui/host_picker_test.go b/cmd/roborev/tui/host_picker_test.go
+new file mode 100644
+index 00000000..952148f1
+--- /dev/null
++++ b/cmd/roborev/tui/host_picker_test.go
+@@ -0,0 +1,36 @@
++package tui
++
++import (
++	"slices"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agent"
++)
++
++func TestRerunAgentPickerListsHostOnlyWithMarker(t *testing.T) { //nolint:paralleltest // global agent registry and environment
++	registerRerunPickerAgent(t, "picker-current")
++	registerRerunPickerAgent(t, "picker-alternate")
++	for _, tc := range []struct {
++		marker   string
++		detected bool
++		want     bool
++	}{{"0", false, false}, {"0", true, false}, {"", false, false}, {"", true, false}, {"1", false, true}} {
++		t.Run(agent.HostMarkerEnv+"="+tc.marker+"/detected="+map[bool]string{true: "yes", false: "no"}[tc.detected], func(t *testing.T) {
++			t.Setenv(agent.HostMarkerEnv, tc.marker)
++			t.Setenv("CURSOR_AGENT", "")
++			if tc.detected {
++				// Detection runs a named host but never lists it.
++				t.Setenv("CURSOR_AGENT", "1")
++				t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++			}
++			m := rerunPickerModel(t, rerunOKHandler)
++			options, err := m.availableRerunAgents(&m.jobs[0])
++			require.NoError(t, err)
++			assert.Contains(t, options, "picker-alternate")
++			assert.Equal(t, tc.want, slices.Contains(options, "host"), "%v", options)
++		})
++	}
++}
+diff --git a/internal/agent/acp_resolution.go b/internal/agent/acp_resolution.go
+index a619f95c..910f8f18 100644
+--- a/internal/agent/acp_resolution.go
++++ b/internal/agent/acp_resolution.go
+@@ -223,7 +223,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 		if ok {
+ 			return backup, nil
+ 		}
+-		return nil, unavailablePreferredBackupError(rawPreferred, backups)
++		return nil, withSkippedHostNote(unavailablePreferredBackupError(rawPreferred, backups), backups)
+ 	}
+ 
+ 	if preferred != "" {
+@@ -248,7 +248,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
+ 		return backup, nil
+ 	}
+ 
+-	return nil, unavailablePreferredBackupError(preferred, backups)
++	return nil, withSkippedHostNote(unavailablePreferredBackupError(preferred, backups), backups)
+ }
+ 
+ // AvailableNamesFromConfig returns built-in and effective named ACP agents.
+@@ -383,7 +383,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
+ 		}
+ 
+ 		// Finally fall back to config-aware auto-selection.
+-		return getAvailableFallbackWithConfig("", repoCfg, cfg)
++		return getAvailableFallbackWithConfig("", repoCfg, cfg, backups)
+ 	}
+ 
+ 	// Check the preferred agent using config command overrides before
+@@ -420,7 +420,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
+ 	}
+ 
+ 	if cfg != nil {
+-		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg)
++		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg, backups)
+ 	}
+ 
+ 	resolved, err := GetAvailable(preferred, backups...)
+@@ -430,7 +430,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
+ 	return applyAgentConfigOverrides(applyCommandOverrides(resolved, cfg), cfg), nil
+ }
+ 
+-func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config) (Agent, error) {
++func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config, backups []string) (Agent, error) {
+ 	for _, name := range fallbackAgentOrder {
+ 		if name == preferred {
+ 			continue
+@@ -451,7 +451,7 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
+ 	}
+ 
+ 	if len(available) == 0 {
+-		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
++		return hostLastResortOr(fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", ")), backups)
+ 	}
+ 
+ 	a, _ := Get(available[0])
+diff --git a/internal/agent/agent.go b/internal/agent/agent.go
+index 02a1c905..11da5d3f 100644
+--- a/internal/agent/agent.go
++++ b/internal/agent/agent.go
+@@ -340,7 +340,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
+ 	}
+ 
+ 	if len(available) == 0 {
+-		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
++		return hostLastResortOr(fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", ")), backups)
+ 	}
+ 
+ 	a, _ := Get(available[0])
+diff --git a/internal/agent/diagnose.go b/internal/agent/diagnose.go
+index 225f2ec7..65a42511 100644
+--- a/internal/agent/diagnose.go
++++ b/internal/agent/diagnose.go
+@@ -51,6 +51,8 @@ func Diagnose(repoCfg *config.RepoConfig, name string, cfg *config.Config) Diagn
+ 	if ca, ok := a.(CommandAgent); ok {
+ 		d.Command = ca.CommandName()
+ 		d.Path, _ = resolveExecutable(d.Command)
++	} else if h, ok := a.(*HostAgent); ok {
++		d.Command = "file handoff in " + h.baseDir()
+ 	}
+ 	return d
+ }
+diff --git a/internal/agent/host.go b/internal/agent/host.go
+index 62a5ff18..68f982ce 100644
+--- a/internal/agent/host.go
++++ b/internal/agent/host.go
+@@ -288,17 +288,33 @@ func stripCodeFence(s string) string {
+ }
+ 
+ // HostMarker says how a host model is attached: Explicit is
+-// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case).
++// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case); Detected is a Cursor cloud
++// agent shell (CURSOR_AGENT=1 plus a CLOUD_AGENT_* variable) with
++// ROBOREV_HOST_AGENT unset or empty.
+ type HostMarker struct {
+-	Explicit bool
+-	Why      string
++	Explicit, Detected bool
++	Why                string
+ }
+ 
+-// ReadHostMarker reads the host marker from the environment.
++// ReadHostMarker reads the host marker from the environment. Any non-empty
++// ROBOREV_HOST_AGENT other than an "on" value turns both kinds off.
+ func ReadHostMarker() HostMarker {
+-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v {
+-	case "1", "true", "yes", "on":
+-		return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
++	if v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v != "" {
++		switch v {
++		case "1", "true", "yes", "on":
++			return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
++		}
++		return HostMarker{}
++	}
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("CURSOR_AGENT"))) {
++	case "1", "true":
++	default:
++		return HostMarker{}
++	}
++	for _, kv := range os.Environ() {
++		if strings.HasPrefix(kv, "CLOUD_AGENT_") {
++			return HostMarker{Detected: true, Why: "Cursor cloud agent detected (CURSOR_AGENT=1 and CLOUD_AGENT_* set)"}
++		}
+ 	}
+ 	return HostMarker{}
+ }
+@@ -312,8 +328,14 @@ const (
+ 	HostAuto                  // auto, auto-selection or a last resort
+ )
+ 
+-// Allows is the one rule for when host may answer: always ROBOREV_HOST_AGENT=1.
++// Allows is the one rule for when host may answer. ROBOREV_HOST_AGENT=1
++// allows every use, including automatic picks (auto, auto-selection, a last
++// resort). A Cursor cloud agent alone allows host only where it is named, and
++// never as an automatic pick or in a listing.
+ func (m HostMarker) Allows(use HostUse) bool {
++	if use == HostNamed {
++		return m.Explicit || m.Detected
++	}
+ 	return m.Explicit
+ }
+ 
+@@ -342,6 +364,49 @@ func requestedHostError(name string) error {
+ 	return &HostUnavailableError{}
+ }
+ 
++func isHostName(name string) bool {
++	return resolveAlias(strings.TrimSpace(name)) == hostAgentName
++}
++
++// withSkippedHostNote names the marker when a named host backup was skipped,
++// so the failure says how to enable it.
++func withSkippedHostNote(err error, backups []string) error {
++	if note := SkippedHostBackupNote(backups...); err != nil && note != "" {
++		return fmt.Errorf("%w%s", err, note)
++	}
++	return err
++}
++
++// SkippedHostBackupNote is a line naming the marker when one of backups is
++// host and host is not allowed, else "".
++func SkippedHostBackupNote(backups ...string) string {
++	if HostAllowed(HostNamed) || !slices.ContainsFunc(backups, isHostName) {
++		return ""
++	}
++	return fmt.Sprintf("\nbackup %q was skipped: no host model is attached (set %s=1 to use it)", hostAgentName, HostMarkerEnv)
++}
++
++// hostLastResortLog receives one line each time host is taken as a last
++// resort.
++var hostLastResortLog io.Writer = os.Stderr
++
++// hostLastResortOr answers with host once non-strict selection found no agent
++// at all, only if host may be picked automatically (ROBOREV_HOST_AGENT=1).
++// Strict lookups never call it.
++func hostLastResortOr(noAgentErr error, backups []string) (Agent, error) {
++	m := ReadHostMarker()
++	if !m.Allows(HostAuto) {
++		return nil, withSkippedHostNote(noAgentErr, backups)
++	}
++	a, err := Get(hostAgentName)
++	if err != nil {
++		return nil, noAgentErr
++	}
++	fmt.Fprintf(hostLastResortLog, "roborev: %s; falling back to %q: %s\n",
++		strings.SplitN(noAgentErr.Error(), "\n", 2)[0], hostAgentName, m.Why)
++	return a, nil
++}
++
+ // ListedAgentNames lists registered agents to offer; host only with ROBOREV_HOST_AGENT=1.
+ func ListedAgentNames() []string {
+ 	names := Available()
+diff --git a/internal/agent/host_test.go b/internal/agent/host_test.go
+index 6fe5d3c5..1504c8e4 100644
+--- a/internal/agent/host_test.go
++++ b/internal/agent/host_test.go
+@@ -60,7 +60,7 @@ var hostModes = []hostMode{
+ 		setDetectedHostOnly(t)
+ 		t.Setenv(HostMarkerEnv, "0")
+ 	}},
+-	{name: "Cursor cloud agent shell", set: setDetectedHostOnly},
++	{name: "Cursor cloud agent shell", set: setDetectedHostOnly, detected: true},
+ 	{name: "explicit marker", set: func(t *testing.T) { setHostMarker(t, true) }, explicit: true},
+ }
+ 
+@@ -121,22 +121,46 @@ func TestReadHostMarker(t *testing.T) {
+ 	setHostMarker(t, false)
+ 	assert.Equal(t, HostMarker{}, ReadHostMarker())
+ 
+-	setDetectedHostOnly(t)
+-	assert.Equal(t, HostMarker{}, ReadHostMarker(), "a Cursor cloud agent shell alone attaches nothing")
++	t.Setenv("CLOUD_AGENT_INJECTED_SECRET_NAMES", "x")
++	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CLOUD_AGENT_* alone is not detection")
+ 
+-	for _, v := range []string{"", "  ", "0", "false", "OFF", "no", "bogus"} {
++	clearCloudAgentEnv(t)
++	t.Setenv("CURSOR_AGENT", "1")
++	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CURSOR_AGENT alone is a local Cursor shell, not a cloud host")
++
++	t.Setenv("CLOUD_AGENT_SOMETHING", "")
++	m := ReadHostMarker()
++	assert.True(t, m.Detected, "CURSOR_AGENT=1 plus any CLOUD_AGENT_* variable")
++	assert.False(t, m.Explicit)
++	assert.Contains(t, m.Why, "CLOUD_AGENT_")
++
++	t.Setenv("CURSOR_AGENT", "TRUE")
++	assert.True(t, ReadHostMarker().Detected, "CURSOR_AGENT is case-insensitive")
++	t.Setenv("CURSOR_AGENT", "0")
++	assert.Equal(t, HostMarker{}, ReadHostMarker())
++	t.Setenv("CURSOR_AGENT", "1")
++
++	for _, v := range []string{"0", "false", "OFF", "no", "bogus"} {
+ 		t.Setenv(HostMarkerEnv, v)
+-		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%q", HostMarkerEnv, v)
++		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%s overrides cloud detection", HostMarkerEnv, v)
+ 	}
++	t.Setenv(HostMarkerEnv, "  ")
++	assert.True(t, ReadHostMarker().Detected, "an empty marker is unset, so detection still applies")
++
+ 	for _, v := range []string{"1", "true", "TRUE", " Yes ", "on"} {
+ 		t.Setenv(HostMarkerEnv, v)
+-		m := ReadHostMarker()
++		m = ReadHostMarker()
+ 		assert.True(t, m.Explicit, "%s=%q", HostMarkerEnv, v)
++		assert.False(t, m.Detected, "the explicit marker wins over detection")
+ 		assert.Contains(t, m.Why, HostMarkerEnv)
+ 	}
++	clearCloudAgentEnv(t)
++	t.Setenv(HostMarkerEnv, "")
++	assert.Equal(t, HostMarker{}, ReadHostMarker(), "empty marker without cloud detection is off")
+ }
+ 
+-// The ruling lives in HostMarker.Allows: every use of host needs
++// The ruling lives in HostMarker.Allows: host runs when named with either
++// marker, but is listed or picked automatically only with
+ // ROBOREV_HOST_AGENT=1.
+ func TestHostMarkerAllows(t *testing.T) {
+ 	for _, tc := range []struct {
+@@ -144,6 +168,7 @@ func TestHostMarkerAllows(t *testing.T) {
+ 		named, listed, auto bool
+ 	}{
+ 		{marker: HostMarker{}},
++		{marker: HostMarker{Detected: true}, named: true},
+ 		{marker: HostMarker{Explicit: true}, named: true, listed: true, auto: true},
+ 	} {
+ 		assert.Equal(t, tc.named, tc.marker.Allows(HostNamed), "%+v named", tc.marker)
+@@ -692,3 +717,149 @@ func TestHostHandoffDirsAreUniqueAndContained(t *testing.T) {
+ 		assert.NotEqual(t, "escape", e.Name())
+ 	}
+ }
++
++func captureHostLastResortLog(t *testing.T) *strings.Builder {
++	t.Helper()
++	var buf strings.Builder
++	prev := hostLastResortLog
++	hostLastResortLog = &buf
++	t.Cleanup(func() { hostLastResortLog = prev })
++	return &buf
++}
++
++// R2: a host named only as a backup is skipped while no host model is
++// attached, and the next candidate is used.
++func TestBackupHostWithoutMarkerIsSkipped(t *testing.T) {
++	setHostMarker(t, false)
++	stubPath(t, "claude")
++	cfg := &config.Config{}
++
++	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "host", "claude")
++	require.NoError(t, err)
++	assert.Equal(t, "claude-code", a.Name(), "strict")
++	a, err = GetAvailableWithConfigFromConfig(nil, "codex", cfg, "host")
++	require.NoError(t, err)
++	assert.Equal(t, "claude-code", a.Name(), "non-strict reaches the fallback order")
++	a, err = GetAvailable("codex", "host", "claude")
++	require.NoError(t, err)
++	assert.Equal(t, "claude-code", a.Name(), "GetAvailable")
++}
++
++// R2: with nothing left after skipping a host backup, the error names the
++// marker that would enable it.
++func TestBackupHostWithoutMarkerNothingLeftNamesMarker(t *testing.T) {
++	setHostMarker(t, false)
++	stubPath(t)
++	cfg := &config.Config{ACP: config.ACPAgentConfigs{"remote": {Command: "missing-acp"}}}
++
++	check := func(label, want string, a Agent, err error) {
++		t.Helper()
++		require.Error(t, err, label)
++		assert.Nil(t, a, label)
++		assert.Contains(t, err.Error(), want, label)
++		assert.Contains(t, err.Error(), `backup "host" was skipped`, label)
++		assert.Contains(t, err.Error(), HostMarkerEnv, label)
++		assert.False(t, IsHostUnavailable(err), "%s: host was not the requested agent", label)
++	}
++	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "host")
++	check("strict", "no configured agent available", a, err)
++	a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "acp.remote", cfg, "host")
++	check("strict named ACP", "no configured agent available", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "codex", cfg, "host")
++	check("non-strict", "no agents available", a, err)
++	a, err = GetAvailableWithConfigFromConfig(nil, "acp.remote", cfg, "host")
++	check("non-strict named ACP", "no agents available", a, err)
++	a, err = GetAvailable("codex", "host")
++	check("GetAvailable", "no agents available", a, err)
++
++	_, err = GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg)
++	require.Error(t, err)
++	assert.NotContains(t, err.Error(), HostMarkerEnv, "no host backup, no host note")
++}
++
++// A host named as a backup is used with the explicit marker and with
++// detection alone, because naming it counts.
++func TestBackupHostWithMarkerIsUsed(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		if !mode.named() {
++			return
++		}
++		stubPath(t)
++		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", &config.Config{}, "host")
++		require.NoError(t, err)
++		assert.Equal(t, "host", a.Name())
++		a, err = GetAvailableWithConfigFromConfig(nil, "codex", &config.Config{}, "host")
++		require.NoError(t, err)
++		assert.Equal(t, "host", a.Name())
++	})
++}
++
++// R4: host is the non-strict last resort only with ROBOREV_HOST_AGENT=1; a
++// Cursor cloud agent alone never makes it an automatic pick, and a strict
++// named agent keeps its error in every mode. No handoff dir is created.
++func TestHostIsLastResortOnlyWithExplicitMarker(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, mode hostMode) {
++		log := captureHostLastResortLog(t)
++		hostDir := filepath.Join(t.TempDir(), "handoff")
++		t.Setenv("ROBOREV_HOST_DIR", hostDir)
++		stubPath(t)
++		cfg := &config.Config{}
++
++		for label, resolve := range map[string]func() (Agent, error){
++			"non-strict":           func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "codex", cfg) },
++			"non-strict no pref":   func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "", cfg) },
++			"non-strict nil cfg":   func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "codex", nil) },
++			"GetAvailable":         func() (Agent, error) { return GetAvailable("codex", "claude") },
++			"GetAvailable no pref": func() (Agent, error) { return GetAvailable("") },
++		} {
++			a, err := resolve()
++			if !mode.explicit {
++				require.Error(t, err, label)
++				assert.Contains(t, err.Error(), "no agents available", label)
++				assert.NotContains(t, err.Error(), "host", "%s: the error is the same as without host", label)
++				continue
++			}
++			require.NoError(t, err, label)
++			assert.Equal(t, "host", a.Name(), label)
++		}
++
++		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
++		require.Error(t, err, "strict named agent keeps its error")
++		assert.Nil(t, a)
++		assert.Contains(t, err.Error(), "no configured agent available")
++
++		if mode.explicit {
++			assert.Contains(t, log.String(), `no agents available (install one of:`)
++			assert.Contains(t, log.String(), `falling back to "host": ROBOREV_HOST_AGENT=1`)
++		} else {
++			assert.Empty(t, log.String())
++		}
++		assert.NoDirExists(t, hostDir)
++	})
++}
++
++// Existing selection is identical whether or not a host model is attached.
++func TestHostDoesNotChangeExistingSelection(t *testing.T) {
++	eachHostMode(t, func(t *testing.T, _ hostMode) {
++		log := captureHostLastResortLog(t)
++		cfg := &config.Config{}
++
++		stubPath(t, "claude")
++		a, err := GetAvailableWithConfigFromConfig(nil, "codex", cfg)
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++		a, err = GetAvailable("")
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
++		require.NoError(t, err)
++		assert.Equal(t, "claude-code", a.Name())
++
++		stubPath(t, "codex", "claude")
++		a, err = GetAvailableWithConfigFromConfig(nil, "", cfg)
++		require.NoError(t, err)
++		assert.Equal(t, "codex", a.Name())
++
++		assert.Empty(t, log.String(), "host is never taken while a backend exists")
++	})
++}
+diff --git a/internal/config/budget.go b/internal/config/budget.go
+index a54c5f1d..aad765bc 100644
+--- a/internal/config/budget.go
++++ b/internal/config/budget.go
+@@ -44,7 +44,7 @@ func (b BudgetConfig) Validate() error {
+ 			return fmt.Errorf("budget.agent_costs: the test agent cannot be used for budget routing")
+ 		}
+ 		if canonical == "host" {
+-			return fmt.Errorf("budget.agent_costs: the host agent runs only when named and cannot be used for budget routing")
++			return fmt.Errorf("budget.agent_costs: the host agent cannot be used for budget routing")
+ 		}
+ 		if prior, ok := seen[canonical]; ok {
+ 			return fmt.Errorf("budget.agent_costs: %q and %q name the same agent", prior, name)
+diff --git a/internal/config/budget_test.go b/internal/config/budget_test.go
+index afa59938..9afcdef7 100644
+--- a/internal/config/budget_test.go
++++ b/internal/config/budget_test.go
+@@ -74,3 +74,30 @@ func TestBudgetPriceListingAndRemoval(t *testing.T) {
+ 	require.NoError(t, SetConfigValue(cfg, "budget.agent_costs.acp.reviewer", ""))
+ 	assert.Empty(t, cfg.Budget.AgentCosts)
+ }
++
++func TestLoadConfigRejectsHostClassifier(t *testing.T) {
++	for _, key := range []string{"classify_agent", "classify_backup_agent"} {
++		for _, scope := range []string{"global", "repository"} {
++			t.Run(scope+"/"+key, func(t *testing.T) {
++				dir := t.TempDir()
++				path := filepath.Join(dir, "config.toml")
++				if scope == "repository" {
++					path = filepath.Join(dir, ".roborev.toml")
++				}
++				require.NoError(t, os.WriteFile(path, []byte(key+" = \"host\"\n"), 0o600))
++				var err error
++				if scope == "global" {
++					_, err = LoadGlobalFrom(path)
++				} else {
++					_, err = LoadRepoConfig(dir)
++				}
++				require.ErrorContains(t, err, key+": the host agent cannot classify")
++			})
++		}
++	}
++	dir := t.TempDir()
++	path := filepath.Join(dir, "config.toml")
++	require.NoError(t, os.WriteFile(path, []byte("default_agent = \"host\"\nfix_agent = \"host\"\n"), 0o600))
++	_, err := LoadGlobalFrom(path)
++	require.NoError(t, err, "host stays valid outside the classifier")
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index e848a458..8f8fec16 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -536,10 +536,23 @@ func validateAgentReferences(cfg any) error {
+ 		if err := agentname.ValidateReference(name); err != nil {
+ 			return fmt.Errorf("%s: %w", path, err)
+ 		}
+-		return nil
++		return validateClassifierReference(path, name)
+ 	})
+ }
+ 
++func isClassifierKey(path string) bool {
++	return path == "classify_agent" || path == "classify_backup_agent"
++}
++
++// validateClassifierReference rejects host for the classifier, which needs a
++// schema-capable agent that answers without a host handoff.
++func validateClassifierReference(path, name string) error {
++	if isClassifierKey(path) && strings.TrimSpace(name) == "host" {
++		return fmt.Errorf("%s: the host agent cannot classify; name a schema-capable agent such as claude-code", path)
++	}
++	return nil
++}
++
+ // walkAgentReferences calls visit for every agent name a config struct sets:
+ // string fields tagged "agent" or "*_agent", "agents" slices, and the keys of
+ // "reviews" maps. The path is the dotted TOML key that holds the name.
+diff --git a/internal/daemon/budget.go b/internal/daemon/budget.go
+index b73982e8..3b22904e 100644
+--- a/internal/daemon/budget.go
++++ b/internal/daemon/budget.go
+@@ -68,10 +68,10 @@ func (r *BudgetRouter) ResolveAgent(configuredAgent string, repoCfg *config.Repo
+ 	preferred := func() (agent.Agent, error) {
+ 		return agent.GetAvailableExactWithConfigFromConfig(repoCfg, configuredAgent, cfg)
+ 	}
+-	if cfg == nil || !cfg.Budget.Enabled {
++	canonical := agent.CanonicalName(configuredAgent)
++	if cfg == nil || !cfg.Budget.Enabled || canonical == "host" {
+ 		return preferred()
+ 	}
+-	canonical := agent.CanonicalName(configuredAgent)
+ 	names := slices.Sorted(maps.Keys(cfg.Budget.AgentCosts))
+ 	if !hasBudgetPrice(configuredAgent, cfg.Budget.AgentCosts) {
+ 		// Without a price for the configured choice, substitution cannot
+@@ -94,7 +94,8 @@ func (r *BudgetRouter) ResolveAgent(configuredAgent string, repoCfg *config.Repo
+ 	var bestScore float64
+ 	var bestCost int
+ 	for _, name := range names {
+-		if agent.CanonicalName(name) == "test" {
++		// Host is never a budget substitute.
++		if c := agent.CanonicalName(name); c == "test" || c == "host" {
+ 			continue
+ 		}
+ 		candidate, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
+diff --git a/internal/daemon/budget_test.go b/internal/daemon/budget_test.go
+index 5209c56d..0b2d373c 100644
+--- a/internal/daemon/budget_test.go
++++ b/internal/daemon/budget_test.go
+@@ -227,3 +227,39 @@ func TestBudgetRoutingDoesNotSelectTestAgent(t *testing.T) {
+ 	require.NoError(t, err)
+ 	assert.Equal(t, "codex", got.Name())
+ }
++
++// Host is never a budget substitute, with or without a host model attached,
++// even when a policy that bypassed validation prices it as the cheapest.
++func TestBudgetRoutingNeverSelectsHost(t *testing.T) {
++	for _, marker := range []string{"0", "1"} {
++		t.Run("ROBOREV_HOST_AGENT="+marker, func(t *testing.T) {
++			t.Setenv(agent.HostMarkerEnv, marker)
++			cfg := config.DefaultConfig()
++			cfg.CodexCmd = "go"
++			cfg.GeminiCmd = "go"
++			cfg.Budget = config.BudgetConfig{
++				Enabled:           true,
++				DailyLimitCents:   500,
++				ReserveFloorCents: 100,
++				AgentCosts:        config.BudgetAgentCosts{"codex": 15, "gemini": 10, "host": 1},
++			}
++			for usd, want := range map[float64]string{4: "codex", 5: "gemini"} {
++				router := NewBudgetRouter(&budgetSpendStub{spend: storage.CostAggregate{TotalUSD: usd, JobsWithCost: 1, JobsTotal: 1}}, nil)
++				got, err := router.ResolveAgent("codex", nil, cfg, config.ReviewTypeDefault, nil)
++				require.NoError(t, err)
++				assert.Equal(t, want, got.Name(), "spend $%v", usd)
++			}
++
++			router := NewBudgetRouter(&budgetSpendStub{spend: storage.CostAggregate{TotalUSD: 5, JobsWithCost: 1, JobsTotal: 1}}, nil)
++			got, err := router.ResolveAgent("host", nil, cfg, config.ReviewTypeDefault, nil)
++			if marker == "0" {
++				require.Error(t, err, "a configured host without a marker is an error, not a substitution")
++				assert.True(t, agent.IsHostUnavailable(err))
++				assert.Contains(t, err.Error(), agent.HostMarkerEnv)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, "host", got.Name(), "an explicit host is never swapped for a priced agent")
++		})
++	}
++}
+diff --git a/internal/daemon/host_agent_test.go b/internal/daemon/host_agent_test.go
+new file mode 100644
+index 00000000..b97467ed
+--- /dev/null
++++ b/internal/daemon/host_agent_test.go
+@@ -0,0 +1,255 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"uuid"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.kenn.io/roborev/internal/agent"
++	"go.kenn.io/roborev/internal/config"
++	"go.kenn.io/roborev/internal/storage"
++	"go.kenn.io/roborev/internal/testutil"
++)
++
++// noHostMarker leaves no marker of either kind: ROBOREV_HOST_AGENT unset and
++// no Cursor cloud agent variables.
++func noHostMarker(t *testing.T) string {
++	t.Helper()
++	for _, kv := range append(os.Environ(), agent.HostMarkerEnv+"=", "CURSOR_AGENT=") {
++		if key, _, _ := strings.Cut(kv, "="); key == agent.HostMarkerEnv || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
++			t.Setenv(key, "")
++			require.NoError(t, os.Unsetenv(key))
++		}
++	}
++	hostDir := filepath.Join(t.TempDir(), "host")
++	t.Setenv("ROBOREV_HOST_DIR", hostDir)
++	return hostDir
++}
++
++// An explicit host with no marker is rejected at enqueue: no job is queued
++// and no handoff dir is created.
++func TestEnqueueExplicitHostWithoutMarkerFailsFast(t *testing.T) {
++	hostDir := noHostMarker(t)
++	server, db, tmpDir := newTestServer(t)
++	repoDir := filepath.Join(tmpDir, "repo")
++	testutil.InitTestGitRepo(t, repoDir)
++
++	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
++		RepoPath: repoDir, GitRef: "HEAD", Agent: "host",
++	})
++	w := httptest.NewRecorder()
++	server.httpServer.Handler.ServeHTTP(w, req)
++
++	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
++	assert.Contains(t, w.Body.String(), agent.HostMarkerEnv)
++	jobs, err := db.ListJobs("", "", 0, 0)
++	require.NoError(t, err)
++	assert.Empty(t, jobs)
++	assert.NoDirExists(t, hostDir)
++}
++
++// A queued host job whose daemon has no marker fails on its first attempt,
++// without retries or failover, and never creates a handoff dir.
++func TestWorkerExplicitHostWithoutMarkerFailsWithoutRetry(t *testing.T) {
++	hostDir := noHostMarker(t)
++	tc := newWorkerTestContext(t, 1)
++	cfg := config.DefaultConfig()
++	cfg.DefaultBackupAgent = "test"
++	tc.reconfigurePool(cfg)
++	sha := testutil.GetHeadSHA(t, tc.TmpDir)
++	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "host")
++
++	tc.Pool.processJob(testWorkerID, job)
++
++	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
++	assert.Equal(t, "host", updated.Agent, "no failover to the backup")
++	assert.Equal(t, 0, updated.RetryCount)
++	assert.Contains(t, updated.Error, agent.HostMarkerEnv)
++	claimed, err := tc.DB.ClaimJob(testWorkerID)
++	require.NoError(t, err)
++	assert.Nil(t, claimed, "nothing is requeued")
++	assert.NoDirExists(t, hostDir)
++}
++
++// Any other failure to get the agent keeps the upstream path: the job is
++// retried on the same agent.
++func TestWorkerNonHostGetAgentErrorIsStillRetried(t *testing.T) {
++	noHostMarker(t)
++	tc := newWorkerTestContext(t, 1)
++	sha := testutil.GetHeadSHA(t, tc.TmpDir)
++	gitPath, err := exec.LookPath("git")
++	require.NoError(t, err)
++	bin := t.TempDir()
++	require.NoError(t, os.Symlink(gitPath, filepath.Join(bin, "git")))
++	t.Setenv("PATH", bin)
++	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
++
++	tc.Pool.processJob(testWorkerID, job)
++
++	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
++	assert.Equal(t, "codex", updated.Agent)
++	assert.Equal(t, 1, updated.RetryCount)
++}
++
++func hostMarkerOn(t *testing.T, timeout string) string {
++	t.Helper()
++	t.Setenv(agent.HostMarkerEnv, "1")
++	t.Setenv("ROBOREV_HOST_TIMEOUT", timeout)
++	hostDir := filepath.Join(t.TempDir(), "host")
++	t.Setenv("ROBOREV_HOST_DIR", hostDir)
++	return hostDir
++}
++
++func claimHostSynthesis(t *testing.T, tc *workerTestContext, name, backup string) *storage.ReviewJob {
++	t.Helper()
++	return claimSynthesis(t, tc, name, "host", backup)
++}
++
++func claimSynthesis(t *testing.T, tc *workerTestContext, name, synthAgent, backup string) *storage.ReviewJob {
++	t.Helper()
++	const member = "host-synth-member"
++	registerPassingAgent(t, member)
++	runUUID, members, _ := enqueuePanelRun(t, tc, name, []memberSpec{
++		{name: "m0", agent: member}, {name: "m1", agent: member},
++	})
++	setSynthesisAgent(t, tc, runUUID, synthAgent)
++	setSynthesisBackup(t, tc, runUUID, backup)
++	completeMember(t, tc, members[0].ID, member, "Finding A")
++	completeMember(t, tc, members[1].ID, member, "Finding B")
++	return releaseAndClaimSynthesis(t, tc, runUUID)
++}
++
++func setSynthesisBackup(t *testing.T, tc *workerTestContext, runUUID uuid.UUID, backup string) {
++	t.Helper()
++	_, err := tc.DB.Exec(
++		"UPDATE review_jobs SET backup_agent = ? WHERE panel_run_uuid = ? AND panel_role = 'synthesis'",
++		backup, runUUID,
++	)
++	require.NoError(t, err)
++}
++
++// A host synthesis with no marker fails on its first attempt, keeps its agent
++// (no failover to the configured backup) and never creates a handoff dir.
++func TestSynthesisExplicitHostWithoutMarkerFailsWithoutRetry(t *testing.T) {
++	hostDir := noHostMarker(t)
++	tc := newWorkerTestContext(t, 1)
++	synth := claimHostSynthesis(t, tc, "host-nomarker", "test")
++
++	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
++
++	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
++	assert.Equal(t, "host", updated.Agent, "no failover to the backup")
++	assert.Equal(t, 0, updated.RetryCount)
++	assert.Contains(t, updated.Error, agent.HostMarkerEnv)
++	claimed, err := tc.DB.ClaimJob(testWorkerID)
++	require.NoError(t, err)
++	assert.Nil(t, claimed, "nothing is requeued")
++	assert.NoDirExists(t, hostDir)
++}
++
++// A host handoff timeout during synthesis burns no same-agent retries: it
++// fails over once when a backup is set and fails when none is.
++func TestSynthesisHostTimeoutSkipsRetries(t *testing.T) {
++	for _, tt := range []struct {
++		name, backup, wantStatus, wantAgent string
++	}{
++		{"no backup", "", string(storage.JobStatusFailed), "host"},
++		{"backup", "test", string(storage.JobStatusQueued), "test"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			hostMarkerOn(t, "50ms")
++			tc := newWorkerTestContext(t, 1)
++			synth := claimHostSynthesis(t, tc, "host-timeout", tt.backup)
++
++			tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
++
++			updated := tc.assertJobStatus(t, synth.ID, storage.JobStatus(tt.wantStatus))
++			assert.Equal(t, tt.wantAgent, updated.Agent)
++			assert.Equal(t, 0, updated.RetryCount, "a host timeout is not retried on host")
++			if tt.backup == "" {
++				assert.Contains(t, updated.Error, "host handoff timeout")
++			}
++		})
++	}
++}
++
++// Only host synthesis errors take the typed path; any other agent's run error,
++// even one marked unavailable, keeps its same-agent retry.
++func TestSynthesisNonHostErrorIsStillRetried(t *testing.T) {
++	noHostMarker(t)
++	const synthAgent = "synth-flaky"
++	agent.RegisterForTest(t, &agent.FakeAgent{
++		NameStr: synthAgent,
++		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
++			return "", agent.MarkUnavailable(errors.New("synth broke"))
++		},
++	})
++	tc := newWorkerTestContext(t, 1)
++	synth := claimSynthesis(t, tc, "synth-retry", synthAgent, "test")
++
++	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
++
++	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusQueued)
++	assert.Equal(t, synthAgent, updated.Agent, "retried on the same agent, not failed over")
++	assert.Equal(t, 1, updated.RetryCount)
++}
++
++// A stored host backup is only resolved when host is allowed, so a job never
++// hops to host without the marker, and the final error names the marker.
++func TestStoredHostBackupNeedsMarker(t *testing.T) {
++	const primary = "host-backup-primary"
++	agent.RegisterForTest(t, &agent.FakeAgent{
++		NameStr: primary,
++		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
++			return "", agent.MarkUnavailable(errors.New("primary broke"))
++		},
++	})
++	for _, tt := range []struct {
++		name   string
++		marker func(*testing.T)
++		want   string
++	}{
++		{"no marker", func(t *testing.T) { noHostMarker(t) }, ""},
++		{"detected only", func(t *testing.T) {
++			t.Setenv(agent.HostMarkerEnv, "")
++			t.Setenv("CURSOR_AGENT", "1")
++			t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
++		}, "host"},
++		{"explicit marker", func(t *testing.T) { hostMarkerOn(t, "1m") }, "host"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			tt.marker(t)
++			tc := newWorkerTestContext(t, 1)
++			sha := testutil.GetHeadSHA(t, tc.TmpDir)
++			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, primary)
++			_, err := tc.DB.Exec(`UPDATE review_jobs SET backup_agent='host' WHERE id=?`, job.ID)
++			require.NoError(t, err)
++			job.BackupAgent = "host"
++			assert.Equal(t, tt.want, tc.Pool.resolveBackupAgent(job))
++
++			tc.Pool.processJob(testWorkerID, job)
++
++			updated, err := tc.DB.GetJobByID(job.ID)
++			require.NoError(t, err)
++			if tt.want == "" {
++				assert.Equal(t, storage.JobStatusFailed, updated.Status)
++				assert.Equal(t, primary, updated.Agent, "never hops to host")
++				assert.Contains(t, updated.Error, agent.HostMarkerEnv)
++			} else {
++				assert.Equal(t, storage.JobStatusQueued, updated.Status)
++				assert.Equal(t, "host", updated.Agent)
++			}
++		})
++	}
++}
+diff --git a/internal/daemon/synthesis_worker.go b/internal/daemon/synthesis_worker.go
+index 8962b56a..b35a6ec9 100644
+--- a/internal/daemon/synthesis_worker.go
++++ b/internal/daemon/synthesis_worker.go
+@@ -444,6 +444,11 @@ func (wp *WorkerPool) runSynthesisAgent(
+ 			)
+ 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
+ 		}
++		if agent.CanonicalName(agentName) == "host" {
++			// A host handoff timeout is not retried on the same agent.
++			wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
++			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
++		}
+ 		wp.failOrRetryAgentContext(ctx, workerID, job, agentName, fmt.Sprintf("agent: %v", err))
+ 		return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
+ 	}
+@@ -468,7 +473,7 @@ func (wp *WorkerPool) configureSynthesisAgentContext(
+ 	cfg := wp.cfgGetter.Config()
+ 	baseAgent, err := resolveConfiguredJobAgent(job, cfg, job.BackupAgent)
+ 	if err != nil {
+-		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, fmt.Sprintf("get agent: %v", err))
++		wp.failGetAgentContext(ctx, workerID, job, err)
+ 		return nil, "", err
+ 	}
+ 
+diff --git a/internal/daemon/worker.go b/internal/daemon/worker.go
+index 59d2fa14..c0a5650e 100644
+--- a/internal/daemon/worker.go
++++ b/internal/daemon/worker.go
+@@ -1148,7 +1148,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
+ 	}
+ 	if agentErr != nil {
+ 		log.Printf("[%s] Error getting agent: %v", workerID, agentErr)
+-		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, fmt.Sprintf("get agent: %v", agentErr))
++		wp.failGetAgentContext(ctx, workerID, job, agentErr)
+ 		return
+ 	}
+ 
+@@ -1645,6 +1645,20 @@ func (wp *WorkerPool) failOrRetryAgentContext(
+ 	})
+ }
+ 
++// failGetAgentContext handles a failure to resolve the job's agent. A missing
++// host model is deterministic for this daemon's environment, so retrying or
++// failing over would only hide the missing marker.
++func (wp *WorkerPool) failGetAgentContext(ctx context.Context, workerID string, job *storage.ReviewJob, err error) {
++	errorMsg := fmt.Sprintf("get agent: %v", err)
++	if !agent.IsHostUnavailable(err) {
++		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, errorMsg)
++		return
++	}
++	wp.runAttemptTransition(workerID, job, func() {
++		wp.failWithoutRetryLocked(workerID, job, job.Agent, errorMsg)
++	})
++}
++
+ // failOrRetryAgentExecutionContext preserves the typed category attached by an
+ // agent adapter until existing provider-limit classification has run. Unknown
+ // pre-protocol failures skip same-agent retries and use the non-retryable
+@@ -1799,6 +1813,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
+ 					return
+ 				}
+ 			}
++			errorMsg += wp.skippedHostBackupNote(job)
+ 		}
+ 
+ 		// No backup or failover failed -- mark as failed
+@@ -1845,7 +1860,12 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
+ 			return
+ 		}
+ 	}
++	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job))
++}
+ 
++func (wp *WorkerPool) failWithoutRetryLocked(
++	workerID string, job *storage.ReviewJob, agentName, errorMsg string,
++) {
+ 	if updated, err := wp.failJobAndInvalidateBudget(job.ID, workerID, errorMsg); err != nil {
+ 		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
+ 	} else if updated {
+@@ -1885,6 +1905,9 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+ 		return ""
+ 	}
+ 	if job.BackupAgent != "" {
++		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
++			return ""
++		}
+ 		if resolved, err := agent.Get(job.BackupAgent); err == nil {
+ 			return resolved.Name()
+ 		}
+@@ -1927,6 +1950,22 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+ 	return resolved.Name()
+ }
+ 
++// skippedHostBackupNote names the marker when the job's stored or workflow
++// backup is host but this daemon has no host model.
++func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
++	backup := job.BackupAgent
++	if backup == "" && job.FrozenExperimentPlan == nil {
++		configRoot := job.RepoPath
++		if job.IsGoalReviewJob() {
++			configRoot = GoalReviewConfigRepoPath(job)
++		}
++		if res, err := agent.ResolveWorkflowConfig("", configRoot, wp.cfgGetter.Config(), failoverWorkflow(job), ""); err == nil {
++			backup = res.BackupAgent
++		}
++	}
++	return agent.SkippedHostBackupNote(backup)
++}
++
+ // resolveBackupModel returns the frozen experiment value when present.
+ // Ordinary jobs retain the workflow-config fallback.
+ func (wp *WorkerPool) resolveBackupModel(job *storage.ReviewJob) string {
+@@ -2304,7 +2343,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
+ 		}
+ 	}
+ 
+-	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg, prefix, label)
++	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job), prefix, label)
+ }
+ 
+ func (wp *WorkerPool) failJobWithPrefixLocked(
+-- 
+2.43.0
+
