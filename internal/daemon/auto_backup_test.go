@@ -521,6 +521,41 @@ func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
 	}
 }
 
+// After a restart in a detected Cursor cloud env without ROBOREV_HOST_AGENT=1,
+// a stored host primary and a stored named-host backup must not run host.
+// Detection never substitutes for the marker. This fails on r5, where
+// HostNamed allowed Detected.
+func TestDetectedRestartDoesNotRunHost(t *testing.T) {
+	hostDir := noHostMarker(t)
+	t.Setenv("CURSOR_AGENT", "1")
+	t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
+	t.Setenv("ROBOREV_HOST_TIMEOUT", "50ms")
+
+	t.Run("primary", func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		sha := testutil.GetHeadSHA(t, tc.TmpDir)
+		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "host")
+		tc.Pool.processJob(testWorkerID, job)
+		updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+		assert.Equal(t, "host", updated.Agent, "does not silently swap the primary")
+		assert.Equal(t, 0, updated.RetryCount)
+		assert.Contains(t, updated.Error, agent.HostMarkerEnv)
+		assert.NoDirExists(t, hostDir)
+	})
+
+	t.Run("named backup", func(t *testing.T) {
+		wtc := newWorkerTestContext(t, 1)
+		job := enqueueCodexJob(t, wtc, "host", false)
+		wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "codex broke")
+		final, err := wtc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusFailed, final.Status)
+		assert.Equal(t, "codex", final.Agent, "does not hop to host")
+		assert.Contains(t, final.Error, agent.SkippedHostBackupNote("host"))
+		assert.NoDirExists(t, hostDir)
+	})
+}
+
 // An experiment's single review pins its backup at enqueue and records
 // whether the pin came from auto, including an empty pin; a named backup is
 // not marked.
