@@ -64,6 +64,8 @@ func TestModelSourceSelection(t *testing.T) {
 		{name: "auto with nothing uses host as last resort", global: config.Config{DefaultAgent: "auto"}, marker: true, wantAgent: "host", lastResor: true},
 		{name: "auto with marker still prefers a CLI agent", global: config.Config{DefaultAgent: "auto"}, path: []string{"claude"}, marker: true, wantAgent: "claude-code"},
 		{name: "auto as backup widens strict lookup", global: config.Config{DefaultAgent: "claude", DefaultBackupAgent: "auto"}, path: []string{"gemini"}, wantAgent: "gemini"},
+		{name: "auto backup does not pair review_model", global: config.Config{DefaultAgent: "codex", ReviewBackupAgent: "auto", ReviewModel: "gpt-5"}, path: []string{"claude"}, wantAgent: "claude-code"},
+		{name: "auto backup keeps default_model for the default agent", global: config.Config{DefaultAgent: "claude", DefaultModel: "sonnet", ReviewAgent: "codex", ReviewBackupAgent: "auto", ReviewModel: "gpt-5"}, path: []string{"claude"}, wantAgent: "claude-code", wantModel: "sonnet"},
 		{name: "named primary with auto backup never becomes host", global: config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "auto"}, marker: true, wantErr: `no configured agent available (preferred: "gemini"`},
 		{name: "named primary with auto backup keeps strict error", global: config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "auto"}, wantErr: `no configured agent available (preferred: "gemini"`},
 

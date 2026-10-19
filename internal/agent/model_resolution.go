@@ -83,6 +83,19 @@ func (w WorkflowConfig) UsesBackupAgent(selectedAgent string) bool {
 		!w.AgentMatches(selectedAgent, w.PreferredAgent)
 }
 
+// autoSelectionModelApplies reports whether the selected agent was chosen by
+// the "auto" keyword: as the preferred agent, or as an auto backup of a
+// named preferred that is not the selected agent. Workflow models beside
+// "auto" name no agent, so they must not pair. UsesBackupAgent does not
+// cover this: BackupAgent is the keyword "auto", not the selected name.
+func (w WorkflowConfig) autoSelectionModelApplies(selectedAgent string) bool {
+	if agentname.IsAuto(w.PreferredAgent) {
+		return true
+	}
+	return agentname.IsAuto(w.BackupAgent) &&
+		!w.AgentMatches(selectedAgent, w.PreferredAgent)
+}
+
 // BackupModel returns the workflow backup model override, if any.
 func (w WorkflowConfig) BackupModel() string {
 	if w.RepoConfig != nil {
@@ -190,7 +203,7 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 		return model
 	}
 	var model string
-	if agentname.IsAuto(w.PreferredAgent) && strings.TrimSpace(cliModel) == "" {
+	if w.autoSelectionModelApplies(selectedAgent) && strings.TrimSpace(cliModel) == "" {
 		repoCfg := w.RepoConfig
 		if repoCfg == nil {
 			repoCfg, _ = config.LoadRepoConfig(w.RepoPath)

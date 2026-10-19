@@ -513,6 +513,38 @@ func TestResolveWorkflowConfigModelForSelectedAgent_BackupWithoutModelKeepsDefau
 	require.Empty(t, resolution.ModelForSelectedAgent("claude-code", ""))
 }
 
+// An "auto" backup selected when the named primary is unavailable must not
+// inherit that primary's workflow model. Mutant pin: if ModelForSelectedAgent
+// only guards IsAuto(PreferredAgent), Claude gets gpt-5 here.
+func TestModelForSelectedAgentAutoBackupSkipsWorkflowModel(t *testing.T) {
+	cfg := &config.Config{
+		DefaultAgent:      "codex",
+		ReviewModel:       "gpt-5",
+		ReviewBackupAgent: "auto",
+	}
+	resolution, err := ResolveWorkflowConfigFromConfig("", nil, cfg, "review", "")
+	require.NoError(t, err)
+	require.Equal(t, "codex", resolution.PreferredAgent)
+	require.Equal(t, "auto", resolution.BackupAgent)
+	assert.False(t, resolution.UsesBackupAgent("claude-code"),
+		"auto is a keyword, not a selected-agent match")
+	assert.Empty(t, resolution.ModelForSelectedAgent("claude-code", ""))
+	assert.Equal(t, "gpt-5", resolution.ModelForSelectedAgent("codex", ""),
+		"the named primary still pairs with its workflow model")
+
+	cfg = &config.Config{
+		DefaultAgent:      "claude",
+		DefaultModel:      "sonnet",
+		ReviewAgent:       "codex",
+		ReviewModel:       "gpt-5",
+		ReviewBackupAgent: "auto",
+	}
+	resolution, err = ResolveWorkflowConfigFromConfig("", nil, cfg, "review", "")
+	require.NoError(t, err)
+	assert.Equal(t, "sonnet", resolution.ModelForSelectedAgent("claude-code", ""),
+		"auto backup landing on the default agent keeps default_model")
+}
+
 // TestModelForSelectedAgentACPBackupPairing pins the backup-path pairing
 // semantics for a configured ACP backup agent. Backup agent and model
 // precedence resolve independently, so a backup model pairs with the backup
