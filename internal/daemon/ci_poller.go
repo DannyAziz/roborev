@@ -24,6 +24,7 @@ import (
 	googlegithub "github.com/google/go-github/v91/github"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 	gitpkg "go.kenn.io/roborev/internal/git"
 	ghpkg "go.kenn.io/roborev/internal/github"
@@ -1284,14 +1285,14 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 		model = override
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, resolvedAgent, repoCfg, cfg,
+		resolution, member.ReviewType, resolvedAgent, repoCfg, cfg,
 	)
 	return resolvedAgent, model, backupAgent, backupModel, nil
 }
 
 func backupExecutionForSelectedAgent(
 	resolution agent.WorkflowConfig,
-	selectedAgent string,
+	reviewType, selectedAgent string,
 	repoCfg *config.RepoConfig,
 	cfg *config.Config,
 ) (string, string) {
@@ -1299,8 +1300,29 @@ func backupExecutionForSelectedAgent(
 	if backupAgent == "" || resolution.AgentMatches(selectedAgent, backupAgent) {
 		return "", ""
 	}
+	// An "auto" backup is pinned to a concrete agent other than the selected
+	// one now, so failover is a single hop. It gets no model: configured
+	// backup models name a model for a specific agent, not whatever auto finds.
+	if agentname.IsAuto(backupAgent) {
+		name := agent.ResolveAutoBackup(repoCfg, cfg, selectedAgent, autoBackupEligible(reviewType))
+		if resolution.AgentMatches(selectedAgent, name) {
+			return "", ""
+		}
+		return name, ""
+	}
 	return agent.StorageNameFromConfig(backupAgent, repoCfg, cfg),
 		resolution.ModelForSelectedAgent(backupAgent, "")
+}
+
+// pinnedAutoBackup is the concrete agent an "auto" workflow backup stands for
+// at enqueue, so failover is a single hop. Named workflow backups keep
+// failover-time resolution.
+func pinnedAutoBackup(resolution agent.WorkflowConfig, reviewType, selectedAgent string) string {
+	if !agentname.IsAuto(strings.TrimSpace(resolution.BackupAgent)) {
+		return ""
+	}
+	name, _ := backupExecutionForSelectedAgent(resolution, reviewType, selectedAgent, resolution.RepoConfig, resolution.GlobalConfig)
+	return name
 }
 
 // resolveMatrixMemberAgent resolves the effective agent and model for one
@@ -1358,7 +1380,7 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 		)
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, resolvedAgent, repoCfg, cfg,
+		resolution, entry.ReviewType, resolvedAgent, repoCfg, cfg,
 	)
 	ciModel := cfg.CI.Model
 	if config.ExperimentOverridesWorkflowModel(repoCfg, workflow, reasoning) {
@@ -1538,7 +1560,7 @@ func (p *CIPoller) maybeAppendDesignMember(
 				designModel = override
 			}
 			backupAgent, backupModel = backupExecutionForSelectedAgent(
-				resolution, designAgent, repoCfg, cfg,
+				resolution, config.ReviewTypeDesign, designAgent, repoCfg, cfg,
 			)
 		}
 		return append(members, config.ResolvedMember{
@@ -1684,6 +1706,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			Model:                 m.Model,
 			BackupAgent:           m.BackupAgent,
 			BackupModel:           m.BackupModel,
+			BackupAuto:            backupIsAuto(in.repoCfg, in.cfg, config.WorkflowForReviewType(m.ReviewType)),
 			Provider:              m.Provider,
 			Reasoning:             m.Reasoning,
 			ReviewType:            m.ReviewType,

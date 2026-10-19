@@ -1129,6 +1129,14 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("add budget_routing_locked column: %w", err)
 		}
 	}
+	// Local like budget_routing_locked: the backup came from an "auto" pin.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'backup_auto'`).Scan(&count)
+	if err == nil && count == 0 {
+		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN backup_auto INTEGER NOT NULL DEFAULT 0`)
+	}
+	if err != nil {
+		return fmt.Errorf("add backup_auto column: %w", err)
+	}
 	for _, column := range []string{"budget_original_agent", "budget_original_backup_agent", "budget_original_backup_model"} {
 		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = ?`, column).Scan(&count)
 		if err != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -78,7 +79,8 @@ func ValidateStructuredReviewBackup(
 	selectedAgent string,
 ) error {
 	backupName := strings.TrimSpace(resolution.BackupAgent)
-	if config.IsBuiltInReviewType(reviewType) || backupName == "" ||
+	// An "auto" backup is pinned to a structured-capable agent at enqueue.
+	if config.IsBuiltInReviewType(reviewType) || backupName == "" || agentname.IsAuto(backupName) ||
 		resolution.AgentMatches(selectedAgent, backupName) {
 		return nil
 	}
@@ -113,6 +115,9 @@ func IsSchemaAgent(a Agent) bool {
 // schema-capable agent and checks availability using the same config-aware
 // command override rules as normal review execution.
 func GetAvailableSchemaExactWithConfig(name string, cfg *config.Config) (SchemaAgent, error) {
+	if agentname.IsAuto(name) {
+		return nil, fmt.Errorf("classifier %q is not supported; name a schema-capable agent such as claude-code", agentname.Auto)
+	}
 	canonical := resolveAlias(name)
 	registryMu.RLock()
 	a, ok := registry[canonical]

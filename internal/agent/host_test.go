@@ -275,12 +275,18 @@ func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
 			{name: "named cli with backup", preferred: "codex", backups: []string{"claude"}},
 			{name: "named ACP", preferred: "acp.remote"},
 			{name: "named ACP with backup", preferred: "acp.remote", backups: []string{"gemini"}},
+			{name: "named cli with auto backup", preferred: "gemini", backups: []string{"auto"}},
+			{name: "named cli with backup and auto", preferred: "codex", backups: []string{"claude", "auto"}},
+			{name: "named ACP with auto backup", preferred: "acp.remote", backups: []string{"auto"}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				a, err := GetPreferredOrBackupWithConfigFromConfig(nil, tc.preferred, cfg, tc.backups...)
 				require.Error(t, err)
 				assert.Nil(t, a)
 				assert.Contains(t, err.Error(), "no configured agent available")
+				if slices.Contains(tc.backups, "auto") {
+					assert.Contains(t, err.Error(), "auto)", "the auto backup is named in the error")
+				}
 			})
 		}
 
@@ -288,6 +294,9 @@ func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
 		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
 		require.NoError(t, err)
 		assert.Equal(t, "claude-code", a.Name(), "a named backup still wins over host")
+		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "gemini", cfg, "auto")
+		require.NoError(t, err)
+		assert.Equal(t, "claude-code", a.Name(), "an auto backup picks an available CLI agent")
 	})
 }
 

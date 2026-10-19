@@ -280,7 +280,7 @@ func IsAvailable(name string) bool {
 // default_backup_agent config without changing the global chain order.
 func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	// Resolve alias upfront for consistent comparisons
-	preferred = resolveAlias(preferred)
+	preferred = resolveAlias(withoutAuto(preferred))
 	if err := requestedHostError(preferred); err != nil {
 		return nil, err
 	}

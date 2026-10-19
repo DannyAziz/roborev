@@ -79,6 +79,7 @@ func TestPostgresBackupColumnRoundTrip(t *testing.T) { //nolint:paralleltest // 
 		SourceMachineID: uuid.New(),
 		BackupAgent:     "claude-code",
 		BackupModel:     "opus",
+		BackupAuto:      true,
 	}
 	require.NoError(t, pool.UpsertJob(ctx, job, repoID, nil))
 
@@ -95,4 +96,5 @@ func TestPostgresBackupColumnRoundTrip(t *testing.T) { //nolint:paralleltest // 
 	require.NotNil(t, found, "job not pulled back")
 	assert.Equal("claude-code", found.BackupAgent)
 	assert.Equal("opus", found.BackupModel)
+	assert.True(found.BackupAuto)
 }

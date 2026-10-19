@@ -3,6 +3,7 @@ package agent
 import (
 	"strings"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -79,6 +80,19 @@ func (w WorkflowConfig) AgentMatches(left, right string) bool {
 func (w WorkflowConfig) UsesBackupAgent(selectedAgent string) bool {
 	return w.BackupAgent != "" &&
 		w.AgentMatches(selectedAgent, w.BackupAgent) &&
+		!w.AgentMatches(selectedAgent, w.PreferredAgent)
+}
+
+// autoSelectionModelApplies reports whether the selected agent was chosen by
+// the "auto" keyword: as the preferred agent, or as an auto backup of a
+// named preferred that is not the selected agent. Workflow models beside
+// "auto" name no agent, so they must not pair. UsesBackupAgent does not
+// cover this: BackupAgent is the keyword "auto", not the selected name.
+func (w WorkflowConfig) autoSelectionModelApplies(selectedAgent string) bool {
+	if agentname.IsAuto(w.PreferredAgent) {
+		return true
+	}
+	return agentname.IsAuto(w.BackupAgent) &&
 		!w.AgentMatches(selectedAgent, w.PreferredAgent)
 }
 
@@ -189,7 +203,13 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 		return model
 	}
 	var model string
-	if w.RepoConfig != nil {
+	if w.autoSelectionModelApplies(selectedAgent) && strings.TrimSpace(cliModel) == "" {
+		repoCfg := w.RepoConfig
+		if repoCfg == nil {
+			repoCfg, _ = config.LoadRepoConfig(w.RepoPath)
+		}
+		model = autoSelectionModel(selectedAgent, repoCfg, w.GlobalConfig)
+	} else if w.RepoConfig != nil {
 		model = ResolveWorkflowModelForAgentFromConfig(
 			selectedAgent, cliModel, w.RepoConfig,
 			w.GlobalConfig, w.Workflow, w.Reasoning,
@@ -249,6 +269,9 @@ func ResolveWorkflowModelForAgentFromConfig(
 		)
 	}
 
+	if agentname.IsAuto(config.ResolveAgentForWorkflowFromConfig("", repoCfg, globalCfg, workflow, level)) {
+		return autoSelectionModel(selectedAgent, repoCfg, globalCfg)
+	}
 	defaultAgent := config.ResolveAgentFromConfig("", repoCfg, globalCfg)
 	if workflowModelComparableAgentNameFromConfig(selectedAgent, repoCfg, globalCfg) !=
 		workflowModelComparableAgentNameFromConfig(defaultAgent, repoCfg, globalCfg) {
@@ -350,4 +373,16 @@ func (w WorkflowConfig) resolveACPAgentConfig(selectedAgent string) *config.ACPA
 		return nil
 	}
 	return &acpCfg
+}
+
+// autoSelectionModel is the model for an agent that "auto" selected, from
+// config or --agent auto. A workflow model beside "auto" names no agent, so it
+// never pairs; default_model pairs only when auto lands on default_agent.
+func autoSelectionModel(selectedAgent string, repoCfg *config.RepoConfig, globalCfg *config.Config) string {
+	defaultAgent := config.ResolveAgentFromConfig("", repoCfg, globalCfg)
+	if workflowModelComparableAgentNameFromConfig(selectedAgent, repoCfg, globalCfg) !=
+		workflowModelComparableAgentNameFromConfig(defaultAgent, repoCfg, globalCfg) {
+		return ""
+	}
+	return config.ResolveModelFromConfig("", repoCfg, globalCfg)
 }

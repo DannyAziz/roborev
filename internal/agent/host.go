@@ -36,13 +36,20 @@ type HostAgent struct {
 	Dir          string
 	Timeout      time.Duration
 	PollInterval time.Duration
+	// Model is passed to the host as a hint; roborev cannot pick the host's
+	// model, so the host uses it only if it can.
+	Model string
 }
 
 func (a *HostAgent) Name() string                       { return hostAgentName }
 func (a *HostAgent) WithReasoning(ReasoningLevel) Agent { return a }
 func (a *HostAgent) WithAgentic(bool) Agent             { return a }
-func (a *HostAgent) WithModel(string) Agent             { return a }
-func (a *HostAgent) CommandLine() string                { return "host (file handoff in " + a.baseDir() + ")" }
+func (a *HostAgent) WithModel(model string) Agent {
+	c := *a
+	c.Model = strings.TrimSpace(model)
+	return &c
+}
+func (a *HostAgent) CommandLine() string { return "host (file handoff in " + a.baseDir() + ")" }
 
 func (a *HostAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 	return a.handoff(ctx, repoPath, commitSHA, prompt, nil, output)
@@ -54,6 +61,13 @@ func (a *HostAgent) ReviewWithSchema(ctx context.Context, repoPath, gitRef, prom
 		return nil, err
 	}
 	return jsontext.Value(raw), nil
+}
+
+func (a *HostAgent) modelHint() string {
+	if a.Model == "" {
+		return ""
+	}
+	return fmt.Sprintf("Requested model (hint only): %s. Use it if you can choose your model; otherwise review with your current one.\n", a.Model)
 }
 
 func (a *HostAgent) baseDir() string {
@@ -135,12 +149,12 @@ func (a *HostAgent) handoff(ctx context.Context, repoPath, gitRef, prompt string
 
 Repository: %s
 Git ref: %s
-
+%s
 1. Read prompt.md here and review the change it describes, using the repository above.
 2. Output format: %s
 3. Write the answer to answer.md.tmp, then rename it to answer.md (only a regular answer.md is read).
 4. roborev waits %s (the host handoff timeout, %s) for answer.md, then fails and removes this directory.
-`, repoPath, gitRef, format, timeout, hostTimeoutEnv)
+`, repoPath, gitRef, a.modelHint(), format, timeout, hostTimeoutEnv)
 	if err := writeHandoffFile(jobDir, "instructions.md", []byte(instructions)); err != nil {
 		return "", err
 	}

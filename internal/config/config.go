@@ -536,7 +536,10 @@ func validateAgentReferences(cfg any) error {
 		if err := agentname.ValidateReference(name); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		return validateClassifierReference(path, name)
+		if err := validateClassifierReference(path, name); err != nil {
+			return err
+		}
+		return validateAutoReference(path, name)
 	})
 }
 
@@ -549,6 +552,22 @@ func isClassifierKey(path string) bool {
 func validateClassifierReference(path, name string) error {
 	if isClassifierKey(path) && strings.TrimSpace(name) == "host" {
 		return fmt.Errorf("%s: the host agent cannot classify; name a schema-capable agent such as claude-code", path)
+	}
+	return nil
+}
+
+// validateAutoReference accepts "auto" only in the top-level agent and
+// workflow agent keys. The classifier needs a named schema-capable agent, and
+// nested agents (panels, subagents, experiments) are always explicit.
+func validateAutoReference(path, name string) error {
+	if !agentname.IsAuto(name) {
+		return nil
+	}
+	if isClassifierKey(path) {
+		return fmt.Errorf("%s: %q is not supported for the classifier; name a schema-capable agent such as claude-code", path, agentname.Auto)
+	}
+	if strings.ContainsAny(path, ".[") {
+		return fmt.Errorf("%s: %q is only supported in default_agent, agent and workflow agent keys", path, agentname.Auto)
 	}
 	return nil
 }
