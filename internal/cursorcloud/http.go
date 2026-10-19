@@ -43,6 +43,11 @@ const defaultResponseHeaderTimeout = 60 * time.Second
 // document without retaining an unbounded socket body in memory.
 const maxResponseBytes = 8 << 20
 
+// responseBodyTimeout bounds the body read after headers arrive.
+// ResponseHeaderTimeout does not cover that read, so a stall after the
+// headers would otherwise block forever. 60s matches that header bound.
+var responseBodyTimeout = 60 * time.Second
+
 // maxErrorMessageBytes matches the 64 KiB error-body cap used for other
 // daemon HTTP errors (internal/mcpserver maxErrorBodyBytes). A non-2xx body
 // is not copied in full into APIError.Message.
@@ -378,14 +383,9 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// LimitReader stops the socket read. One extra byte distinguishes a body
-	// that fits from one that must be refused instead of truncated.
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	data, err := c.readResponseBody(ctx, resp.Body)
 	if err != nil {
-		return c.redactErr(fmt.Errorf("cursor cloud: read response: %w", err))
-	}
-	if int64(len(data)) > maxResponseBytes {
-		return errors.New("cursor cloud: response body exceeds 8 MiB")
+		return c.redactErr(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return c.apiError(op, resp.StatusCode, data)
@@ -400,6 +400,36 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud %s: decode response: %w", op, err))
 	}
 	return nil
+}
+
+func (c *httpClient) readResponseBody(ctx context.Context, body io.ReadCloser) ([]byte, error) {
+	timer := time.NewTimer(responseBodyTimeout)
+	defer timer.Stop()
+	done := make(chan struct{})
+	var data []byte
+	var err error
+	go func() {
+		data, err = io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-timer.C:
+		_ = body.Close()
+		<-done
+		return nil, errors.New("cursor cloud: response body deadline exceeded")
+	case <-ctx.Done():
+		_ = body.Close()
+		<-done
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cursor cloud: read response: %w", err)
+	}
+	if int64(len(data)) > maxResponseBytes {
+		return nil, errors.New("cursor cloud: response body exceeds 8 MiB")
+	}
+	return data, nil
 }
 
 func (c *httpClient) endpoint(rawPath string) (string, error) {

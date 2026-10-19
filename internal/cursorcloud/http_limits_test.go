@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,43 @@ func TestErrorBodyIsTruncated(t *testing.T) {
 	require.ErrorAs(t, err, &apiErr)
 	assert.Len(t, apiErr.Message, maxErrorMessageBytes)
 	assert.NotContains(t, apiErr.Message, "k")
+}
+
+func TestHTTPBodyStallAfterHeadersTimesOut(t *testing.T) {
+	old := responseBodyTimeout
+	responseBodyTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { responseBodyTimeout = old })
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(started)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	errc := make(chan error, 1)
+	go func() {
+		client := NewHTTPClient("k", WithBaseURL(srv.URL))
+		_, err := client.GetAgent(context.Background(), "bc_1")
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		require.ErrorContains(t, err, "response body deadline exceeded")
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetAgent blocked after response headers")
+	}
+	<-started
 }
 
 func TestHTTPOversizedBodyErrors(t *testing.T) {
