@@ -82,8 +82,8 @@ func checkDoctorAgents(env *doctorEnv) []doctorCheck {
 		}
 	}
 	if len(installed) == 0 && slices.Contains(doctorAgentNames(env), "host") {
-		// Listings show host only with ROBOREV_HOST_AGENT=1, but a host named
-		// in config also runs inside a Cursor cloud agent.
+		// Listings show host only with ROBOREV_HOST_AGENT=1. Named host
+		// uses the same marker; detection never makes Diagnose succeed.
 		if v := env.viewAgent("host"); v.diag.Available {
 			installed = append(installed, v.diag)
 		}
@@ -134,7 +134,7 @@ func checkDoctorPathMismatch(env *doctorEnv, local []agent.Diagnosis) []doctorCh
 			// The daemon lists host only with the explicit marker, so ask
 			// whether it would run host when named.
 			if !env.viewAgent(d.Name).diag.Available {
-				missing = append(missing, fmt.Sprintf("%s: %s=1 is set in this shell, but the daemon's environment has neither it nor a Cursor cloud agent, so a named host fails there", d.Name, agent.HostMarkerEnv))
+				missing = append(missing, fmt.Sprintf("%s: %s=1 is set in this shell, but the daemon's environment does not, so a named host fails there", d.Name, agent.HostMarkerEnv))
 			}
 			continue
 		}
@@ -302,7 +302,7 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
 		// An explicit host without a host model is an error, never a
 		// reason to run the backup.
 		c.Status = doctorFail
-		c.Summary = fmt.Sprintf("%s will fail: agent host needs %s=1 or a Cursor cloud agent in %s", subject, agent.HostMarkerEnv, primary.where())
+		c.Summary = fmt.Sprintf("%s will fail: agent host needs %s=1 in %s", subject, agent.HostMarkerEnv, primary.where())
 		c.Details = details
 		if res.BackupAgent != "" {
 			c.Details = append(c.Details, fmt.Sprintf("backup %s is never tried, because an explicit host without a host model is an error", res.BackupAgent))
@@ -430,7 +430,7 @@ func checkDoctorConfiguredAgents(env *doctorEnv, skip map[string]bool) []doctorC
 	}
 	fix := "install the agent, fix the name, or remove the setting; jobs routed to it fail"
 	if _, ok := keysByName["host"]; ok && !skip["host"] && !env.viewAgent("host").diag.Available {
-		fix += fmt.Sprintf("; host needs %s=1 where reviews run, or a Cursor cloud agent if host is named (a host backup is skipped until then)", agent.HostMarkerEnv)
+		fix += fmt.Sprintf("; host needs %s=1 where reviews run (a host backup is skipped until then)", agent.HostMarkerEnv)
 	}
 	if restartHelps {
 		fix = "some of these are installed in this shell; run 'roborev daemon restart' from it. Otherwise " + fix

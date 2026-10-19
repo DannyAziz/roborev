@@ -236,7 +236,7 @@ var daemonHostModes = []daemonHostMode{
 		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
 		return dir
 	}},
-	{name: "detected only", named: true, set: func(t *testing.T) string {
+	{name: "detected only", set: func(t *testing.T) string {
 		dir := noHostMarker(t)
 		t.Setenv("CURSOR_AGENT", "1")
 		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
@@ -250,11 +250,11 @@ var daemonHostModes = []daemonHostMode{
 }
 
 // The host ruling, end to end at the daemon: host runs where it is named
-// (primary or named backup) with ROBOREV_HOST_AGENT=1 or in a Cursor cloud
-// agent, and is an automatic pick (the auto primary, a CI blank agent, an auto
-// backup resolved at failover) only with ROBOREV_HOST_AGENT=1. Strict enqueue
-// with an auto backup never takes host. No agent CLI is on PATH, and no
-// handoff dir is created.
+// (primary or named backup) only with ROBOREV_HOST_AGENT=1, and is an
+// automatic pick (the auto primary, a CI blank agent, an auto backup
+// resolved at failover) only with that same marker. Detection of a Cursor
+// cloud agent never substitutes for it. Strict enqueue with an auto backup
+// never takes host. No agent CLI is on PATH, and no handoff dir is created.
 func TestHostRulingByMarkerMode(t *testing.T) {
 	for _, mode := range daemonHostModes {
 		t.Run(mode.name, func(t *testing.T) {
@@ -349,8 +349,8 @@ func enqueueCodexJob(t *testing.T, wtc *workerTestContext, backup string, backup
 // Runtime failover by marker mode. With ROBOREV_HOST_AGENT=1 an auto backup
 // that finds no CLI agent fails over to host. Without the marker, host is
 // skipped and the next agent is tried; when none is left the job fails with an
-// error naming ROBOREV_HOST_AGENT. A named host backup runs wherever host may
-// be named. No handoff dir is created: the job is only requeued.
+// error naming ROBOREV_HOST_AGENT. A named host backup runs only with
+// ROBOREV_HOST_AGENT=1. No handoff dir is created: the job is only requeued.
 func TestHostFailoverByMarkerMode(t *testing.T) {
 	for _, mode := range daemonHostModes {
 		for _, tc := range []struct {
@@ -431,8 +431,8 @@ func TestEmptyAutoPinIsFrozen(t *testing.T) {
 
 // A host backup that auto pinned under ROBOREV_HOST_AGENT=1 runs after a
 // restart only while that marker is still set: a Cursor cloud agent alone
-// never makes host an automatic pick. A named host backup is honored wherever
-// host may be named.
+// never makes host an automatic pick. A named host backup is honored only
+// with ROBOREV_HOST_AGENT=1.
 func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
 	for _, mode := range daemonHostModes {
 		t.Run(mode.name, func(t *testing.T) {

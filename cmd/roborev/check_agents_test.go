@@ -59,7 +59,7 @@ func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
 		{marker: "1", want: `(?m)^  - host\s+not smoke-tested`},
 		{marker: "1", filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
 		{detected: true, notWant: `(?m)^  . host\s`},
-		{detected: true, filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
+		{detected: true, filter: "host", wantErr: true, want: `(?m)^  x host\s+FAIL: agent "host" hands reviews to a host model, but none is attached: set ROBOREV_HOST_AGENT=1`},
 		{marker: "0", notWant: `(?m)^  . host\s`},
 		{marker: "0", filter: "host", wantErr: true, want: `(?m)^  x host\s+FAIL: agent "host" hands reviews to a host model, but none is attached: set ROBOREV_HOST_AGENT=1`},
 	} {

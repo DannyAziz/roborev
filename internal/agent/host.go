@@ -342,13 +342,12 @@ const (
 	HostAuto                  // auto, auto-selection or a last resort
 )
 
-// Allows is the one rule for when host may answer. ROBOREV_HOST_AGENT=1
-// allows every use, including automatic picks (auto, auto-selection, a last
-// resort). A Cursor cloud agent alone allows host only where it is named, and
-// never as an automatic pick or in a listing.
+// Allows is the one rule for when host may answer: only
+// ROBOREV_HOST_AGENT=1. Detection of a Cursor cloud agent never
+// substitutes for the marker, including when host is named.
 func (m HostMarker) Allows(use HostUse) bool {
 	if use == HostNamed {
-		return m.Explicit || m.Detected
+		return m.Explicit
 	}
 	return m.Explicit
 }

@@ -59,6 +59,31 @@ func TestEnqueueExplicitHostWithoutMarkerFailsFast(t *testing.T) {
 	assert.NoDirExists(t, hostDir)
 }
 
+// Mutant pin: if HostMarker.Allows(HostNamed) treats Detected as sufficient,
+// this named-host enqueue returns 201 and queues a job.
+func TestEnqueueNamedHostDetectedWithoutMarkerFails(t *testing.T) {
+	hostDir := noHostMarker(t)
+	t.Setenv("CURSOR_AGENT", "1")
+	t.Setenv("CLOUD_AGENT_FLAKE", "1")
+	server, db, tmpDir := newTestServer(t)
+	repoDir := filepath.Join(tmpDir, "repo")
+	testutil.InitTestGitRepo(t, repoDir)
+
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
+		RepoPath: repoDir, GitRef: "HEAD", Agent: "host",
+	})
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusCreated, w.Code, w.Body.String())
+	assert.GreaterOrEqual(t, w.Code, 400, w.Body.String())
+	assert.Contains(t, w.Body.String(), agent.HostMarkerEnv)
+	jobs, err := db.ListJobs("", "", 0, 0)
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "nothing is queued")
+	assert.NoDirExists(t, hostDir)
+}
+
 // A queued host job whose daemon has no marker fails on its first attempt,
 // without retries or failover, and never creates a handoff dir.
 func TestWorkerExplicitHostWithoutMarkerFailsWithoutRetry(t *testing.T) {
@@ -225,7 +250,7 @@ func TestStoredHostBackupNeedsMarker(t *testing.T) {
 			t.Setenv(agent.HostMarkerEnv, "")
 			t.Setenv("CURSOR_AGENT", "1")
 			t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
-		}, "host"},
+		}, ""},
 		{"explicit marker", func(t *testing.T) { hostMarkerOn(t, "1m") }, "host"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

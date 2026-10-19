@@ -22,7 +22,7 @@ func TestRerunAgentPickerListsHostOnlyWithMarker(t *testing.T) { //nolint:parall
 			t.Setenv(agent.HostMarkerEnv, tc.marker)
 			t.Setenv("CURSOR_AGENT", "")
 			if tc.detected {
-				// Detection runs a named host but never lists it.
+				// Detection never lists host and never lets a named host run.
 				t.Setenv("CURSOR_AGENT", "1")
 				t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
 			}

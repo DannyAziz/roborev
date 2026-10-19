@@ -148,7 +148,7 @@ func testDoctorAgentsDaemonPathMismatch(t *testing.T, mode string) {
 	want := 2
 	if mode == "explicit" {
 		want = 3
-		assert.Contains(mismatch.Details[1], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment has neither")
+		assert.Contains(mismatch.Details[1], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment does not")
 	}
 	require.Len(t, mismatch.Details, want, "%q", mismatch.Details)
 	assert.Contains(mismatch.Details[0], "claude-code: found at ")
@@ -669,7 +669,7 @@ func TestDoctorDaemonTLS(t *testing.T) {
 }
 
 func TestDoctorAgentsExplicitHostWithoutMarker(t *testing.T) {
-	for _, mode := range []string{"none", "zero"} {
+	for _, mode := range []string{"none", "zero", "detected"} {
 		t.Run(mode, func(t *testing.T) {
 			setDoctorHostMode(t, mode)
 			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
@@ -679,7 +679,7 @@ func TestDoctorAgentsExplicitHostWithoutMarker(t *testing.T) {
 			}
 			review, _ := checkDoctorReviewAgent(env, "reviews")
 			assert.Equal(t, doctorFail, review.Status, "an explicit host never falls back to the backup")
-			assert.Contains(t, review.Summary, "agent host needs ROBOREV_HOST_AGENT=1 or a Cursor cloud agent in this shell")
+			assert.Contains(t, review.Summary, "agent host needs ROBOREV_HOST_AGENT=1 in this shell")
 			assert.Contains(t, strings.Join(review.Details, "\n"), "backup gemini is never tried")
 			assert.Equal(t, "set ROBOREV_HOST_AGENT=1 in the environment the daemon runs in and run 'roborev daemon restart' from it, or change default_agent to an installed CLI agent", review.Fix)
 
@@ -691,7 +691,7 @@ func TestDoctorAgentsExplicitHostWithoutMarker(t *testing.T) {
 }
 
 func TestDoctorAgentsHostBackupLabeledUnavailable(t *testing.T) {
-	for _, mode := range []string{"none", "zero"} {
+	for _, mode := range []string{"none", "zero", "detected"} {
 		t.Run(mode, func(t *testing.T) {
 			setDoctorHostMode(t, mode)
 			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
@@ -702,45 +702,34 @@ func TestDoctorAgentsHostBackupLabeledUnavailable(t *testing.T) {
 			configured := findDoctorCheck(t, checkDoctorAgents(env), "agents.configured")
 			assert.Equal(t, doctorWarn, configured.Status)
 			assert.Contains(t, strings.Join(configured.Details, "\n"), `host (set by default_backup_agent): agent "host" hands reviews to a host model, but none is attached`)
-			assert.Contains(t, configured.Fix, "host needs ROBOREV_HOST_AGENT=1 where reviews run, or a Cursor cloud agent if host is named")
+			assert.Contains(t, configured.Fix, "host needs ROBOREV_HOST_AGENT=1 where reviews run")
 		})
 	}
 }
 
-// Detection alone runs a named host but never lists it, in the shell or the
-// daemon, so doctor reports host only through the review check.
+// Detection alone never runs a named host and never lists it, so doctor
+// treats it like no marker: the review check fails and host is hidden.
 func TestDoctorAgentsHostUnderDetectionOnly(t *testing.T) {
 	setDoctorHostMode(t, "detected")
 	t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
 	env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
 	review, _ := checkDoctorReviewAgent(env, "reviews")
-	assert.Equal(t, doctorOK, review.Status)
-	assert.Regexp(t, `^reviews use host \(file handoff in .+\)$`, review.Summary)
+	assert.Equal(t, doctorFail, review.Status)
+	assert.Contains(t, review.Summary, "agent host needs ROBOREV_HOST_AGENT=1 in this shell")
 
 	local := agent.DiagnoseAll(env.repoCfg, env.global)
 	for _, d := range local {
 		assert.NotEqual(t, "host", d.Name, "detection alone does not list host")
 	}
+	assert.False(t, agent.Diagnose(env.repoCfg, "host", env.global).Available)
 	installed := findDoctorCheck(t, checkDoctorAgents(env), "agents.installed")
 	assert.NotContains(t, installed.Summary, "host")
-
-	// A daemon started in the same shell runs a named host and lists the
-	// same agents, so there is no mismatch to warn about.
-	env.ping = &daemon.PingInfo{OK: true}
-	env.daemonAgents = &doctorDaemonAgents{
-		Agents:    local,
-		Requested: []agent.Diagnosis{agent.Diagnose(env.repoCfg, "host", env.global)},
-	}
-	checks := checkDoctorAgents(env)
-	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
-	assert.Equal(t, doctorOK, mismatch.Status, "%q", mismatch.Details)
-	assert.Equal(t, doctorOK, findDoctorCheck(t, checks, "agents.review").Status)
 }
 
-// A daemon that runs a named host raises no host mismatch, whichever marker
-// lets it.
+// A daemon that runs a named host raises no host mismatch. Only
+// ROBOREV_HOST_AGENT=1 lets it.
 func TestDoctorAgentsNoHostMismatchWhenDaemonRunsHost(t *testing.T) {
-	for _, mode := range []string{"explicit", "detected"} {
+	for _, mode := range []string{"explicit"} {
 		t.Run(mode, func(t *testing.T) {
 			setDoctorHostMode(t, mode)
 			t.Setenv("PATH", t.TempDir())
@@ -756,9 +745,8 @@ func TestDoctorAgentsNoHostMismatchWhenDaemonRunsHost(t *testing.T) {
 	}
 }
 
-// With no CLI agent installed, a host named in config is what reviews run
-// on, so detection alone does not report that no agent is available; with
-// host not named, it does, and host is not offered.
+// With no CLI agent installed, detection alone never makes host available,
+// even when config names it, and host is not offered.
 func TestDoctorAgentsOnlyNamedHostUnderDetection(t *testing.T) {
 	for _, tc := range []struct {
 		name, defaultAgent string
@@ -766,8 +754,8 @@ func TestDoctorAgentsOnlyNamedHostUnderDetection(t *testing.T) {
 		want               doctorStatus
 		wantSummary        string
 	}{
-		{name: "named host, no daemon", defaultAgent: "host", want: doctorOK, wantSummary: "agents available to this shell: host"},
-		{name: "named host, daemon", defaultAgent: "host", daemonUp: true, want: doctorOK, wantSummary: "agents available to the daemon: host"},
+		{name: "named host, no daemon", defaultAgent: "host", want: doctorFail, wantSummary: "no review agents are available to this shell"},
+		{name: "named host, daemon", defaultAgent: "host", daemonUp: true, want: doctorFail, wantSummary: "no review agents are available to the daemon"},
 		{name: "host not named", defaultAgent: "codex", want: doctorFail, wantSummary: "no review agents are available to this shell"},
 		{name: "host not named, daemon", defaultAgent: "codex", daemonUp: true, want: doctorFail, wantSummary: "no review agents are available to the daemon"},
 	} {
@@ -807,7 +795,7 @@ func TestDoctorAgentsHostWithMarker(t *testing.T) {
 	}
 	checks := checkDoctorAgents(env)
 	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
-	assert.Contains(t, mismatch.Details[0], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment has neither it nor a Cursor cloud agent")
+	assert.Contains(t, mismatch.Details[0], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment does not")
 	assert.NotContains(t, strings.Join(mismatch.Details, "\n"), "PATH")
 	assert.Equal(t, "run 'roborev daemon restart' from this shell so the daemon inherits ROBOREV_HOST_AGENT", mismatch.Fix)
 	review = findDoctorCheck(t, checks, "agents.review")
