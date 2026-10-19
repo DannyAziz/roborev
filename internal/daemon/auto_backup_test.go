@@ -17,6 +17,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
@@ -553,6 +554,40 @@ func TestDetectedRestartDoesNotRunHost(t *testing.T) {
 		assert.Equal(t, "codex", final.Agent, "does not hop to host")
 		assert.Contains(t, final.Error, agent.SkippedHostBackupNote("host"))
 		assert.NoDirExists(t, hostDir)
+	})
+}
+
+// When a host backup is skipped, both final-error paths must carry the
+// skipped-host note. Mutants that drop skippedHostBackupNote at the retries-
+// exhausted path or the quota/prefix path turn these red.
+func TestSkippedHostNoteOnFinalErrorPaths(t *testing.T) {
+	note := agent.SkippedHostBackupNote("host")
+	require.NotEmpty(t, note)
+
+	t.Run("retries exhausted", func(t *testing.T) {
+		noHostMarker(t)
+		wtc := newWorkerTestContext(t, 1)
+		job := enqueueCodexJob(t, wtc, "host", false)
+		job = wtc.exhaustRetries(t, job, testWorkerID, job.Agent)
+		wtc.Pool.failOrRetryInner(testWorkerID, job, job.Agent, "connection reset", true)
+		final, err := wtc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusFailed, final.Status)
+		assert.Equal(t, "codex", final.Agent)
+		assert.Contains(t, final.Error, note)
+	})
+
+	t.Run("quota prefix", func(t *testing.T) {
+		noHostMarker(t)
+		wtc := newWorkerTestContext(t, 1)
+		job := enqueueCodexJob(t, wtc, "host", false)
+		wtc.Pool.failOrRetryInner(testWorkerID, job, job.Agent, "resource exhausted: reset after 1h", true)
+		final, err := wtc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusFailed, final.Status)
+		assert.Equal(t, "codex", final.Agent)
+		assert.Contains(t, final.Error, review.QuotaErrorPrefix)
+		assert.Contains(t, final.Error, note)
 	})
 }
 
