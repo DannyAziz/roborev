@@ -4,9 +4,6 @@
 //
 // v0 authenticates with HTTP Basic: the API key is the username and the
 // password is empty (curl -u KEY:). The key is never written to logs or errors.
-//
-// TODO: migrate to the Cursor cloud agents v1 API when v1 replaces the v0
-// launch, status, and conversation endpoints.
 package cursorcloud
 
 import (
@@ -17,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,15 +34,6 @@ const listPageLimit = 100
 // headers. The review loop applies its own deadline; this only stops a
 // stalled socket. 60s matches a single metadata-style HTTP call.
 const defaultResponseHeaderTimeout = 60 * time.Second
-
-// maxResponseBytes bounds one response body. 8 MiB covers a long review
-// document without retaining an unbounded socket body in memory.
-const maxResponseBytes = 8 << 20
-
-// maxErrorMessageBytes matches the 64 KiB error-body cap used for other
-// daemon HTTP errors (internal/mcpserver maxErrorBodyBytes). A non-2xx body
-// is not copied in full into APIError.Message.
-const maxErrorMessageBytes = 64 << 10
 
 // Option configures an HTTP client.
 type Option func(*httpClient)
@@ -114,9 +101,8 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
-// WithBaseURL points the client at an absolute http or https origin. A base
-// path is kept and joined with each request path. Plain http is allowed only
-// for a loopback host. Userinfo is stripped so a key in the URL is not sent.
+// WithBaseURL points the client at an absolute http or https origin. The
+// path is the API root (no /v0 suffix). Intended for tests.
 func WithBaseURL(raw string) Option {
 	return func(c *httpClient) {
 		raw = strings.TrimSpace(raw)
@@ -126,10 +112,6 @@ func WithBaseURL(raw string) Option {
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			c.cfgErr = errors.New("cursor cloud: base URL must be an absolute http(s) URL")
-			return
-		}
-		if u.Scheme == "http" && !loopbackHost(u.Host) {
-			c.cfgErr = errors.New("cursor cloud: plain http is only allowed for loopback hosts")
 			return
 		}
 		u.User = nil
@@ -154,18 +136,6 @@ func defaultHTTPClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
-}
-
-func loopbackHost(hostport string) bool {
-	host := hostport
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		host = h
-	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // NewFromEnv returns a client using CURSOR_API_KEY. The value is trimmed.
@@ -255,7 +225,7 @@ func (c *httpClient) FinalMessage(ctx context.Context, id string) (string, error
 			return msg.Text, nil
 		}
 	}
-	return "", ErrNoAssistantMessage
+	return "", errors.New("cursor cloud final message: no assistant message")
 }
 
 func (c *httpClient) ListAgents(ctx context.Context) ([]Agent, error) {
@@ -378,7 +348,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return c.redactErr(fmt.Errorf("cursor cloud: read response: %w", err))
 	}
@@ -397,17 +367,16 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	return nil
 }
 
-func (c *httpClient) endpoint(rawPath string) (string, error) {
-	path, query, _ := strings.Cut(rawPath, "?")
-	path = strings.TrimPrefix(path, "/")
-	joined, err := url.JoinPath(c.baseURL, path)
+func (c *httpClient) endpoint(path string) (string, error) {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return "", errors.New("cursor cloud: invalid base URL")
+	}
+	ref, err := url.Parse(path)
 	if err != nil {
 		return "", errors.New("cursor cloud: invalid request path")
 	}
-	if query != "" {
-		joined += "?" + query
-	}
-	return joined, nil
+	return base.ResolveReference(ref).String(), nil
 }
 
 func (c *httpClient) authorization() string {
@@ -419,9 +388,6 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	code, message, ok := parseAPIErrorBody(data)
 	if !ok {
 		message = string(data)
-	}
-	if len(message) > maxErrorMessageBytes {
-		message = message[:maxErrorMessageBytes]
 	}
 	return &APIError{
 		Op:         op,
@@ -440,9 +406,6 @@ func parseAPIErrorBody(data []byte) (code, message string, ok bool) {
 	message, _ = top["message"].(string)
 	switch nested := top["error"].(type) {
 	case string:
-		if code == "" {
-			code = nested
-		}
 		if message == "" {
 			message = nested
 		}

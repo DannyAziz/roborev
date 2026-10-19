@@ -1,9 +1,6 @@
 package cursorcloud
 
-import (
-	"context"
-	"errors"
-)
+import "context"
 
 // EnvAPIKey is the only env var this package reads for credentials.
 const EnvAPIKey = "CURSOR_API_KEY"
@@ -26,10 +23,6 @@ const (
 	StatusError    AgentStatus = "ERROR"
 	StatusExpired  AgentStatus = "EXPIRED"
 )
-
-// ErrNoAssistantMessage is returned when the conversation has no
-// assistant_message. Callers must fail the review; there is no empty fallback.
-var ErrNoAssistantMessage = errors.New("cursor cloud final message: no assistant message")
 
 type Agent struct {
 	ID     string
