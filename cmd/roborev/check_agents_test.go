@@ -87,9 +87,9 @@ func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
 			output := captureOutput(t, func() error { runErr = cmd.Execute(); return runErr })
 
 			if tc.wantErr {
-				assert.Error(t, runErr, "an unavailable host must exit nonzero")
+				require.Error(t, runErr, "an unavailable host must exit nonzero")
 			} else {
-				assert.NoError(t, runErr)
+				require.NoError(t, runErr)
 			}
 			if tc.want != "" {
 				assert.Regexp(t, tc.want, output)
