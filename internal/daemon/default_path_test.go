@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -128,6 +130,10 @@ func TestDefaultPathUnchanged(t *testing.T) {
 					add("failover codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, false))
 					add("retry codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, true))
 				}
+				// HTTP enqueue, not db.EnqueueJob: a named backup must stay
+				// empty here. Pinning it on every ordinary enqueue turns these
+				// rows red.
+				add("enqueue: %s", defaultPathEnqueue(t, cfg))
 			})
 		}
 	}
@@ -138,6 +144,32 @@ func TestDefaultPathUnchanged(t *testing.T) {
 		return
 	}
 	assert.Equal(t, defaultPathGolden, got)
+}
+
+// defaultPathEnqueue queues one ordinary review through /api/enqueue and
+// reports the stored agent, model, and backup pin.
+func defaultPathEnqueue(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	server, db, _ := newTestServer(t)
+	*server.configWatcher.Config() = *cfg
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("main.go", "package main\n", "add main")
+	rec := enqueueRaw(t, server, EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Panel: config.PanelNone,
+	})
+	if rec.Code != http.StatusCreated {
+		var body ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error == "" {
+			return fmt.Sprintf("status=%d body=%s", rec.Code, strings.ReplaceAll(strings.TrimSpace(rec.Body.String()), "\n", " | "))
+		}
+		return fmt.Sprintf("status=%d error=%s", rec.Code, strings.ReplaceAll(body.Error, "\n", " | "))
+	}
+	var created storage.ReviewJob
+	testutil.DecodeJSON(t, rec, &created)
+	stored, err := db.GetJobByID(created.ID)
+	require.NoError(t, err)
+	return fmt.Sprintf("agent=%q model=%q backup=%q backup_model=%q backup_auto=%t",
+		stored.Agent, stored.Model, stored.BackupAgent, stored.BackupModel, stored.BackupAuto)
 }
 
 // defaultPathFailover fails a codex job once (non-retryable) or until it
@@ -194,6 +226,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == default config / PATH=codex
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -213,6 +246,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == default config / PATH=claude
 review workflow: preferred="codex" backup=""
 review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -232,6 +266,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == default config / PATH=codex,claude
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -251,6 +286,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == default config / PATH=gemini
 review workflow: preferred="codex" backup=""
 review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -270,6 +306,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == default config / PATH=codex,claude,gemini
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -289,6 +326,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == named agent / PATH=
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -308,6 +346,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent / PATH=codex
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -327,6 +366,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent / PATH=claude
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=
@@ -346,6 +386,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="" backup="" backup_model="" backup_auto=false
 == named agent / PATH=codex,claude
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=
@@ -365,6 +406,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="" backup="" backup_model="" backup_auto=false
 == named agent / PATH=gemini
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -384,6 +426,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent / PATH=codex,claude,gemini
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=
@@ -403,6 +446,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="" backup="" backup_model="" backup_auto=false
 == named agent with model / PATH=
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -422,6 +466,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent with model / PATH=codex
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -441,6 +486,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent with model / PATH=claude
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=sonnet
@@ -460,6 +506,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="sonnet" backup="" backup_model="" backup_auto=false
 == named agent with model / PATH=codex,claude
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=sonnet
@@ -479,6 +526,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="sonnet" backup="" backup_model="" backup_auto=false
 == named agent with model / PATH=gemini
 review workflow: preferred="claude" backup=""
 review strict: error: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -498,6 +546,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "claude-code", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == named agent with model / PATH=codex,claude,gemini
 review workflow: preferred="claude" backup=""
 review strict: claude-code model=sonnet
@@ -517,6 +566,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="sonnet" backup="" backup_model="" backup_auto=false
 == backup agent / PATH=
 review workflow: preferred="codex" backup="claude"
 review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -536,6 +586,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == backup agent / PATH=codex
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -555,6 +606,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == backup agent / PATH=claude
 review workflow: preferred="codex" backup="claude"
 review strict: claude-code model=
@@ -574,6 +626,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="" backup="" backup_model="" backup_auto=false
 == backup agent / PATH=codex,claude
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -593,6 +646,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == backup agent / PATH=gemini
 review workflow: preferred="codex" backup="claude"
 review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -612,6 +666,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == backup agent / PATH=codex,claude,gemini
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -631,6 +686,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == backup agent with model / PATH=
 review workflow: preferred="codex" backup="claude"
 review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -650,6 +706,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == backup agent with model / PATH=codex
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -669,6 +726,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == backup agent with model / PATH=claude
 review workflow: preferred="codex" backup="claude"
 review strict: claude-code model=sonnet
@@ -688,6 +746,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="claude-code" model="sonnet" backup="" backup_model="" backup_auto=false
 == backup agent with model / PATH=codex,claude
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -707,6 +766,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == backup agent with model / PATH=gemini
 review workflow: preferred="codex" backup="claude"
 review strict: error: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -726,6 +786,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: claude-code) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == backup agent with model / PATH=codex,claude,gemini
 review workflow: preferred="codex" backup="claude"
 review strict: codex model=
@@ -745,6 +806,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == review workflow agent / PATH=
 review workflow: preferred="gemini" backup=""
 review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -764,6 +826,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == review workflow agent / PATH=codex
 review workflow: preferred="gemini" backup=""
 review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -783,6 +846,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == review workflow agent / PATH=claude
 review workflow: preferred="gemini" backup=""
 review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -802,6 +866,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == review workflow agent / PATH=codex,claude
 review workflow: preferred="gemini" backup=""
 review strict: error: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -821,6 +886,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "gemini", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == review workflow agent / PATH=gemini
 review workflow: preferred="gemini" backup=""
 review strict: gemini model=pro
@@ -840,6 +906,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="gemini" model="pro" backup="" backup_model="" backup_auto=false
 == review workflow agent / PATH=codex,claude,gemini
 review workflow: preferred="gemini" backup=""
 review strict: gemini model=pro
@@ -859,6 +926,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="gemini" model="pro" backup="" backup_model="" backup_auto=false
 == fix pin / PATH=
 review workflow: preferred="codex" backup=""
 review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -878,6 +946,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == fix pin / PATH=codex
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -897,6 +966,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == fix pin / PATH=claude
 review workflow: preferred="codex" backup=""
 review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -916,6 +986,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == fix pin / PATH=codex,claude
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -935,6 +1006,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == fix pin / PATH=gemini
 review workflow: preferred="codex" backup=""
 review strict: error: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
@@ -954,6 +1026,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=503 error=no review agent available: no configured agent available (preferred: "codex", backups: ) | You may need to run 'roborev daemon restart' from a shell that has access to your agents
 == fix pin / PATH=codex,claude,gemini
 review workflow: preferred="codex" backup=""
 review strict: codex model=
@@ -973,6 +1046,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: agent="codex" model="" backup="" backup_model="" backup_auto=false
 == unknown agent / PATH=
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -992,6 +1066,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 == unknown agent / PATH=codex
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -1011,6 +1086,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 == unknown agent / PATH=claude
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -1030,6 +1106,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 == unknown agent / PATH=codex,claude
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -1049,6 +1126,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 == unknown agent / PATH=gemini
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -1068,6 +1146,7 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 == unknown agent / PATH=codex,claude,gemini
 review workflow: preferred="bogus" backup=""
 review strict: error: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
@@ -1087,4 +1166,5 @@ failover codex stored backup "claude": queued/claude-code/model=/retries=0/error
 retry codex stored backup "claude": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/claude-code/model=/retries=0/error="" -> queued/claude-code/model=/retries=1/error="" -> queued/claude-code/model=/retries=2/error="" -> queued/claude-code/model=/retries=3/error="" -> failed/claude-code/model=/retries=3/error="claude-code broke"
 failover codex stored backup "gemini": queued/gemini/model=/retries=0/error="" -> failed/gemini/model=/retries=0/error="gemini broke"
 retry codex stored backup "gemini": queued/codex/model=/retries=1/error="" -> queued/codex/model=/retries=2/error="" -> queued/codex/model=/retries=3/error="" -> queued/gemini/model=/retries=0/error="" -> queued/gemini/model=/retries=1/error="" -> queued/gemini/model=/retries=2/error="" -> queued/gemini/model=/retries=3/error="" -> failed/gemini/model=/retries=3/error="gemini broke"
+enqueue: status=400 error=invalid agent: unknown agent "bogus" (known: acp, claude-code, codex, copilot, cursor, droid, gemini, grok, kilo, kiro, opencode, pi, test)
 `
