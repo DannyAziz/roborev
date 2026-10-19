@@ -261,6 +261,10 @@ func IsAvailable(name string) bool {
 		// Only a lookup that names host gets here: automatic picks skip it.
 		return HostAllowed(HostNamed)
 	}
+	if name == cursorCloudAgentName {
+		// Key presence never makes cursor-cloud an automatic pick.
+		return false
+	}
 
 	// Check if agent implements CommandAgent interface
 	if ca, ok := a.(CommandAgent); ok {
@@ -281,6 +285,9 @@ func IsAvailable(name string) bool {
 func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	// Resolve alias upfront for consistent comparisons
 	preferred = resolveAlias(withoutAuto(preferred))
+	if cloud, err := explicitCursorCloud(preferred); cloud != nil || err != nil {
+		return cloud, err
+	}
 	if err := requestedHostError(preferred); err != nil {
 		return nil, err
 	}
@@ -313,6 +320,16 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 		if b == "" || b == preferred {
 			continue
 		}
+		if b == cursorCloudAgentName {
+			if !cursorCloudKeySet() {
+				continue
+			}
+			a, err := Get(cursorCloudAgentName)
+			if err != nil {
+				return nil, err
+			}
+			return a, nil
+		}
 		registryMu.RLock()
 		_, ok := registry[b]
 		registryMu.RUnlock()
@@ -334,7 +351,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	// recursive RLock deadlocks once a Register call is waiting.
 	var available []string
 	for _, name := range Available() {
-		if name != "test" && name != hostAgentName && IsAvailable(name) {
+		if name != "test" && name != hostAgentName && name != cursorCloudAgentName && IsAvailable(name) {
 			available = append(available, name)
 		}
 	}

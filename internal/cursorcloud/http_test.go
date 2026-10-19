@@ -129,6 +129,14 @@ func TestHTTPCreateValidationDoesNotDial(t *testing.T) {
 	require.ErrorContains(t, err, "agent id is empty")
 	_, err = client.GetAgent(context.Background(), "../secret")
 	require.ErrorContains(t, err, "agent id is invalid")
+	err = client.StopAgent(context.Background(), " ")
+	require.ErrorContains(t, err, "agent id is empty")
+	err = client.DeleteAgent(context.Background(), " ")
+	require.ErrorContains(t, err, "agent id is empty")
+	err = client.DeleteAgent(context.Background(), "../secret")
+	require.ErrorContains(t, err, "agent id is invalid")
+	err = client.StopAgent(nil, "bc_1") //nolint:staticcheck // SA1012: nil context is the case under test.
+	require.ErrorContains(t, err, "nil context")
 	_, err = client.GetAgent(nil, "bc_1") //nolint:staticcheck // SA1012: nil context is the case under test.
 	require.ErrorContains(t, err, "nil context")
 	assertNoKey(t, err)
@@ -164,6 +172,24 @@ func TestHTTPFinalMessage(t *testing.T) {
 	require.ErrorIs(t, err, cursorcloud.ErrNoAssistantMessage)
 	assert.Empty(t, text)
 	assertNoKey(t, err)
+}
+
+func TestHTTPStopAndDelete(t *testing.T) {
+	client, rec := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/agents/bc_1/stop":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"bc_1"}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v0/agents/bc_1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	require.NoError(t, client.StopAgent(context.Background(), "bc_1"))
+	require.NoError(t, client.DeleteAgent(context.Background(), "bc_1"))
+	assert.Equal(t, []string{http.MethodPost, http.MethodDelete}, methods(rec))
+	assertAuth(t, rec)
 }
 
 func TestHTTPListPaginates(t *testing.T) {

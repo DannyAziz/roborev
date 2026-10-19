@@ -177,6 +177,9 @@ var allAgentSpecs = []agentSpec{
 		Name: hostAgentName,
 	},
 	{
+		Name: cursorCloudAgentName,
+	},
+	{
 		Name: "test",
 	},
 }

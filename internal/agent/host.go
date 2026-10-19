@@ -424,7 +424,8 @@ func isHostName(name string) bool {
 // withSkippedHostNote names the marker when a named host backup was skipped,
 // so the failure says how to enable it.
 func withSkippedHostNote(err error, backups []string) error {
-	if note := SkippedHostBackupNote(backups...); err != nil && note != "" {
+	note := SkippedHostBackupNote(backups...) + skippedCursorCloudBackupNote(backups...)
+	if err != nil && note != "" {
 		return fmt.Errorf("%w%s", err, note)
 	}
 	return err
@@ -462,7 +463,7 @@ func hostLastResortOr(noAgentErr error, backups []string) (Agent, error) {
 
 // ListedAgentNames lists registered agents to offer; host only with ROBOREV_HOST_AGENT=1.
 func ListedAgentNames() []string {
-	names := Available()
+	names := slices.DeleteFunc(Available(), func(name string) bool { return name == cursorCloudAgentName })
 	if HostAllowed(HostListed) {
 		return names
 	}

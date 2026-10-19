@@ -263,6 +263,48 @@ func (c *httpClient) FinalMessage(ctx context.Context, id string) (string, error
 	return "", ErrNoAssistantMessage
 }
 
+func (c *httpClient) UserPrompt(ctx context.Context, id string) (string, error) {
+	path, err := agentPath(id)
+	if err != nil {
+		return "", err
+	}
+	var wire conversationWire
+	if err := c.do(ctx, "conversation", http.MethodGet, path+"/conversation", nil, &wire); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, msg := range wire.Messages {
+		if msg.Type != "user_message" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(msg.Text)
+	}
+	return b.String(), nil
+}
+
+func (c *httpClient) StopAgent(ctx context.Context, id string) error {
+	path, err := agentPath(id)
+	if err != nil {
+		return err
+	}
+	// POST /v0/agents/{id}/stop pauses execution and does not delete the agent.
+	// https://cursor.com/docs/cloud-agent/api/v0#stop-an-agent
+	return c.do(ctx, "stop agent", http.MethodPost, path+"/stop", nil, nil)
+}
+
+func (c *httpClient) DeleteAgent(ctx context.Context, id string) error {
+	path, err := agentPath(id)
+	if err != nil {
+		return err
+	}
+	// DELETE /v0/agents/{id} is permanent. The v0 docs do not say it stops billing.
+	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
+	return c.do(ctx, "delete agent", http.MethodDelete, path, nil, nil)
+}
+
 func (c *httpClient) ListAgents(ctx context.Context) ([]Agent, error) {
 	cursor := ""
 	seen := map[string]struct{}{"": {}}
@@ -316,6 +358,10 @@ type agentWire struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
+	Source struct {
+		Repository string `json:"repository"`
+		Ref        string `json:"ref"`
+	} `json:"source"`
 }
 
 type listWire struct {
@@ -331,7 +377,13 @@ type conversationWire struct {
 }
 
 func toAgent(w agentWire) Agent {
-	return Agent{ID: w.ID, Status: AgentStatus(w.Status), Title: w.Name}
+	return Agent{
+		ID:               w.ID,
+		Status:           AgentStatus(w.Status),
+		Title:            w.Name,
+		SourceRepository: w.Source.Repository,
+		SourceRef:        w.Source.Ref,
+	}
 }
 
 func agentPath(id string) (string, error) {

@@ -249,6 +249,7 @@ type Config struct {
 	ReviewGuidelines           string                          `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
 	FixGuidelines              string                          `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
 	DefaultAgent               string                          `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
+	Host                       string                          `toml:"host" comment:"Review host: local (default), host, or cursor-cloud. Empty inherits ROBOREV_DEFAULT_HOST, then local. CURSOR_API_KEY alone does not select cursor-cloud."`
 	DefaultModel               string                          `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
@@ -777,6 +778,7 @@ func (c *Config) Validate() (err error) {
 type RepoConfig struct {
 	experimentOverlay               map[string]any
 	Agent                           string                          `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
+	Host                            string                          `toml:"host" comment:"Review host for this repo: local, host, or cursor-cloud. Empty inherits the global host, then ROBOREV_DEFAULT_HOST."`
 	Model                           string                          `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
 	BackupAgent                     string                          `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
 	BackupModel                     string                          `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
@@ -2589,32 +2591,77 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	return "local://" + absPath
 }
 
-// stripURLCredentials removes userinfo (username:password) from a URL.
-// For non-URL strings (e.g., SSH URLs like git@github.com:user/repo.git),
-// returns the original string unchanged.
+// StripURLCredentials removes credentials from a URL before it is sent or stored.
+// A URL that cannot be stripped safely becomes redactedURL.
+func StripURLCredentials(rawURL string) string {
+	return stripURLCredentials(rawURL)
+}
+
+// redactedURL is returned when a URL cannot be parsed or still carries a
+// credential. It contains no userinfo from the input.
+const redactedURL = "redacted-url"
+
+// stripURLCredentials removes userinfo and access_token from a URL.
+// SCP git@host:path has no password and stays unchanged so the launch URL
+// still names the repository. user:password@host:path, a bad percent-escape,
+// and any URL that cannot be cleaned fail closed as redactedURL.
 func stripURLCredentials(rawURL string) string {
-	// Try to parse as a standard URL
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		// Not a valid URL, return as-is
-		return rawURL
-	}
-
-	// If there's no scheme, it's likely an SCP-style URL (git@host:repo.git).
-	// Strip any credentials (user:pass@host:repo → host:repo).
-	if parsed.Scheme == "" {
-		if _, after, ok := strings.Cut(rawURL, "@"); ok {
-			return after
+		if strings.Contains(rawURL, "://") || userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
+			return redactedURL
 		}
 		return rawURL
 	}
-
-	// If there's no userinfo, return as-is
-	if parsed.User == nil {
+	if parsed.Scheme == "" {
+		if userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
+			return redactedURL
+		}
 		return rawURL
 	}
-
-	// Clear the userinfo
-	parsed.User = nil
+	if !transportScheme(parsed.Scheme) && strings.Contains(rawURL, "@") {
+		// user:tok@host:o/r parses as scheme "user" and would otherwise be returned raw.
+		return redactedURL
+	}
+	changed := false
+	if parsed.User != nil {
+		parsed.User = nil
+		changed = true
+	}
+	if stripAccessTokenQuery(parsed) {
+		changed = true
+	}
+	if !changed {
+		return rawURL
+	}
 	return parsed.String()
+}
+
+func transportScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https", "ssh", "git", "file":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripAccessTokenQuery(u *url.URL) bool {
+	q := u.Query()
+	if _, ok := q["access_token"]; !ok {
+		return false
+	}
+	q.Del("access_token")
+	u.RawQuery = q.Encode()
+	return true
+}
+
+// userinfoBeforeAt reports a user:password@ prefix. SCP git@host:path has
+// the colon after @ and is not userinfo.
+func userinfoBeforeAt(raw string) bool {
+	at := strings.Index(raw, "@")
+	if at <= 0 {
+		return false
+	}
+	return strings.Contains(raw[:at], ":")
 }

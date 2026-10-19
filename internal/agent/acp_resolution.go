@@ -134,6 +134,16 @@ func resolveAvailableBackupWithConfig(
 		if backup == preferred {
 			continue
 		}
+		if backup == cursorCloudAgentName {
+			if !cursorCloudKeySet() {
+				continue
+			}
+			cloud, err := Get(cursorCloudAgentName)
+			if err != nil {
+				return nil, false, err
+			}
+			return cloud, true, nil
+		}
 		registryMu.RLock()
 		_, inReg := registry[backup]
 		registryMu.RUnlock()
@@ -163,6 +173,9 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
 	if name == hostAgentName {
 		// Only a lookup that names host gets here: automatic picks skip it.
 		return HostAllowed(HostNamed)
+	}
+	if name == cursorCloudAgentName {
+		return false
 	}
 	ca, ok := a.(CommandAgent)
 	if !ok {
@@ -223,6 +236,9 @@ func GetPreferredOrBackupEligible(
 
 	rawPreferred := strings.TrimSpace(preferred)
 	preferred = resolveAlias(rawPreferred)
+	if cloud, err := explicitCursorCloud(preferred); cloud != nil || err != nil {
+		return cloud, err
+	}
 	if err := requestedHostError(preferred); err != nil {
 		return nil, err
 	}
@@ -366,6 +382,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 	}
 
 	canonical := resolveAlias(rawName)
+	if cloud, err := explicitCursorCloud(canonical); cloud != nil || err != nil {
+		return cloud, err
+	}
 	if err := requestedHostError(canonical); err != nil {
 		return nil, err
 	}
@@ -398,6 +417,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred string, cfg *config.Config, backups ...string) (Agent, error) {
 	rawPreferred := strings.TrimSpace(withoutAuto(preferred))
 	preferred = resolveAlias(rawPreferred)
+	if cloud, err := explicitCursorCloud(preferred); cloud != nil || err != nil {
+		return cloud, err
+	}
 	if err := requestedHostError(preferred); err != nil {
 		return nil, err
 	}
@@ -482,7 +504,7 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
 
 	var available []string
 	for _, name := range Available() {
-		if name != "test" && name != hostAgentName && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
+		if name != "test" && name != hostAgentName && name != cursorCloudAgentName && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
 			available = append(available, name)
 		}
 	}

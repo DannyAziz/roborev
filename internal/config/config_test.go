@@ -3478,6 +3478,31 @@ func TestStripURLCredentials(t *testing.T) {
 			input:    "file:///path/to/repo",
 			expected: "file:///path/to/repo",
 		},
+		{
+			name:     "malformed userinfo is redacted",
+			input:    "https://user:fake-credential@ex ample.com/r.git",
+			expected: redactedURL,
+		},
+		{
+			name:     "scp userinfo is redacted",
+			input:    "user:tok@host:o/r",
+			expected: redactedURL,
+		},
+		{
+			name:     "bad percent escape is redacted",
+			input:    "https://user:tok@host/r%zz.git",
+			expected: redactedURL,
+		},
+		{
+			name:     "access_token query is removed",
+			input:    "https://github.com/o/r.git?access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "ssh userinfo is removed",
+			input:    "ssh://user:tok@github.com/o/r.git",
+			expected: "ssh://github.com/o/r.git",
+		},
 	}
 
 	for _, tt := range tests {
