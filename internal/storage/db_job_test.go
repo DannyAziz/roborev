@@ -2446,7 +2446,9 @@ func TestGetJobsToSyncIncludesBackupColumns(t *testing.T) {
 	require.Len(t, jobs, 1)
 	assert.Equal("gemini", jobs[0].BackupAgent)
 	assert.Equal("gemini-2.5-pro", jobs[0].BackupModel)
-	assert.True(jobs[0].BackupAuto)
+	var auto int
+	require.NoError(t, db.QueryRow(`SELECT backup_auto FROM review_jobs WHERE id = ?`, job.ID).Scan(&auto))
+	assert.Equal(1, auto, "the auto pin stays on the local row")
 }
 
 func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
@@ -2468,7 +2470,6 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 		SourceMachineID: testUUID("remote-machine"),
 		BackupAgent:     "copilot",
 		BackupModel:     "gpt-5",
-		BackupAuto:      true,
 	}
 	require.NoError(t, db.UpsertPulledJob(pulled, repo.ID, nil))
 
@@ -2480,10 +2481,10 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 	require.NoError(t, row.Scan(&ba, &bm, &auto))
 	assert.Equal("copilot", ba)
 	assert.Equal("gpt-5", bm)
-	assert.Equal(1, auto)
+	assert.Equal(0, auto, "a pulled job does not import backup_auto")
 }
 
-func TestBackupAutoSyncRoundTrip(t *testing.T) {
+func TestBackupAutoStaysLocalAcrossSync(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 	src := openTestDB(t)
@@ -2504,7 +2505,9 @@ func TestBackupAutoSyncRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, outgoing, 1)
 	assert.Equal("claude-code", outgoing[0].BackupAgent)
-	assert.True(outgoing[0].BackupAuto)
+	var srcAuto int
+	require.NoError(t, src.QueryRow(`SELECT backup_auto FROM review_jobs WHERE id = ?`, job.ID).Scan(&srcAuto))
+	assert.Equal(1, srcAuto, "the enqueueing database keeps the auto pin")
 
 	dst := openTestDB(t)
 	t.Cleanup(func() { dst.Close() })
@@ -2521,7 +2524,6 @@ func TestBackupAutoSyncRoundTrip(t *testing.T) {
 		SourceMachineID: testUUID("remote-machine"),
 		BackupAgent:     outgoing[0].BackupAgent,
 		BackupModel:     outgoing[0].BackupModel,
-		BackupAuto:      outgoing[0].BackupAuto,
 	}, dstRepo.ID, nil))
 
 	var id int64
@@ -2529,7 +2531,7 @@ func TestBackupAutoSyncRoundTrip(t *testing.T) {
 	got, err := dst.GetJobByID(id)
 	require.NoError(t, err)
 	assert.Equal("claude-code", got.BackupAgent)
-	assert.True(got.BackupAuto)
+	assert.False(got.BackupAuto, "the receiving database does not learn the auto pin")
 }
 
 func TestClaimJobHydratesUUID(t *testing.T) {

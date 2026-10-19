@@ -19,13 +19,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PostgreSQL schema version - increment when schema changes
-const pgSchemaVersion = 24
+// pgSchemaVersion is the newest schema this binary will write.
+// It stays at 23: backup_auto is local SQLite state, like budget_routing_locked,
+// and is not a Postgres column. Writing 24 would make older binaries refuse
+// the shared database ("schema version 24 is newer").
+const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
-//go:embed schemas/postgres_v24.sql
+//go:embed schemas/postgres_v23.sql
 var pgSchemaSQL string
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
@@ -468,11 +471,6 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 				return fmt.Errorf("v23 migration (add non_voting): %w", err)
 			}
 		}
-		if currentVersion < 24 {
-			if _, err = p.pool.Exec(ctx, `ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS backup_auto BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
-				return fmt.Errorf("v24 migration (add backup_auto): %w", err)
-			}
-		}
 		// Update version
 		_, err = p.pool.Exec(ctx, `INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, pgSchemaVersion)
 		if err != nil {
@@ -795,8 +793,8 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 			enqueued_at, started_at, finished_at, prompt, diff_content, dirty_files, error, token_usage,
 			worktree_path, source, min_severity,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json,
-			source_machine_id, backup_agent, backup_model, backup_auto, agent_invoked, non_voting, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, clock_timestamp())
+			source_machine_id, backup_agent, backup_model, agent_invoked, non_voting, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, clock_timestamp())
 		ON CONFLICT (uuid) DO UPDATE SET
 			status = EXCLUDED.status,
 			finished_at = EXCLUDED.finished_at,
@@ -819,7 +817,6 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 			min_severity = EXCLUDED.min_severity,
 			backup_agent = EXCLUDED.backup_agent,
 			backup_model = EXCLUDED.backup_model,
-			backup_auto = EXCLUDED.backup_auto,
 			panel_run_uuid = EXCLUDED.panel_run_uuid,
 			panel_role = EXCLUDED.panel_role,
 			panel_name = EXCLUDED.panel_name,
@@ -832,7 +829,7 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 		defaultStr(j.JobType, "review"), j.ReviewType, nullString(j.PatchID), j.Status, j.Agentic, j.EnqueuedAt, j.StartedAt, j.FinishedAt,
 		nullString(j.Prompt), j.DiffContent, nullString(dirtyFilesJSON), nullString(j.Error), nullString(j.TokenUsage), nullString(j.WorktreePath), nullString(j.Source), normalizeMinSeverityForWrite(j.MinSeverity),
 		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
-		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.BackupAuto, j.AgentInvoked, j.NonVoting)
+		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return err
 }
 
@@ -1109,7 +1106,6 @@ type PulledJob struct {
 	MinSeverity           string
 	BackupAgent           string
 	BackupModel           string
-	BackupAuto            bool
 	PanelRunUUID          *uuid.UUID
 	PanelRole             string
 	PanelName             string
@@ -1142,7 +1138,7 @@ func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID uuid.UUID, curso
 			j.git_ref, COALESCE(j.branch, ''), COALESCE(j.session_id, ''), NULLIF(j.resume_source_job_uuid, '')::uuid, j.agent, COALESCE(j.model, ''), COALESCE(j.provider, ''), COALESCE(j.requested_model, ''), COALESCE(j.requested_provider, ''), COALESCE(j.reasoning, ''), COALESCE(j.job_type, 'review'), COALESCE(j.review_type, ''), COALESCE(j.patch_id, ''), j.status, j.agentic, COALESCE(j.agent_invoked, FALSE),
 			j.enqueued_at, j.started_at, j.finished_at,
 			COALESCE(j.prompt, ''), j.diff_content, j.dirty_files, COALESCE(j.error, ''), COALESCE(j.token_usage, ''),
-			COALESCE(j.worktree_path, ''), COALESCE(j.source, ''), COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''), COALESCE(j.backup_auto, FALSE),
+			COALESCE(j.worktree_path, ''), COALESCE(j.source, ''), COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
 			NULLIF(j.panel_run_uuid, '')::uuid, COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), COALESCE(j.panel_member_index, 0), COALESCE(j.panel_member_config_json, ''), COALESCE(j.non_voting, FALSE),
 			j.source_machine_id, j.updated_at, j.id
 		FROM review_jobs j
@@ -1172,7 +1168,7 @@ func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID uuid.UUID, curso
 			&j.GitRef, &j.Branch, &j.SessionID, &j.ResumeSourceJobUUID, &j.Agent, &j.Model, &j.Provider, &j.RequestedModel, &j.RequestedProvider, &j.Reasoning, &j.JobType, &j.ReviewType, &j.PatchID, &j.Status, &j.Agentic, &j.AgentInvoked,
 			&j.EnqueuedAt, &j.StartedAt, &j.FinishedAt,
 			&j.Prompt, &diffContent, &dirtyFiles, &j.Error, &j.TokenUsage,
-			&j.WorktreePath, &j.Source, &j.MinSeverity, &j.BackupAgent, &j.BackupModel, &j.BackupAuto,
+			&j.WorktreePath, &j.Source, &j.MinSeverity, &j.BackupAgent, &j.BackupModel,
 			&j.PanelRunUUID, &j.PanelRole, &j.PanelName, &j.PanelMemberName, &j.PanelMemberIndex, &j.PanelMemberConfigJSON, &j.NonVoting,
 			&j.SourceMachineID, &j.UpdatedAt, &lastID,
 		)
@@ -1609,6 +1605,8 @@ func (p *PgPool) upsertJobsIndividually(ctx context.Context, jobs []JobWithPgIDs
 	return success, firstErr
 }
 
+// queueJobUpsert queues one job upsert. backup_auto is not a column here:
+// the flag stays in SQLite, so the batch path and UpsertJob both omit it.
 func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 	j := jw.Job
 	dirtyFilesJSON, err := encodeDirtyFiles(j.DirtyFiles)
@@ -1621,8 +1619,8 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 				enqueued_at, started_at, finished_at, prompt, diff_content, dirty_files, error, token_usage,
 				worktree_path, source, min_severity,
 				panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json,
-				source_machine_id, backup_agent, backup_model, backup_auto, agent_invoked, non_voting, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, clock_timestamp())
+				source_machine_id, backup_agent, backup_model, agent_invoked, non_voting, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, clock_timestamp())
 			ON CONFLICT (uuid) DO UPDATE SET
 				status = EXCLUDED.status,
 				finished_at = EXCLUDED.finished_at,
@@ -1645,7 +1643,6 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 				min_severity = EXCLUDED.min_severity,
 				backup_agent = EXCLUDED.backup_agent,
 				backup_model = EXCLUDED.backup_model,
-				backup_auto = EXCLUDED.backup_auto,
 				panel_run_uuid = EXCLUDED.panel_run_uuid,
 				panel_role = EXCLUDED.panel_role,
 				panel_name = EXCLUDED.panel_name,
@@ -1658,6 +1655,6 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 		defaultStr(j.JobType, "review"), j.ReviewType, nullString(j.PatchID), j.Status, j.Agentic, j.EnqueuedAt, j.StartedAt, j.FinishedAt,
 		nullString(sanitizePostgresText(j.Prompt)), sanitizePostgresTextPointer(j.DiffContent), nullString(dirtyFilesJSON), nullString(sanitizePostgresText(j.Error)), nullString(j.TokenUsage), nullString(j.WorktreePath), nullString(j.Source), normalizeMinSeverityForWrite(j.MinSeverity),
 		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
-		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.BackupAuto, j.AgentInvoked, j.NonVoting)
+		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return nil
 }

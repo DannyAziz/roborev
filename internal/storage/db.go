@@ -1130,6 +1130,8 @@ func (db *DB) migrate() error {
 		}
 	}
 	// Local like budget_routing_locked: the backup came from an "auto" pin.
+	// It does not sync. Postgres stays on schema v23 so older binaries can
+	// still open a shared database.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'backup_auto'`).Scan(&count)
 	if err == nil && count == 0 {
 		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN backup_auto INTEGER NOT NULL DEFAULT 0`)
