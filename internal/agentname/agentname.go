@@ -25,6 +25,7 @@ var canonicalByName = map[string]string{
 	"grok":        "grok",
 	"grok-build":  "grok",
 	"acp":         "acp",
+	"host":        "host",
 	"test":        "test",
 }
 

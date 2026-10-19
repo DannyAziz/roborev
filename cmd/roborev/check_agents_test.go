@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,4 +47,42 @@ func TestCheckAgentsDiscoversRepoACPAgentFromNestedDirectory(t *testing.T) {
 
 	assert.Regexp(t, `(?m)^  - acp\.goose\s+agent "acp\.goose" command "missing-nested-goose-acp" unavailable:`, output)
 	assert.Contains(t, output, "1 skipped")
+}
+
+func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
+	for _, tc := range []struct {
+		marker, filter string
+		want, notWant  string
+	}{
+		{marker: "1", want: `(?m)^  - host\s+not smoke-tested`},
+		{marker: "1", filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
+		{marker: "0", notWant: `(?m)^  . host\s`},
+	} {
+		t.Run(fmt.Sprintf("marker=%s/filter=%s", tc.marker, tc.filter), func(t *testing.T) {
+			setupConfigEnv(t, "", "")
+			t.Setenv("ROBOREV_HOST_AGENT", tc.marker)
+			hostDir := filepath.Join(t.TempDir(), "host")
+			t.Setenv("ROBOREV_HOST_DIR", hostDir)
+			t.Setenv("ROBOREV_HOST_TIMEOUT", "1h")
+			t.Setenv("PATH", t.TempDir())
+
+			cmd := checkAgentsCmd()
+			args := []string{"--timeout", "1"}
+			if tc.filter != "" {
+				args = append(args, "--agent", tc.filter)
+			}
+			cmd.SetArgs(args)
+			cmd.SilenceUsage, cmd.SilenceErrors = true, true
+			output := captureOutput(t, cmd.Execute)
+
+			if tc.want != "" {
+				assert.Regexp(t, tc.want, output)
+			}
+			if tc.notWant != "" {
+				assert.NotRegexp(t, tc.notWant, output)
+			}
+			assert.NotRegexp(t, `(?m)^  \? host`, output, "host is never smoke-tested")
+			assert.NoDirExists(t, hostDir)
+		})
+	}
 }

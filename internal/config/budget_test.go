@@ -53,6 +53,7 @@ func TestBudgetValidation(t *testing.T) {
 		{"negative price", "[budget.agent_costs]\ncodex = -2"},
 		{"unknown agent", "[budget.agent_costs]\nunknown = 5"},
 		{"test agent", "[budget.agent_costs]\ntest = 1"},
+		{"host agent", "[budget.agent_costs]\nhost = 1"},
 		{"duplicate alias", "[budget.agent_costs]\nclaude = 5\nclaude-code = 12"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

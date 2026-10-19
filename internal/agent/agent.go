@@ -257,6 +257,10 @@ func IsAvailable(name string) bool {
 	if !ok {
 		return false
 	}
+	if name == hostAgentName {
+		// Only a lookup that names host gets here: automatic picks skip it.
+		return HostAllowed(HostNamed)
+	}
 
 	// Check if agent implements CommandAgent interface
 	if ca, ok := a.(CommandAgent); ok {
@@ -277,6 +281,9 @@ func IsAvailable(name string) bool {
 func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	// Resolve alias upfront for consistent comparisons
 	preferred = resolveAlias(preferred)
+	if err := requestedHostError(preferred); err != nil {
+		return nil, err
+	}
 
 	// Reject unknown agent names (typos, config mistakes).
 	// Known-but-unavailable agents still fall back below.
@@ -285,7 +292,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 		_, ok := registry[preferred]
 		registryMu.RUnlock()
 		if !ok {
-			known := Available()
+			known := ListedAgentNames()
 			sort.Strings(known)
 			return nil, &UnknownAgentError{
 				Name:  preferred,
@@ -327,7 +334,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	// recursive RLock deadlocks once a Register call is waiting.
 	var available []string
 	for _, name := range Available() {
-		if name != "test" && IsAvailable(name) {
+		if name != "test" && name != hostAgentName && IsAvailable(name) {
 			available = append(available, name)
 		}
 	}

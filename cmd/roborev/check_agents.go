@@ -62,6 +62,12 @@ Examples:
 				if agentFilter != "" && name != agentFilter {
 					continue
 				}
+				if name == "host" {
+					// A smoke test would block on a handoff nobody answers.
+					fmt.Printf("  - %-14s not smoke-tested: reviews are handed off to the attached host model\n", name)
+					skipped++
+					continue
+				}
 
 				a, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
 				if err != nil {

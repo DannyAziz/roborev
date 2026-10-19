@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -68,4 +69,27 @@ func TestAgentFlagCompletionUsesCommandRepoFlag(t *testing.T) {
 	assert.Contains(t, got, cobra.Completion("acp.foo"))
 	assert.NotContains(t, got, cobra.Completion("acp.goose"))
 	assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+}
+
+func TestAgentFlagCompletionListsHostOnlyWithMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name, globalTOML string
+	}{
+		{name: "config", globalTOML: ""},
+		{name: "fallback", globalTOML: "default_agent = [broken\n"},
+	} {
+		for _, marker := range []string{"0", "1"} {
+			t.Run(tc.name+"/marker="+marker, func(t *testing.T) {
+				env := setupConfigEnv(t, tc.globalTOML, "")
+				t.Chdir(env.RepoDir)
+				t.Setenv("ROBOREV_HOST_AGENT", marker)
+				cmd := reviewCmd()
+				completion, ok := cmd.GetFlagCompletionFunc("agent")
+				require.True(t, ok)
+				got, _ := completion(cmd, nil, "")
+				assert.Contains(t, got, cobra.Completion("codex"))
+				assert.Equal(t, marker == "1", slices.Contains(got, cobra.Completion("host")), "%v", got)
+			})
+		}
+	}
 }

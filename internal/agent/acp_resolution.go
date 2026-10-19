@@ -159,6 +159,10 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
 	if !ok {
 		return false
 	}
+	if name == hostAgentName {
+		// Only a lookup that names host gets here: automatic picks skip it.
+		return HostAllowed(HostNamed)
+	}
 	ca, ok := a.(CommandAgent)
 	if !ok {
 		return true // non-command agents (e.g. test) are always available
@@ -200,6 +204,9 @@ func GetPreferredOrBackupWithConfigFromConfig(
 ) (Agent, error) {
 	rawPreferred := strings.TrimSpace(preferred)
 	preferred = resolveAlias(rawPreferred)
+	if err := requestedHostError(preferred); err != nil {
+		return nil, err
+	}
 
 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
@@ -246,7 +253,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
 
 // AvailableNamesFromConfig returns built-in and effective named ACP agents.
 func AvailableNamesFromConfig(repoCfg *config.RepoConfig, cfg *config.Config) []string {
-	known := Available()
+	known := ListedAgentNames()
 	for name := range config.ResolveACPAgentConfigsFromConfig(repoCfg, cfg) {
 		known = append(known, namedACPAgentName(name))
 	}
@@ -322,6 +329,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 	}
 
 	canonical := resolveAlias(rawName)
+	if err := requestedHostError(canonical); err != nil {
+		return nil, err
+	}
 	a, err := Get(canonical)
 	if err != nil {
 		return nil, &UnknownAgentError{
@@ -351,6 +361,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred string, cfg *config.Config, backups ...string) (Agent, error) {
 	rawPreferred := strings.TrimSpace(preferred)
 	preferred = resolveAlias(rawPreferred)
+	if err := requestedHostError(preferred); err != nil {
+		return nil, err
+	}
 
 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
@@ -432,7 +445,7 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
 
 	var available []string
 	for _, name := range Available() {
-		if name != "test" && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
+		if name != "test" && name != hostAgentName && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
 			available = append(available, name)
 		}
 	}
