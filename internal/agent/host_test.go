@@ -50,7 +50,7 @@ type hostMode struct {
 }
 
 // named reports whether host is accepted when chosen by name in this mode.
-func (m hostMode) named() bool { return m.explicit || m.detected }
+func (m hostMode) named() bool { return m.explicit }
 
 // listed reports whether host is offered in listings in this mode.
 func (m hostMode) listed() bool { return m.explicit }
@@ -61,7 +61,7 @@ var hostModes = []hostMode{
 		setDetectedHostOnly(t)
 		t.Setenv(HostMarkerEnv, "0")
 	}},
-	{name: "Cursor cloud agent shell", set: setDetectedHostOnly},
+	{name: "Cursor cloud agent shell", set: setDetectedHostOnly, detected: true},
 	{name: "explicit marker", set: func(t *testing.T) { setHostMarker(t, true) }, explicit: true},
 }
 
@@ -122,29 +122,54 @@ func TestReadHostMarker(t *testing.T) {
 	setHostMarker(t, false)
 	assert.Equal(t, HostMarker{}, ReadHostMarker())
 
-	setDetectedHostOnly(t)
-	assert.Equal(t, HostMarker{}, ReadHostMarker(), "a Cursor cloud agent shell alone attaches nothing")
+	t.Setenv("CLOUD_AGENT_INJECTED_SECRET_NAMES", "x")
+	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CLOUD_AGENT_* alone is not detection")
 
-	for _, v := range []string{"", "  ", "0", "false", "OFF", "no", "bogus"} {
+	clearCloudAgentEnv(t)
+	t.Setenv("CURSOR_AGENT", "1")
+	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CURSOR_AGENT alone is a local Cursor shell, not a cloud host")
+
+	t.Setenv("CLOUD_AGENT_SOMETHING", "")
+	m := ReadHostMarker()
+	assert.True(t, m.Detected, "CURSOR_AGENT=1 plus any CLOUD_AGENT_* variable")
+	assert.False(t, m.Explicit)
+	assert.Contains(t, m.Why, "CLOUD_AGENT_")
+
+	t.Setenv("CURSOR_AGENT", "TRUE")
+	assert.True(t, ReadHostMarker().Detected, "CURSOR_AGENT is case-insensitive")
+	t.Setenv("CURSOR_AGENT", "0")
+	assert.Equal(t, HostMarker{}, ReadHostMarker())
+	t.Setenv("CURSOR_AGENT", "1")
+
+	for _, v := range []string{"0", "false", "OFF", "no", "bogus"} {
 		t.Setenv(HostMarkerEnv, v)
-		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%q", HostMarkerEnv, v)
+		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%s overrides cloud detection", HostMarkerEnv, v)
 	}
+	t.Setenv(HostMarkerEnv, "  ")
+	assert.True(t, ReadHostMarker().Detected, "an empty marker is unset, so detection still applies")
+
 	for _, v := range []string{"1", "true", "TRUE", " Yes ", "on"} {
 		t.Setenv(HostMarkerEnv, v)
-		m := ReadHostMarker()
+		m = ReadHostMarker()
 		assert.True(t, m.Explicit, "%s=%q", HostMarkerEnv, v)
+		assert.False(t, m.Detected, "the explicit marker wins over detection")
 		assert.Contains(t, m.Why, HostMarkerEnv)
 	}
+	clearCloudAgentEnv(t)
+	t.Setenv(HostMarkerEnv, "")
+	assert.Equal(t, HostMarker{}, ReadHostMarker(), "empty marker without cloud detection is off")
 }
 
-// The ruling lives in HostMarker.Allows: every use of host needs
-// ROBOREV_HOST_AGENT=1.
+// The ruling lives in HostMarker.Allows: host runs, is listed, and is
+// picked automatically only with ROBOREV_HOST_AGENT=1. Detection never
+// substitutes for the marker.
 func TestHostMarkerAllows(t *testing.T) {
 	for _, tc := range []struct {
 		marker              HostMarker
 		named, listed, auto bool
 	}{
 		{marker: HostMarker{}},
+		{marker: HostMarker{Detected: true}},
 		{marker: HostMarker{Explicit: true}, named: true, listed: true, auto: true},
 	} {
 		assert.Equal(t, tc.named, tc.marker.Allows(HostNamed), "%+v named", tc.marker)
@@ -166,33 +191,51 @@ func TestHostAvailabilityIsMarkerGated(t *testing.T) {
 	})
 }
 
-// R1: an explicitly chosen primary host with no marker is a hard error on
-// every resolver, and never falls back to another agent.
+// R1: an explicitly chosen primary host without ROBOREV_HOST_AGENT=1 is a
+// hard error on every resolver, including a Cursor cloud agent shell, and
+// never falls back to another agent.
 func TestExplicitHostWithoutMarkerErrors(t *testing.T) {
-	setHostMarker(t, false)
-	hostDir := filepath.Join(t.TempDir(), "handoff")
-	t.Setenv("ROBOREV_HOST_DIR", hostDir)
-	stubPath(t, "codex", "claude")
-	cfg := &config.Config{}
+	eachHostMode(t, func(t *testing.T, mode hostMode) {
+		if mode.named() {
+			return
+		}
+		hostDir := filepath.Join(t.TempDir(), "handoff")
+		t.Setenv("ROBOREV_HOST_DIR", hostDir)
+		stubPath(t, "codex", "claude")
+		cfg := &config.Config{}
 
-	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "host", cfg)
-	requireHostUnavailable(t, "strict", a, err)
-	a, err = GetPreferredOrBackupWithConfigFromConfig(nil, " host ", cfg, "claude")
-	requireHostUnavailable(t, "strict with backup", a, err)
-	a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg)
-	requireHostUnavailable(t, "non-strict", a, err)
-	a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg, "claude")
-	requireHostUnavailable(t, "non-strict with backup", a, err)
-	a, err = GetAvailableWithConfigFromConfig(nil, "host", nil)
-	requireHostUnavailable(t, "non-strict nil config", a, err)
-	a, err = GetAvailable("host")
+		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "host", cfg)
+		requireHostUnavailable(t, "strict", a, err)
+		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, " host ", cfg, "claude")
+		requireHostUnavailable(t, "strict with backup", a, err)
+		a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg)
+		requireHostUnavailable(t, "non-strict", a, err)
+		a, err = GetAvailableWithConfigFromConfig(nil, "host", cfg, "claude")
+		requireHostUnavailable(t, "non-strict with backup", a, err)
+		a, err = GetAvailableWithConfigFromConfig(nil, "host", nil)
+		requireHostUnavailable(t, "non-strict nil config", a, err)
+		a, err = GetAvailable("host")
+		requireHostUnavailable(t, "GetAvailable", a, err)
+		a, err = GetAvailable("host", "codex")
+		requireHostUnavailable(t, "GetAvailable with backup", a, err)
+		a, err = GetAvailableExactWithConfigFromConfig(nil, "host", cfg)
+		requireHostUnavailable(t, "exact", a, err)
+		assert.False(t, IsAvailable("host"), "IsAvailable")
+		assert.False(t, isAvailableWithConfig("host", cfg), "isAvailableWithConfig")
+		assert.False(t, Diagnose(nil, "host", cfg).Available, "Diagnose")
+
+		assert.NoDirExists(t, hostDir, "resolution never creates a handoff dir")
+	})
+}
+
+// Mutant pin: re-adding m.Detected to Allows(HostNamed) turns this red.
+func TestDetectionNeverSubstitutesForMarker(t *testing.T) {
+	setDetectedHostOnly(t)
+	assert.False(t, HostMarker{Detected: true}.Allows(HostNamed))
+	assert.False(t, HostAllowed(HostNamed))
+	assert.False(t, IsAvailable("host"))
+	a, err := GetAvailable("host")
 	requireHostUnavailable(t, "GetAvailable", a, err)
-	a, err = GetAvailable("host", "codex")
-	requireHostUnavailable(t, "GetAvailable with backup", a, err)
-	a, err = GetAvailableExactWithConfigFromConfig(nil, "host", cfg)
-	requireHostUnavailable(t, "exact", a, err)
-
-	assert.NoDirExists(t, hostDir, "resolution never creates a handoff dir")
 }
 
 // An explicitly named host resolves in every mode that allows naming it.
@@ -687,4 +730,153 @@ func TestHostHandoffDirsAreUniqueAndContained(t *testing.T) {
 	for _, e := range parent {
 		assert.NotEqual(t, "escape", e.Name())
 	}
+}
+
+func captureHostLastResortLog(t *testing.T) *strings.Builder {
+	t.Helper()
+	var buf strings.Builder
+	prev := hostLastResortLog
+	hostLastResortLog = &buf
+	t.Cleanup(func() { hostLastResortLog = prev })
+	return &buf
+}
+
+// R2: a host named only as a backup is skipped while no host model is
+// attached, and the next candidate is used.
+func TestBackupHostWithoutMarkerIsSkipped(t *testing.T) {
+	setHostMarker(t, false)
+	stubPath(t, "claude")
+	cfg := &config.Config{}
+
+	a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "host", "claude")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", a.Name(), "strict")
+	a, err = GetAvailableWithConfigFromConfig(nil, "codex", cfg, "host")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", a.Name(), "non-strict reaches the fallback order")
+	a, err = GetAvailable("codex", "host", "claude")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-code", a.Name(), "GetAvailable")
+}
+
+// R2: with nothing left after skipping a host backup, the error names the
+// marker that would enable it.
+func TestBackupHostWithoutMarkerNothingLeftNamesMarker(t *testing.T) {
+	eachHostMode(t, func(t *testing.T, mode hostMode) {
+		if mode.named() {
+			return
+		}
+		stubPath(t)
+		cfg := &config.Config{ACP: config.ACPAgentConfigs{"remote": {Command: "missing-acp"}}}
+
+		check := func(label, want string, a Agent, err error) {
+			t.Helper()
+			require.Error(t, err, label)
+			assert.Nil(t, a, label)
+			assert.Contains(t, err.Error(), want, label)
+			assert.Contains(t, err.Error(), `backup "host" was skipped`, label)
+			assert.Contains(t, err.Error(), HostMarkerEnv, label)
+			assert.False(t, IsHostUnavailable(err), "%s: host was not the requested agent", label)
+		}
+		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "host")
+		check("strict", "no configured agent available", a, err)
+		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "acp.remote", cfg, "host")
+		check("strict named ACP", "no configured agent available", a, err)
+		a, err = GetAvailableWithConfigFromConfig(nil, "codex", cfg, "host")
+		check("non-strict", "no agents available", a, err)
+		a, err = GetAvailableWithConfigFromConfig(nil, "acp.remote", cfg, "host")
+		check("non-strict named ACP", "no agents available", a, err)
+		a, err = GetAvailable("codex", "host")
+		check("GetAvailable", "no agents available", a, err)
+
+		_, err = GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), HostMarkerEnv, "no host backup, no host note")
+	})
+}
+
+// A host named as a backup is used only with ROBOREV_HOST_AGENT=1.
+func TestBackupHostWithMarkerIsUsed(t *testing.T) {
+	eachHostMode(t, func(t *testing.T, mode hostMode) {
+		if !mode.named() {
+			return
+		}
+		stubPath(t)
+		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", &config.Config{}, "host")
+		require.NoError(t, err)
+		assert.Equal(t, "host", a.Name())
+		a, err = GetAvailableWithConfigFromConfig(nil, "codex", &config.Config{}, "host")
+		require.NoError(t, err)
+		assert.Equal(t, "host", a.Name())
+	})
+}
+
+// R4: host is the non-strict last resort only with ROBOREV_HOST_AGENT=1; a
+// Cursor cloud agent alone never makes it an automatic pick, and a strict
+// named agent keeps its error in every mode. No handoff dir is created.
+func TestHostIsLastResortOnlyWithExplicitMarker(t *testing.T) {
+	eachHostMode(t, func(t *testing.T, mode hostMode) {
+		log := captureHostLastResortLog(t)
+		hostDir := filepath.Join(t.TempDir(), "handoff")
+		t.Setenv("ROBOREV_HOST_DIR", hostDir)
+		stubPath(t)
+		cfg := &config.Config{}
+
+		for label, resolve := range map[string]func() (Agent, error){
+			"non-strict":           func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "codex", cfg) },
+			"non-strict no pref":   func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "", cfg) },
+			"non-strict nil cfg":   func() (Agent, error) { return GetAvailableWithConfigFromConfig(nil, "codex", nil) },
+			"GetAvailable":         func() (Agent, error) { return GetAvailable("codex", "claude") },
+			"GetAvailable no pref": func() (Agent, error) { return GetAvailable("") },
+		} {
+			a, err := resolve()
+			if !mode.explicit {
+				require.Error(t, err, label)
+				assert.Contains(t, err.Error(), "no agents available", label)
+				assert.NotContains(t, err.Error(), "host", "%s: the error is the same as without host", label)
+				continue
+			}
+			require.NoError(t, err, label)
+			assert.Equal(t, "host", a.Name(), label)
+		}
+
+		a, err := GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
+		require.Error(t, err, "strict named agent keeps its error")
+		assert.Nil(t, a)
+		assert.Contains(t, err.Error(), "no configured agent available")
+
+		if mode.explicit {
+			assert.Contains(t, log.String(), `no agents available (install one of:`)
+			assert.Contains(t, log.String(), `falling back to "host": ROBOREV_HOST_AGENT=1`)
+		} else {
+			assert.Empty(t, log.String())
+		}
+		assert.NoDirExists(t, hostDir)
+	})
+}
+
+// Existing selection is identical whether or not a host model is attached.
+func TestHostDoesNotChangeExistingSelection(t *testing.T) {
+	eachHostMode(t, func(t *testing.T, _ hostMode) {
+		log := captureHostLastResortLog(t)
+		cfg := &config.Config{}
+
+		stubPath(t, "claude")
+		a, err := GetAvailableWithConfigFromConfig(nil, "codex", cfg)
+		require.NoError(t, err)
+		assert.Equal(t, "claude-code", a.Name())
+		a, err = GetAvailable("")
+		require.NoError(t, err)
+		assert.Equal(t, "claude-code", a.Name())
+		a, err = GetPreferredOrBackupWithConfigFromConfig(nil, "codex", cfg, "claude")
+		require.NoError(t, err)
+		assert.Equal(t, "claude-code", a.Name())
+
+		stubPath(t, "codex", "claude")
+		a, err = GetAvailableWithConfigFromConfig(nil, "", cfg)
+		require.NoError(t, err)
+		assert.Equal(t, "codex", a.Name())
+
+		assert.Empty(t, log.String(), "host is never taken while a backend exists")
+	})
 }

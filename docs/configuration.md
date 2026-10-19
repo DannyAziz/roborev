@@ -1095,8 +1095,8 @@ filter_branch = false             # Show all branches on startup (default: curre
 
 | Option | Type | Default | Description | Hot-Reload |
 |--------|------|---------|-------------|------------|
-| `default_agent` | string | auto-detect | Default AI agent to use | Yes |
-| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
+| `default_agent` | string | auto-detect | Default AI agent to use. `host` hands reviews to an attached host model and runs only when named here or as a backup with `ROBOREV_HOST_AGENT=1`; detection of a Cursor cloud agent never substitutes for the marker; listings show it only with `ROBOREV_HOST_AGENT=1` | Yes |
+| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `host` is that last resort only under `ROBOREV_HOST_AGENT=1` | Yes |
 | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
@@ -1152,6 +1152,13 @@ filter_branch = false             # Show all branches on startup (default: curre
     If you have it set and `hide_closed_by_default` is not present, the old value is
     used automatically. No action is required, but new configs should use the new
     name.
+
+Host reviews run only with the explicit marker `ROBOREV_HOST_AGENT=1`. Detecting
+a Cursor cloud agent (`CURSOR_AGENT=1` plus a `CLOUD_AGENT_*` variable) never
+substitutes for the marker: a named host, listings, and automatic picks all
+require `ROBOREV_HOST_AGENT=1`. Without the marker, an explicit host is an
+error and never falls back to a local agent. Failover skips `host` and tries
+the next agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
 
 ### Review Search Embeddings
 

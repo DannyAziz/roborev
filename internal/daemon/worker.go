@@ -1148,7 +1148,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 	if agentErr != nil {
 		log.Printf("[%s] Error getting agent: %v", workerID, agentErr)
-		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, fmt.Sprintf("get agent: %v", agentErr))
+		wp.failGetAgentContext(ctx, workerID, job, agentErr)
 		return
 	}
 
@@ -1645,6 +1645,20 @@ func (wp *WorkerPool) failOrRetryAgentContext(
 	})
 }
 
+// failGetAgentContext handles a failure to resolve the job's agent. A missing
+// host model is deterministic for this daemon's environment, so retrying or
+// failing over would only hide the missing marker.
+func (wp *WorkerPool) failGetAgentContext(ctx context.Context, workerID string, job *storage.ReviewJob, err error) {
+	errorMsg := fmt.Sprintf("get agent: %v", err)
+	if !agent.IsHostUnavailable(err) {
+		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, errorMsg)
+		return
+	}
+	wp.runAttemptTransition(workerID, job, func() {
+		wp.failWithoutRetryLocked(workerID, job, job.Agent, errorMsg)
+	})
+}
+
 // failOrRetryAgentExecutionContext preserves the typed category attached by an
 // agent adapter until existing provider-limit classification has run. Unknown
 // pre-protocol failures skip same-agent retries and use the non-retryable
@@ -1799,6 +1813,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 					return
 				}
 			}
+			errorMsg += wp.skippedHostBackupNote(job)
 		}
 
 		// No backup or failover failed -- mark as failed
@@ -1845,7 +1860,12 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 			return
 		}
 	}
+	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job))
+}
 
+func (wp *WorkerPool) failWithoutRetryLocked(
+	workerID string, job *storage.ReviewJob, agentName, errorMsg string,
+) {
 	if updated, err := wp.failJobAndInvalidateBudget(job.ID, workerID, errorMsg); err != nil {
 		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
 	} else if updated {
@@ -1885,6 +1905,9 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 		return ""
 	}
 	if job.BackupAgent != "" {
+		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
+			return ""
+		}
 		if resolved, err := agent.Get(job.BackupAgent); err == nil {
 			return resolved.Name()
 		}
@@ -1925,6 +1948,22 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 		return ""
 	}
 	return resolved.Name()
+}
+
+// skippedHostBackupNote names the marker when the job's stored or workflow
+// backup is host but this daemon has no host model.
+func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
+	backup := job.BackupAgent
+	if backup == "" && job.FrozenExperimentPlan == nil {
+		configRoot := job.RepoPath
+		if job.IsGoalReviewJob() {
+			configRoot = GoalReviewConfigRepoPath(job)
+		}
+		if res, err := agent.ResolveWorkflowConfig("", configRoot, wp.cfgGetter.Config(), failoverWorkflow(job), ""); err == nil {
+			backup = res.BackupAgent
+		}
+	}
+	return agent.SkippedHostBackupNote(backup)
 }
 
 // resolveBackupModel returns the frozen experiment value when present.
@@ -2304,7 +2343,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
 		}
 	}
 
-	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg, prefix, label)
+	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job), prefix, label)
 }
 
 func (wp *WorkerPool) failJobWithPrefixLocked(

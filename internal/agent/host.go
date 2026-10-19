@@ -290,17 +290,33 @@ func stripCodeFence(s string) string {
 }
 
 // HostMarker says how a host model is attached: Explicit is
-// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case).
+// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case); Detected is a Cursor cloud
+// agent shell (CURSOR_AGENT=1 plus a CLOUD_AGENT_* variable) with
+// ROBOREV_HOST_AGENT unset or empty.
 type HostMarker struct {
-	Explicit bool
-	Why      string
+	Explicit, Detected bool
+	Why                string
 }
 
-// ReadHostMarker reads the host marker from the environment.
+// ReadHostMarker reads the host marker from the environment. Any non-empty
+// ROBOREV_HOST_AGENT other than an "on" value turns both kinds off.
 func ReadHostMarker() HostMarker {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v {
-	case "1", "true", "yes", "on":
-		return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
+		}
+		return HostMarker{}
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CURSOR_AGENT"))) {
+	case "1", "true":
+	default:
+		return HostMarker{}
+	}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "CLOUD_AGENT_") {
+			return HostMarker{Detected: true, Why: "Cursor cloud agent detected (CURSOR_AGENT=1 and CLOUD_AGENT_* set)"}
+		}
 	}
 	return HostMarker{}
 }
@@ -314,8 +330,13 @@ const (
 	HostAuto                  // auto, auto-selection or a last resort
 )
 
-// Allows is the one rule for when host may answer: always ROBOREV_HOST_AGENT=1.
+// Allows is the one rule for when host may answer: only
+// ROBOREV_HOST_AGENT=1. Detection of a Cursor cloud agent never
+// substitutes for the marker, including when host is named.
 func (m HostMarker) Allows(use HostUse) bool {
+	if use == HostNamed {
+		return m.Explicit
+	}
 	return m.Explicit
 }
 
@@ -342,6 +363,49 @@ func requestedHostError(name string) error {
 		return nil
 	}
 	return &HostUnavailableError{}
+}
+
+func isHostName(name string) bool {
+	return resolveAlias(strings.TrimSpace(name)) == hostAgentName
+}
+
+// withSkippedHostNote names the marker when a named host backup was skipped,
+// so the failure says how to enable it.
+func withSkippedHostNote(err error, backups []string) error {
+	if note := SkippedHostBackupNote(backups...); err != nil && note != "" {
+		return fmt.Errorf("%w%s", err, note)
+	}
+	return err
+}
+
+// SkippedHostBackupNote is a line naming the marker when one of backups is
+// host and host is not allowed, else "".
+func SkippedHostBackupNote(backups ...string) string {
+	if HostAllowed(HostNamed) || !slices.ContainsFunc(backups, isHostName) {
+		return ""
+	}
+	return fmt.Sprintf("\nbackup %q was skipped: no host model is attached (set %s=1 to use it)", hostAgentName, HostMarkerEnv)
+}
+
+// hostLastResortLog receives one line each time host is taken as a last
+// resort.
+var hostLastResortLog io.Writer = os.Stderr
+
+// hostLastResortOr answers with host once non-strict selection found no agent
+// at all, only if host may be picked automatically (ROBOREV_HOST_AGENT=1).
+// Strict lookups never call it.
+func hostLastResortOr(noAgentErr error, backups []string) (Agent, error) {
+	m := ReadHostMarker()
+	if !m.Allows(HostAuto) {
+		return nil, withSkippedHostNote(noAgentErr, backups)
+	}
+	a, err := Get(hostAgentName)
+	if err != nil {
+		return nil, noAgentErr
+	}
+	fmt.Fprintf(hostLastResortLog, "roborev: %s; falling back to %q: %s\n",
+		strings.SplitN(noAgentErr.Error(), "\n", 2)[0], hostAgentName, m.Why)
+	return a, nil
 }
 
 // ListedAgentNames lists registered agents to offer; host only with ROBOREV_HOST_AGENT=1.

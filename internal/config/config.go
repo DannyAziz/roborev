@@ -536,8 +536,21 @@ func validateAgentReferences(cfg any) error {
 		if err := agentname.ValidateReference(name); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		return nil
+		return validateClassifierReference(path, name)
 	})
+}
+
+func isClassifierKey(path string) bool {
+	return path == "classify_agent" || path == "classify_backup_agent"
+}
+
+// validateClassifierReference rejects host for the classifier, which needs a
+// schema-capable agent that answers without a host handoff.
+func validateClassifierReference(path, name string) error {
+	if isClassifierKey(path) && strings.TrimSpace(name) == "host" {
+		return fmt.Errorf("%s: the host agent cannot classify; name a schema-capable agent such as claude-code", path)
+	}
+	return nil
 }
 
 // walkAgentReferences calls visit for every agent name a config struct sets:

@@ -99,6 +99,9 @@ func doctorAgentNames(env *doctorEnv) []string {
 	for _, ref := range env.experimentAgentReferences() {
 		add(ref.Name)
 	}
+	if agent.HostAllowed(agent.HostListed) {
+		add("host") // the daemon does not list host on detection alone
+	}
 	return names
 }
 
