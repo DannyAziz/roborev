@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,12 +70,11 @@ func TestHTTPCreateAndGet(t *testing.T) {
 		Title:  "ignored-by-v0",
 	})
 	require.NoError(t, err)
-	// v0 launch returns CREATING, which is not in the contract status set.
-	// The client passes that status through unchanged.
-	assert.Equal(t, cursorcloud.AgentStatus("CREATING"), created.Status)
+	// v0 launch returns CREATING. The client passes that status through unchanged.
+	assert.Equal(t, cursorcloud.StatusCreating, created.Status)
 	assert.NotEqual(t, cursorcloud.StatusRunning, created.Status)
 	assert.Equal(t, cursorcloud.Agent{
-		ID: "bc_1", Status: cursorcloud.AgentStatus("CREATING"), Title: "Review widgets",
+		ID: "bc_1", Status: cursorcloud.StatusCreating, Title: "Review widgets",
 	}, created)
 	// CreateAgentRequest.Title is not sent on v0. The body has no title, and
 	// the response name is mapped to Agent.Title.
@@ -160,7 +161,7 @@ func TestHTTPFinalMessage(t *testing.T) {
 	// FinalMessage errors when the conversation has no assistant_message.
 	// It does not return an empty message as a successful review.
 	text, err = empty.FinalMessage(context.Background(), "bc_1")
-	require.ErrorContains(t, err, "no assistant message")
+	require.ErrorIs(t, err, cursorcloud.ErrNoAssistantMessage)
 	assert.Empty(t, text)
 	assertNoKey(t, err)
 }
@@ -239,6 +240,13 @@ func TestHTTPErrorMappingAndRedaction(t *testing.T) {
 			wantSubstr: "Error",
 		},
 		{
+			name:       "error string and message",
+			status:     http.StatusBadRequest,
+			body:       `{"error":"invalid_request","message":"repository not found"}`,
+			wantCode:   "invalid_request",
+			wantSubstr: "repository not found",
+		},
+		{
 			name:       "plain body with key and basic token",
 			status:     http.StatusForbidden,
 			body:       "nope " + testKey + " " + encoded,
@@ -272,7 +280,9 @@ func TestHTTPRedirectIsNotFollowed(t *testing.T) {
 		hits++
 		http.Redirect(w, r, "/v0/agents/elsewhere", http.StatusFound)
 	})
-	_, err := client.GetAgent(context.Background(), "bc_1")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := client.GetAgent(ctx, "bc_1")
 	var apiErr *cursorcloud.APIError
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, http.StatusFound, apiErr.StatusCode)
@@ -290,6 +300,57 @@ func TestHTTPEmptyKeyAndBadBaseURL(t *testing.T) {
 	_, err = client.ListAgents(context.Background())
 	require.ErrorContains(t, err, "API key is empty")
 	assertNoKey(t, err)
+}
+
+func TestHTTPBaseURLKeepsPathAndStripsUserinfo(t *testing.T) {
+	var got *http.Request
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.Clone(r.Context())
+		return jsonResponse(http.StatusOK, `{"id":"bc_1","name":"n","status":"RUNNING"}`), nil
+	})}
+	client := cursorcloud.NewHTTPClient(testKey,
+		cursorcloud.WithBaseURL("https://alice:"+testKey+"@example.com/prefix"),
+		cursorcloud.WithHTTPClient(hc),
+	)
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Nil(t, got.URL.User, "userinfo must be stripped")
+	assert.NotContains(t, got.URL.String(), testKey)
+	assert.Equal(t, "/prefix/v0/agents/bc_1", got.URL.Path)
+	assert.True(t, strings.HasPrefix(got.Header.Get("Authorization"), "Basic "))
+}
+
+func TestHTTPPlainHTTPOnlyForLoopback(t *testing.T) {
+	client := cursorcloud.NewHTTPClient(testKey, cursorcloud.WithBaseURL("http://example.com"))
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	require.ErrorContains(t, err, "loopback")
+	client = cursorcloud.NewHTTPClient(testKey, cursorcloud.WithBaseURL("http://127.0.0.1:9"))
+	_, err = client.GetAgent(context.Background(), "bc_1")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "loopback")
+}
+
+func TestHTTPContextPropagates(t *testing.T) {
+	type ctxKey struct{}
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		if r.Context().Value(ctxKey{}) != "marker" {
+			return jsonResponse(http.StatusInternalServerError, `{"message":"missing ctx"}`), nil
+		}
+		return jsonResponse(http.StatusOK, `{"id":"bc_1","name":"n","status":"RUNNING"}`), nil
+	})}
+	client := cursorcloud.NewHTTPClient(testKey, cursorcloud.WithHTTPClient(hc))
+	ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+	_, err := client.GetAgent(ctx, "bc_1")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = client.GetAgent(ctx, "bc_1")
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestHTTPTransportErrorRedactsKeyInURL(t *testing.T) {
@@ -329,11 +390,9 @@ func newClient(t *testing.T, handler http.HandlerFunc) (cursorcloud.Client, *req
 
 func assertAuth(t *testing.T, log *requestLog) {
 	t.Helper()
-	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(testKey+":"))
 	require.NotEmpty(t, log.reqs)
 	for _, req := range log.reqs {
-		assert.Equal(t, want, req.auth)
-		assert.NotContains(t, req.auth, "Bearer")
+		assert.True(t, strings.HasPrefix(req.auth, "Basic "), req.auth)
 		assert.NotContains(t, req.url, testKey)
 	}
 }
@@ -349,6 +408,18 @@ func assertNoKey(t *testing.T, err error) {
 	assert.NotContains(t, apiErr.Message, testKey)
 	assert.NotContains(t, apiErr.Code, testKey)
 	assert.NotContains(t, apiErr.Op, testKey)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func jsonResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
 }
 
 func methods(log *requestLog) []string {

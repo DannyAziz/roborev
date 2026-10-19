@@ -24,7 +24,7 @@ func TestFakeLifecycleAndCalls(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "bc_fake_1", created.ID)
 	assert.Equal(t, cursorcloud.StatusRunning, created.Status)
-	assert.Equal(t, "widgets review", created.Title)
+	assert.Empty(t, created.Title)
 
 	fake.ScriptStatuses(created.ID, cursorcloud.StatusRunning, cursorcloud.StatusFinished)
 	first, err := fake.GetAgent(ctx, created.ID)
@@ -91,5 +91,36 @@ func TestFakeDefaultFinalAndErrors(t *testing.T) {
 	fake.Error = nil
 	fake.MethodErrors = nil
 	_, err = fake.FinalMessage(ctx, "missing")
-	require.ErrorContains(t, err, "no final message")
+	var apiErr *cursorcloud.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, 404, apiErr.StatusCode)
+
+	fake.Final = ""
+	_, err = fake.FinalMessage(ctx, "bc_seed")
+	require.ErrorIs(t, err, cursorcloud.ErrNoAssistantMessage)
+}
+
+func TestFakeMatchesAPIEdges(t *testing.T) {
+	fake := &Fake{}
+	_, err := fake.CreateAgent(nil, cursorcloud.CreateAgentRequest{Repo: "r", Prompt: "p"}) //nolint:staticcheck // SA1012: nil context is the case under test.
+	require.ErrorContains(t, err, "nil context")
+	_, err = fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{Prompt: "p"})
+	require.ErrorContains(t, err, "repository is empty")
+	_, err = fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{Repo: "r"})
+	require.ErrorContains(t, err, "prompt is empty")
+	_, err = fake.GetAgent(context.Background(), " ")
+	require.ErrorContains(t, err, "agent id is empty")
+	_, err = fake.GetAgent(context.Background(), "../x")
+	require.ErrorContains(t, err, "agent id is invalid")
+
+	created, err := fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{
+		Repo: "https://example.com/acme/repo.git", Prompt: "review", Title: "ignored",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, cursorcloud.StatusCreating, created.Status)
+	assert.Empty(t, created.Title)
+	_, err = fake.GetAgent(context.Background(), "missing")
+	var apiErr *cursorcloud.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, 404, apiErr.StatusCode)
 }

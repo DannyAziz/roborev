@@ -3,7 +3,10 @@ package cursorcloudtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 
 	"go.kenn.io/roborev/internal/cursorcloud"
@@ -26,7 +29,7 @@ type Call struct {
 // Fake implements cursorcloud.Client in memory.
 //
 // CreateStatus is the status stored for agents created after it is set; empty
-// means RUNNING. Final is the assistant text used when an id has no per-id
+// means CREATING, matching a v0 launch. Final is the assistant text used when an id has no per-id
 // message. Error is returned by every method that has no MethodErrors entry.
 // MethodErrors is keyed by the Method* constants. Set fields before calling;
 // the methods themselves are safe for concurrent use.
@@ -80,7 +83,7 @@ func (f *Fake) ScriptStatuses(id string, statuses ...cursorcloud.AgentStatus) {
 	f.init()
 	f.scripts[id] = append([]cursorcloud.AgentStatus(nil), statuses...)
 	if _, ok := f.agents[id]; !ok {
-		f.agents[id] = cursorcloud.Agent{ID: id, Status: cursorcloud.StatusRunning}
+		f.agents[id] = cursorcloud.Agent{ID: id, Status: cursorcloud.StatusCreating}
 		f.order = append(f.order, id)
 	}
 }
@@ -104,6 +107,15 @@ func (f *Fake) Calls() []Call {
 }
 
 func (f *Fake) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	if err := rejectCtx(ctx); err != nil {
+		return cursorcloud.Agent{}, err
+	}
+	if strings.TrimSpace(req.Repo) == "" {
+		return cursorcloud.Agent{}, errors.New("cursor cloud create agent: repository is empty")
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		return cursorcloud.Agent{}, errors.New("cursor cloud create agent: prompt is empty")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -113,15 +125,22 @@ func (f *Fake) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentReque
 	f.seq++
 	status := f.CreateStatus
 	if status == "" {
-		status = cursorcloud.StatusRunning
+		status = cursorcloud.StatusCreating
 	}
-	agent := cursorcloud.Agent{ID: fmt.Sprintf("bc_fake_%d", f.seq), Status: status, Title: req.Title}
+	// Title is not echoed. v0 does not accept it and returns a generated name.
+	agent := cursorcloud.Agent{ID: fmt.Sprintf("bc_fake_%d", f.seq), Status: status}
 	f.agents[agent.ID] = agent
 	f.order = append(f.order, agent.ID)
 	return agent, nil
 }
 
 func (f *Fake) GetAgent(ctx context.Context, id string) (cursorcloud.Agent, error) {
+	if err := rejectCtx(ctx); err != nil {
+		return cursorcloud.Agent{}, err
+	}
+	if err := invalidAgentID(id); err != nil {
+		return cursorcloud.Agent{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -130,7 +149,7 @@ func (f *Fake) GetAgent(ctx context.Context, id string) (cursorcloud.Agent, erro
 	}
 	agent, ok := f.agents[id]
 	if !ok {
-		return cursorcloud.Agent{}, fmt.Errorf("cursor cloud fake: agent %s not found", id)
+		return cursorcloud.Agent{}, notFound("get agent")
 	}
 	if script := f.scripts[id]; len(script) > 0 {
 		agent.Status = script[0]
@@ -141,22 +160,34 @@ func (f *Fake) GetAgent(ctx context.Context, id string) (cursorcloud.Agent, erro
 }
 
 func (f *Fake) FinalMessage(ctx context.Context, id string) (string, error) {
+	if err := rejectCtx(ctx); err != nil {
+		return "", err
+	}
+	if err := invalidAgentID(id); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
 	if err := f.fail(ctx, MethodFinal, id, cursorcloud.CreateAgentRequest{}); err != nil {
 		return "", err
 	}
+	if _, ok := f.agents[id]; !ok {
+		return "", notFound("final message")
+	}
 	if text, ok := f.finals[id]; ok {
 		return text, nil
 	}
-	if _, ok := f.agents[id]; ok && f.Final != "" {
+	if f.Final != "" {
 		return f.Final, nil
 	}
-	return "", fmt.Errorf("cursor cloud fake: no final message for %s", id)
+	return "", cursorcloud.ErrNoAssistantMessage
 }
 
 func (f *Fake) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	if err := rejectCtx(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -182,6 +213,27 @@ func (f *Fake) init() {
 	if f.scripts == nil {
 		f.scripts = map[string][]cursorcloud.AgentStatus{}
 	}
+}
+
+func rejectCtx(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("cursor cloud: nil context")
+	}
+	return nil
+}
+
+func invalidAgentID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("cursor cloud: agent id is empty")
+	}
+	if strings.ContainsAny(id, "/\\?#") || id == "." || id == ".." {
+		return errors.New("cursor cloud: agent id is invalid")
+	}
+	return nil
+}
+
+func notFound(op string) error {
+	return &cursorcloud.APIError{Op: op, StatusCode: http.StatusNotFound, Message: "not found"}
 }
 
 func (f *Fake) fail(ctx context.Context, method, id string, req cursorcloud.CreateAgentRequest) error {

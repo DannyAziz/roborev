@@ -4,6 +4,9 @@
 //
 // v0 authenticates with HTTP Basic: the API key is the username and the
 // password is empty (curl -u KEY:). The key is never written to logs or errors.
+//
+// TODO: migrate to the Cursor cloud agents v1 API when v1 replaces the v0
+// launch, status, and conversation endpoints.
 package cursorcloud
 
 import (
@@ -14,12 +17,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const defaultBaseURL = "https://api.cursor.com"
@@ -28,6 +33,20 @@ const defaultBaseURL = "https://api.cursor.com"
 // (default 20, max 100). ListAgents follows nextCursor so the full set is
 // returned. https://cursor.com/docs/cloud-agent/api/v0#list-agents
 const listPageLimit = 100
+
+// defaultResponseHeaderTimeout is how long one call waits for response
+// headers. The review loop applies its own deadline; this only stops a
+// stalled socket. 60s matches a single metadata-style HTTP call.
+const defaultResponseHeaderTimeout = 60 * time.Second
+
+// maxResponseBytes bounds one response body. 8 MiB covers a long review
+// document without retaining an unbounded socket body in memory.
+const maxResponseBytes = 8 << 20
+
+// maxErrorMessageBytes matches the 64 KiB error-body cap used for other
+// daemon HTTP errors (internal/mcpserver maxErrorBodyBytes). A non-2xx body
+// is not copied in full into APIError.Message.
+const maxErrorMessageBytes = 64 << 10
 
 // Option configures an HTTP client.
 type Option func(*httpClient)
@@ -52,18 +71,15 @@ type httpClient struct {
 	cfgErr  error
 }
 
-func (c *httpClient) String() string { return c.redactedSummary() }
+func (c httpClient) String() string { return c.redactedSummary() }
 
-func (c *httpClient) GoString() string { return c.redactedSummary() }
+func (c httpClient) GoString() string { return c.redactedSummary() }
 
-func (c *httpClient) Format(f fmt.State, _ rune) {
+func (c httpClient) Format(f fmt.State, _ rune) {
 	_, _ = io.WriteString(f, c.redactedSummary())
 }
 
-func (c *httpClient) redactedSummary() string {
-	if c == nil {
-		return "cursorcloud.Client(nil)"
-	}
+func (c httpClient) redactedSummary() string {
 	base := c.baseURL
 	if key := c.apiKey.value(); key != "" {
 		base = strings.ReplaceAll(base, key, "[REDACTED]")
@@ -78,11 +94,7 @@ func NewHTTPClient(apiKey string, opts ...Option) Client {
 	c := &httpClient{
 		apiKey:  secret(strings.TrimSpace(apiKey)),
 		baseURL: defaultBaseURL,
-		hc: &http.Client{
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		hc:      defaultHTTPClient(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -92,8 +104,19 @@ func NewHTTPClient(apiKey string, opts ...Option) Client {
 	return c
 }
 
-// WithBaseURL points the client at an absolute http or https origin. The
-// path is the API root (no /v0 suffix). Intended for tests.
+// WithHTTPClient uses hc for calls. A nil client is ignored. The caller's
+// timeout and transport are left as set.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *httpClient) {
+		if hc != nil {
+			c.hc = hc
+		}
+	}
+}
+
+// WithBaseURL points the client at an absolute http or https origin. A base
+// path is kept and joined with each request path. Plain http is allowed only
+// for a loopback host. Userinfo is stripped so a key in the URL is not sent.
 func WithBaseURL(raw string) Option {
 	return func(c *httpClient) {
 		raw = strings.TrimSpace(raw)
@@ -105,12 +128,44 @@ func WithBaseURL(raw string) Option {
 			c.cfgErr = errors.New("cursor cloud: base URL must be an absolute http(s) URL")
 			return
 		}
+		if u.Scheme == "http" && !loopbackHost(u.Host) {
+			c.cfgErr = errors.New("cursor cloud: plain http is only allowed for loopback hosts")
+			return
+		}
 		u.User = nil
 		u.RawQuery = ""
 		u.Fragment = ""
 		u.Path = strings.TrimRight(u.Path, "/")
 		c.baseURL = strings.TrimRight(u.String(), "/")
 	}
+}
+
+func defaultHTTPClient() *http.Client {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	tr.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	return &http.Client{
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func loopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewFromEnv returns a client using CURSOR_API_KEY. The value is trimmed.
@@ -200,7 +255,7 @@ func (c *httpClient) FinalMessage(ctx context.Context, id string) (string, error
 			return msg.Text, nil
 		}
 	}
-	return "", errors.New("cursor cloud final message: no assistant message")
+	return "", ErrNoAssistantMessage
 }
 
 func (c *httpClient) ListAgents(ctx context.Context) ([]Agent, error) {
@@ -298,13 +353,16 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	if err != nil {
 		return c.redactErr(err)
 	}
-	var body io.Reader
+	var payload []byte
 	if in != nil {
-		buf, err := json.Marshal(in)
+		payload, err = json.Marshal(in)
 		if err != nil {
 			return c.redactErr(fmt.Errorf("cursor cloud: encode request: %w", err))
 		}
-		body = bytes.NewReader(buf)
+	}
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
@@ -312,7 +370,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	}
 	req.Header.Set("Authorization", c.authorization())
 	req.Header.Set("Accept", "application/json")
-	if in != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.hc.Do(req)
@@ -320,7 +378,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return c.redactErr(fmt.Errorf("cursor cloud: read response: %w", err))
 	}
@@ -339,16 +397,17 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	return nil
 }
 
-func (c *httpClient) endpoint(path string) (string, error) {
-	base, err := url.Parse(c.baseURL)
-	if err != nil {
-		return "", errors.New("cursor cloud: invalid base URL")
-	}
-	ref, err := url.Parse(path)
+func (c *httpClient) endpoint(rawPath string) (string, error) {
+	path, query, _ := strings.Cut(rawPath, "?")
+	path = strings.TrimPrefix(path, "/")
+	joined, err := url.JoinPath(c.baseURL, path)
 	if err != nil {
 		return "", errors.New("cursor cloud: invalid request path")
 	}
-	return base.ResolveReference(ref).String(), nil
+	if query != "" {
+		joined += "?" + query
+	}
+	return joined, nil
 }
 
 func (c *httpClient) authorization() string {
@@ -360,6 +419,9 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	code, message, ok := parseAPIErrorBody(data)
 	if !ok {
 		message = string(data)
+	}
+	if len(message) > maxErrorMessageBytes {
+		message = message[:maxErrorMessageBytes]
 	}
 	return &APIError{
 		Op:         op,
@@ -378,6 +440,9 @@ func parseAPIErrorBody(data []byte) (code, message string, ok bool) {
 	message, _ = top["message"].(string)
 	switch nested := top["error"].(type) {
 	case string:
+		if code == "" {
+			code = nested
+		}
 		if message == "" {
 			message = nested
 		}
