@@ -1153,14 +1153,13 @@ filter_branch = false             # Show all branches on startup (default: curre
     used automatically. No action is required, but new configs should use the new
     name.
 
-Host as an automatic pick: `host` is auto-eligible (an `auto` agent or
-backup, a CI or fix pin, the last resort of a failover) only with the
-explicit marker `ROBOREV_HOST_AGENT=1`. Detecting a Cursor cloud agent
-(`CURSOR_AGENT=1` plus a `CLOUD_AGENT_*` variable) never substitutes for
-the marker: named host, listings, and automatic picks all require
-`ROBOREV_HOST_AGENT=1`. Without the marker, an explicit host is an
-error, failover skips `host` and tries the next agent, and when none is
-left the error names `ROBOREV_HOST_AGENT`.
+Host as an automatic pick: `host` is auto-eligible (an `auto` agent or backup, a
+CI or fix pin, the last resort of a failover) only with the explicit marker
+`ROBOREV_HOST_AGENT=1`. Detecting a Cursor cloud agent (`CURSOR_AGENT=1` plus a
+`CLOUD_AGENT_*` variable) never substitutes for the marker: named host,
+listings, and automatic picks all require `ROBOREV_HOST_AGENT=1`. Without the
+marker, an explicit host is an error, failover skips `host` and tries the next
+agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
 
 ### Review Search Embeddings
 

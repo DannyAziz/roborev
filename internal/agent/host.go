@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.kenn.io/kit/atomicfile"
+
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -185,7 +187,7 @@ func writeSyncedTemp(dir, name string, data []byte, final string) error {
 	_, err = f.Write(data)
 	err = errors.Join(err, f.Sync(), f.Close())
 	if err == nil {
-		err = os.Rename(f.Name(), final)
+		err = atomicfile.RenameNoReplace(f.Name(), final)
 	}
 	if err != nil {
 		_ = os.Remove(f.Name())

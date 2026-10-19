@@ -2,7 +2,6 @@ package review
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,5 +55,5 @@ func TestRunAgentReviewHostTimeoutIsNonRetryable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "host handoff timeout")
 	assert.True(t, agent.IsUnavailable(err), "the worker fails over or fails without same-agent retries")
-	assert.False(t, errors.Is(err, context.DeadlineExceeded), "the worker must not label it as the job timeout")
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "the worker must not label it as the job timeout")
 }
