@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +35,8 @@ const listPageLimit = 100
 // headers. The review loop applies its own deadline; this only stops a
 // stalled socket. 60s matches a single metadata-style HTTP call.
 const defaultResponseHeaderTimeout = 60 * time.Second
+
+const maxResponseBytes = 8 << 20 // one response body; 8 MiB covers a long review
 
 // Option configures an HTTP client.
 type Option func(*httpClient)
@@ -102,7 +105,7 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithBaseURL points the client at an absolute http or https origin. The
-// path is the API root (no /v0 suffix). Intended for tests.
+// path is the API root. Plain http is only allowed for a loopback host.
 func WithBaseURL(raw string) Option {
 	return func(c *httpClient) {
 		raw = strings.TrimSpace(raw)
@@ -112,6 +115,10 @@ func WithBaseURL(raw string) Option {
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			c.cfgErr = errors.New("cursor cloud: base URL must be an absolute http(s) URL")
+			return
+		}
+		if u.Scheme == "http" && !loopbackHost(u.Host) {
+			c.cfgErr = errors.New("cursor cloud: plain http is only allowed for loopback hosts")
 			return
 		}
 		u.User = nil
@@ -136,6 +143,18 @@ func defaultHTTPClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+func loopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewFromEnv returns a client using CURSOR_API_KEY. The value is trimmed.
@@ -348,9 +367,9 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readResponse(resp.Body)
 	if err != nil {
-		return c.redactErr(fmt.Errorf("cursor cloud: read response: %w", err))
+		return c.redactErr(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return c.apiError(op, resp.StatusCode, data)
@@ -365,6 +384,17 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(fmt.Errorf("cursor cloud %s: decode response: %w", op, err))
 	}
 	return nil
+}
+
+func readResponse(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("cursor cloud: read response: %w", err)
+	}
+	if int64(len(data)) > maxResponseBytes {
+		return nil, errors.New("cursor cloud: response body exceeds 8 MiB")
+	}
+	return data, nil
 }
 
 func (c *httpClient) endpoint(path string) (string, error) {
