@@ -340,7 +340,7 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	}
 
 	if len(available) == 0 {
-		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
+		return hostLastResortOr(fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", ")), backups)
 	}
 
 	a, _ := Get(available[0])

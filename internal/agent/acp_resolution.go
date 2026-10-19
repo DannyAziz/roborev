@@ -223,7 +223,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		if ok {
 			return backup, nil
 		}
-		return nil, unavailablePreferredBackupError(rawPreferred, backups)
+		return nil, withSkippedHostNote(unavailablePreferredBackupError(rawPreferred, backups), backups)
 	}
 
 	if preferred != "" {
@@ -248,7 +248,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		return backup, nil
 	}
 
-	return nil, unavailablePreferredBackupError(preferred, backups)
+	return nil, withSkippedHostNote(unavailablePreferredBackupError(preferred, backups), backups)
 }
 
 // AvailableNamesFromConfig returns built-in and effective named ACP agents.
@@ -383,7 +383,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 		}
 
 		// Finally fall back to config-aware auto-selection.
-		return getAvailableFallbackWithConfig("", repoCfg, cfg)
+		return getAvailableFallbackWithConfig("", repoCfg, cfg, backups)
 	}
 
 	// Check the preferred agent using config command overrides before
@@ -420,7 +420,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 	}
 
 	if cfg != nil {
-		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg)
+		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg, backups)
 	}
 
 	resolved, err := GetAvailable(preferred, backups...)
@@ -430,7 +430,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 	return applyAgentConfigOverrides(applyCommandOverrides(resolved, cfg), cfg), nil
 }
 
-func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config) (Agent, error) {
+func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config, backups []string) (Agent, error) {
 	for _, name := range fallbackAgentOrder {
 		if name == preferred {
 			continue
@@ -451,7 +451,7 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
 	}
 
 	if len(available) == 0 {
-		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
+		return hostLastResortOr(fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", ")), backups)
 	}
 
 	a, _ := Get(available[0])

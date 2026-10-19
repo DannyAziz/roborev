@@ -52,15 +52,25 @@ func TestCheckAgentsDiscoversRepoACPAgentFromNestedDirectory(t *testing.T) {
 func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
 	for _, tc := range []struct {
 		marker, filter string
+		detected       bool
 		want, notWant  string
+		wantErr        bool
 	}{
 		{marker: "1", want: `(?m)^  - host\s+not smoke-tested`},
 		{marker: "1", filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
+		{detected: true, notWant: `(?m)^  . host\s`},
+		{detected: true, filter: "host", want: `(?m)^  - host\s+not smoke-tested`},
 		{marker: "0", notWant: `(?m)^  . host\s`},
+		{marker: "0", filter: "host", wantErr: true, want: `(?m)^  x host\s+FAIL: agent "host" hands reviews to a host model, but none is attached: set ROBOREV_HOST_AGENT=1`},
 	} {
-		t.Run(fmt.Sprintf("marker=%s/filter=%s", tc.marker, tc.filter), func(t *testing.T) {
+		t.Run(fmt.Sprintf("marker=%s/detected=%v/filter=%s", tc.marker, tc.detected, tc.filter), func(t *testing.T) {
 			setupConfigEnv(t, "", "")
 			t.Setenv("ROBOREV_HOST_AGENT", tc.marker)
+			t.Setenv("CURSOR_AGENT", "")
+			if tc.detected {
+				t.Setenv("CURSOR_AGENT", "1")
+				t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
+			}
 			hostDir := filepath.Join(t.TempDir(), "host")
 			t.Setenv("ROBOREV_HOST_DIR", hostDir)
 			t.Setenv("ROBOREV_HOST_TIMEOUT", "1h")
@@ -73,8 +83,14 @@ func TestCheckAgentsNeverSmokeTestsHost(t *testing.T) {
 			}
 			cmd.SetArgs(args)
 			cmd.SilenceUsage, cmd.SilenceErrors = true, true
-			output := captureOutput(t, cmd.Execute)
+			var runErr error
+			output := captureOutput(t, func() error { runErr = cmd.Execute(); return runErr })
 
+			if tc.wantErr {
+				assert.Error(t, runErr, "an unavailable host must exit nonzero")
+			} else {
+				assert.NoError(t, runErr)
+			}
 			if tc.want != "" {
 				assert.Regexp(t, tc.want, output)
 			}

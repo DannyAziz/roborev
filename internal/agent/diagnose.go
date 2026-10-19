@@ -51,6 +51,8 @@ func Diagnose(repoCfg *config.RepoConfig, name string, cfg *config.Config) Diagn
 	if ca, ok := a.(CommandAgent); ok {
 		d.Command = ca.CommandName()
 		d.Path, _ = resolveExecutable(d.Command)
+	} else if h, ok := a.(*HostAgent); ok {
+		d.Command = "file handoff in " + h.baseDir()
 	}
 	return d
 }

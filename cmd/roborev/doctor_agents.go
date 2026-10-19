@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"go.kenn.io/roborev/internal/agent"
@@ -80,6 +81,13 @@ func checkDoctorAgents(env *doctorEnv) []doctorCheck {
 			installed = append(installed, d)
 		}
 	}
+	if len(installed) == 0 && slices.Contains(doctorAgentNames(env), "host") {
+		// Listings show host only with ROBOREV_HOST_AGENT=1, but a host named
+		// in config also runs inside a Cursor cloud agent.
+		if v := env.viewAgent("host"); v.diag.Available {
+			installed = append(installed, v.diag)
+		}
+	}
 	if len(installed) == 0 {
 		out = append(out, doctorCheck{
 			ID: "agents.installed", Category: "agents", Status: doctorFail,
@@ -116,11 +124,22 @@ func checkDoctorPathMismatch(env *doctorEnv, local []agent.Diagnosis) []doctorCh
 		daemonHas[doctorAgentKey(d.Name)] = d
 	}
 	var missing []string
+	pathMissing := false
 	for _, d := range local {
 		if !d.Available {
 			continue
 		}
-		if dd, ok := daemonHas[doctorAgentKey(d.Name)]; ok && !dd.Available {
+		dd, ok := daemonHas[doctorAgentKey(d.Name)]
+		if doctorIsHost(d.Name) {
+			// The daemon lists host only with the explicit marker, so ask
+			// whether it would run host when named.
+			if !env.viewAgent(d.Name).diag.Available {
+				missing = append(missing, fmt.Sprintf("%s: %s=1 is set in this shell, but the daemon's environment has neither it nor a Cursor cloud agent, so a named host fails there", d.Name, agent.HostMarkerEnv))
+			}
+			continue
+		}
+		if ok && !dd.Available {
+			pathMissing = true
 			missing = append(missing, fmt.Sprintf("%s: found at %s in this shell, but not on the daemon's PATH", d.Name, d.Path))
 		}
 	}
@@ -130,12 +149,17 @@ func checkDoctorPathMismatch(env *doctorEnv, local []agent.Diagnosis) []doctorCh
 			Summary: "the daemon can run every agent this shell can",
 		}}
 	}
-	details := append(missing, "daemon PATH: "+env.daemonAgents.PathEnv)
+	details, fix, what := missing, fmt.Sprintf("run 'roborev daemon restart' from this shell so the daemon inherits %s", agent.HostMarkerEnv), "available"
+	if pathMissing {
+		what = "installed"
+		details = append(details, "daemon PATH: "+env.daemonAgents.PathEnv)
+		fix = "run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path"
+	}
 	return []doctorCheck{{
 		ID: "agents.daemon_path", Category: "agents", Status: doctorWarn,
-		Summary: fmt.Sprintf("%s installed here cannot be run by the daemon", plural(len(missing), "agent")),
+		Summary: fmt.Sprintf("%s %s here cannot be run by the daemon", plural(len(missing), "agent"), what),
 		Details: details,
-		Fix:     "run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path",
+		Fix:     fix,
 	}}
 }
 
@@ -255,6 +279,9 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
 	if primary.diag.Available {
 		c.Status = doctorOK
 		c.Summary = fmt.Sprintf("%s use %s (%s)", subject, primary.diag.Name, primary.diag.Path)
+		if doctorIsHost(primary.diag.Name) {
+			c.Summary = fmt.Sprintf("%s use %s (%s)", subject, primary.diag.Name, primary.diag.Command)
+		}
 		return c, reported
 	}
 	reported[doctorAgentKey(res.PreferredAgent)] = true
@@ -269,6 +296,18 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
 			c.Details = append(c.Details, fmt.Sprintf("backup %s is never tried, because the preferred name is rejected first", res.BackupAgent))
 		}
 		c.Fix = fmt.Sprintf("fix the agent name, or add an [acp.<name>] table if %s is meant to be a named ACP agent", res.PreferredAgent)
+		return c, reported
+	}
+	if doctorIsHost(res.PreferredAgent) {
+		// An explicit host without a host model is an error, never a
+		// reason to run the backup.
+		c.Status = doctorFail
+		c.Summary = fmt.Sprintf("%s will fail: agent host needs %s=1 or a Cursor cloud agent in %s", subject, agent.HostMarkerEnv, primary.where())
+		c.Details = details
+		if res.BackupAgent != "" {
+			c.Details = append(c.Details, fmt.Sprintf("backup %s is never tried, because an explicit host without a host model is an error", res.BackupAgent))
+		}
+		c.Fix = doctorAgentFix(env, res.PreferredAgent)
 		return c, reported
 	}
 	if res.BackupAgent != "" {
@@ -290,7 +329,39 @@ func checkDoctorReviewAgent(env *doctorEnv, subject string) (doctorCheck, map[st
 	return c, reported
 }
 
+func doctorIsHost(name string) bool {
+	return doctorAgentKey(name) == "host"
+}
+
+// doctorHostKeys names the config settings that select host.
+func (env *doctorEnv) doctorHostKeys() string {
+	var keys []string
+	for _, ref := range config.AgentReferences(env.global) {
+		if doctorIsHost(ref.Name) {
+			keys = append(keys, ref.Key)
+		}
+	}
+	if env.repoCfg != nil {
+		for _, ref := range config.AgentReferences(env.repoCfg) {
+			if doctorIsHost(ref.Name) {
+				keys = append(keys, ".roborev.toml "+ref.Key)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		return "the agent setting"
+	}
+	return strings.Join(keys, " and ")
+}
+
 func doctorAgentFix(env *doctorEnv, name string) string {
+	if doctorIsHost(name) {
+		change := fmt.Sprintf("or change %s to an installed CLI agent", env.doctorHostKeys())
+		if env.daemonAgents != nil && agent.Diagnose(env.repoCfg, name, env.global).Available {
+			return "a host model is attached in this shell; run 'roborev daemon restart' from this shell so the daemon inherits its environment, " + change
+		}
+		return fmt.Sprintf("set %s=1 in the environment the daemon runs in and run 'roborev daemon restart' from it, %s", agent.HostMarkerEnv, change)
+	}
 	local := agent.Diagnose(env.repoCfg, name, env.global)
 	if local.Available && env.daemonAgents != nil {
 		return fmt.Sprintf("%s is installed in this shell (%s); run 'roborev daemon restart' from this shell so the daemon inherits its PATH", name, local.Path)
@@ -358,6 +429,9 @@ func checkDoctorConfiguredAgents(env *doctorEnv, skip map[string]bool) []doctorC
 		}}
 	}
 	fix := "install the agent, fix the name, or remove the setting; jobs routed to it fail"
+	if _, ok := keysByName["host"]; ok && !skip["host"] && !env.viewAgent("host").diag.Available {
+		fix += fmt.Sprintf("; host needs %s=1 where reviews run, or a Cursor cloud agent if host is named (a host backup is skipped until then)", agent.HostMarkerEnv)
+	}
 	if restartHelps {
 		fix = "some of these are installed in this shell; run 'roborev daemon restart' from it. Otherwise " + fix
 	}

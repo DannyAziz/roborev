@@ -74,3 +74,30 @@ func TestBudgetPriceListingAndRemoval(t *testing.T) {
 	require.NoError(t, SetConfigValue(cfg, "budget.agent_costs.acp.reviewer", ""))
 	assert.Empty(t, cfg.Budget.AgentCosts)
 }
+
+func TestLoadConfigRejectsHostClassifier(t *testing.T) {
+	for _, key := range []string{"classify_agent", "classify_backup_agent"} {
+		for _, scope := range []string{"global", "repository"} {
+			t.Run(scope+"/"+key, func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "config.toml")
+				if scope == "repository" {
+					path = filepath.Join(dir, ".roborev.toml")
+				}
+				require.NoError(t, os.WriteFile(path, []byte(key+" = \"host\"\n"), 0o600))
+				var err error
+				if scope == "global" {
+					_, err = LoadGlobalFrom(path)
+				} else {
+					_, err = LoadRepoConfig(dir)
+				}
+				require.ErrorContains(t, err, key+": the host agent cannot classify")
+			})
+		}
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte("default_agent = \"host\"\nfix_agent = \"host\"\n"), 0o600))
+	_, err := LoadGlobalFrom(path)
+	require.NoError(t, err, "host stays valid outside the classifier")
+}

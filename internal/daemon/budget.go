@@ -68,10 +68,10 @@ func (r *BudgetRouter) ResolveAgent(configuredAgent string, repoCfg *config.Repo
 	preferred := func() (agent.Agent, error) {
 		return agent.GetAvailableExactWithConfigFromConfig(repoCfg, configuredAgent, cfg)
 	}
-	if cfg == nil || !cfg.Budget.Enabled {
+	canonical := agent.CanonicalName(configuredAgent)
+	if cfg == nil || !cfg.Budget.Enabled || canonical == "host" {
 		return preferred()
 	}
-	canonical := agent.CanonicalName(configuredAgent)
 	names := slices.Sorted(maps.Keys(cfg.Budget.AgentCosts))
 	if !hasBudgetPrice(configuredAgent, cfg.Budget.AgentCosts) {
 		// Without a price for the configured choice, substitution cannot
@@ -94,7 +94,8 @@ func (r *BudgetRouter) ResolveAgent(configuredAgent string, repoCfg *config.Repo
 	var bestScore float64
 	var bestCost int
 	for _, name := range names {
-		if agent.CanonicalName(name) == "test" {
+		// Host is never a budget substitute.
+		if c := agent.CanonicalName(name); c == "test" || c == "host" {
 			continue
 		}
 		candidate, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)

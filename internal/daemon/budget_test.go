@@ -227,3 +227,39 @@ func TestBudgetRoutingDoesNotSelectTestAgent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "codex", got.Name())
 }
+
+// Host is never a budget substitute, with or without a host model attached,
+// even when a policy that bypassed validation prices it as the cheapest.
+func TestBudgetRoutingNeverSelectsHost(t *testing.T) {
+	for _, marker := range []string{"0", "1"} {
+		t.Run("ROBOREV_HOST_AGENT="+marker, func(t *testing.T) {
+			t.Setenv(agent.HostMarkerEnv, marker)
+			cfg := config.DefaultConfig()
+			cfg.CodexCmd = "go"
+			cfg.GeminiCmd = "go"
+			cfg.Budget = config.BudgetConfig{
+				Enabled:           true,
+				DailyLimitCents:   500,
+				ReserveFloorCents: 100,
+				AgentCosts:        config.BudgetAgentCosts{"codex": 15, "gemini": 10, "host": 1},
+			}
+			for usd, want := range map[float64]string{4: "codex", 5: "gemini"} {
+				router := NewBudgetRouter(&budgetSpendStub{spend: storage.CostAggregate{TotalUSD: usd, JobsWithCost: 1, JobsTotal: 1}}, nil)
+				got, err := router.ResolveAgent("codex", nil, cfg, config.ReviewTypeDefault, nil)
+				require.NoError(t, err)
+				assert.Equal(t, want, got.Name(), "spend $%v", usd)
+			}
+
+			router := NewBudgetRouter(&budgetSpendStub{spend: storage.CostAggregate{TotalUSD: 5, JobsWithCost: 1, JobsTotal: 1}}, nil)
+			got, err := router.ResolveAgent("host", nil, cfg, config.ReviewTypeDefault, nil)
+			if marker == "0" {
+				require.Error(t, err, "a configured host without a marker is an error, not a substitution")
+				assert.True(t, agent.IsHostUnavailable(err))
+				assert.Contains(t, err.Error(), agent.HostMarkerEnv)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "host", got.Name(), "an explicit host is never swapped for a priced agent")
+		})
+	}
+}
