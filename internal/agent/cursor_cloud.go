@@ -488,14 +488,13 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		ctx = context.Background()
 	}
 	// started gates the next list only. A list already running keeps its
-	// own timeout. Conversation reads share one pass deadline.
+	// own timeout. Each pass's conversation reads share one deadline that
+	// starts before that pass's list, so a slow list consumes it.
 	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
 	foundLaunch := false
 	backoff := cursorCloudReconcileBackoff
-	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
-	defer passCancel()
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
@@ -503,15 +502,25 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
 			break
 		}
+		// Start the 60s before ListAgents. One clock for the whole
+		// reconcile would already be spent by earlier passes, and starting
+		// it after the list returns would hide the list's duration.
+		passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 		listCtx, listCancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 		agents, err := client.ListAgents(listCtx)
 		listCancel()
+		var found bool
+		var matchErr error
+		if err == nil {
+			found, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output)
+		}
+		passCancel()
 		if err != nil {
 			errs = appendReconcileErr(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
 			if cursorCloudRateLimited(err) {
 				break
 			}
-		} else if found, matchErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output); found || matchErr != nil {
+		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
 			}

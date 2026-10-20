@@ -1435,6 +1435,32 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	})
 }
 
+func TestReconcilePassBudgetStartsBeforeList(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		prevPass := cursorCloudReconcilePassTimeout
+		prevWindow := cursorCloudReconcileWindow
+		cursorCloudReconcilePassTimeout = time.Second
+		cursorCloudReconcileWindow = time.Minute
+		defer func() {
+			cursorCloudReconcilePassTimeout = prevPass
+			cursorCloudReconcileWindow = prevWindow
+		}()
+		const repo = "https://github.com/acme/widgets.git"
+		const token = "budget-token"
+		client := &budgetListCloud{
+			listDelay: 200 * time.Millisecond,
+			appearAt:  2,
+			text:      "review\n" + cursorCloudLaunchMarker + token + "\n",
+		}
+		err := reconcileCursorCloudLaunch(context.Background(), client, repo, token, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"stop", "delete"}, client.ops)
+		// 200ms of the 1s budget is the list itself. Earlier empty passes
+		// must not shrink it, and it must not restart after the list.
+		assert.Equal(t, 800*time.Millisecond, client.remain)
+	})
+}
+
 func TestReconcileConversationRateLimitStops(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		prev := cursorCloudReconcileWindow
@@ -1542,6 +1568,56 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type budgetListCloud struct {
+	listDelay time.Duration
+	appearAt  int
+	lists     int
+	text      string
+	remain    time.Duration
+	ops       []string
+}
+
+func (c *budgetListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, errors.New("unused")
+}
+
+func (c *budgetListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *budgetListCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *budgetListCloud) UserPrompt(ctx context.Context, _ string) (string, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.remain = time.Until(dl)
+	}
+	return c.text, nil
+}
+func (c *budgetListCloud) StopAgent(context.Context, string) error {
+	c.ops = append(c.ops, "stop")
+	return nil
+}
+func (c *budgetListCloud) DeleteAgent(context.Context, string) error {
+	c.ops = append(c.ops, "delete")
+	return nil
+}
+func (c *budgetListCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	timer := time.NewTimer(c.listDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+	n := c.lists
+	c.lists++
+	if n < c.appearAt {
+		return nil, nil
+	}
+	return []cursorcloud.Agent{{
+		ID:               "bc_budget",
+		SourceRepository: "https://github.com/acme/widgets.git",
+	}}, nil
 }
 
 type conversationLimitCloud struct {
