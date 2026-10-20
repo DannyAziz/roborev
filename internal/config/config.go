@@ -2670,9 +2670,12 @@ func stripURLCredentials(rawURL string) string {
 // url.Parse rejects SCP user@host:path, and that whole string is the stored
 // identity, including a non-git user such as deploy@ or org@vs-ssh. A
 // user:password SCP user is the exception: the password is dropped and
-// host:path is kept so two remotes stay distinct. Transport URLs lose
-// userinfo only. Query and fragment are kept, matching main. Case, a
-// trailing .git, and an '@' in the path are left as stored.
+// host:path is kept so two remotes stay distinct. A ?query or #fragment
+// on that password form is dropped with the password. That is not main's
+// query and fragment. user@host/path, a slash path with no colon, drops a
+// non-git user and keeps host/path. Transport URLs lose userinfo only.
+// Their query and fragment are kept, matching main. Case, a trailing .git,
+// and an '@' in the path are left as stored.
 func stripRepoIdentityURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -2691,9 +2694,11 @@ func stripRepoIdentityURL(rawURL string) string {
 	return parsed.String()
 }
 
-// scpIdentity returns an SCP identity. A user without ':' is kept, matching
-// main's parse-error path for deploy@, gitolite@, and gitea@. user:password
-// is removed so the secret is not stored and host:path stays distinct.
+// scpIdentity returns an SCP identity. A user without ':' on a colon path
+// is kept, matching main's parse-error path for deploy@, gitolite@, and
+// gitea@. user:password is removed, and any ?query or #fragment on that
+// form is removed with it, leaving host:path. This does not restore
+// main's query and fragment. user@host/path drops a non-git user.
 func scpIdentity(raw string) (string, bool) {
 	if strings.Contains(raw, "://") {
 		return "", false
@@ -2709,6 +2714,11 @@ func scpIdentity(raw string) (string, bool) {
 		return "", false
 	}
 	if strings.Contains(user, ":") {
+		return rest, true
+	}
+	// Slash path, no colon: bd7a0846 stored host/path without the user.
+	// user@host:path has a colon in the path and falls through to raw.
+	if user != "git" && strings.Contains(rest, "/") && !strings.Contains(rest, ":") {
 		return rest, true
 	}
 	return raw, true

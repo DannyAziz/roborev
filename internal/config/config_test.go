@@ -1973,6 +1973,30 @@ func TestResolveRepoIdentityRejectsMalformedCredentials(t *testing.T) {
 	}
 }
 
+func TestResolveRepoIdentitySlashSCPDropsUser(t *testing.T) {
+	dir := t.TempDir()
+	assert := assert.New(t)
+	got := ResolveRepoIdentity(dir, func(string, string) string { return "user@host/org/repo.git" })
+	assert.Equal("host/org/repo.git", got)
+	gitGot := ResolveRepoIdentity(dir, func(string, string) string { return "git@host/org/repo.git" })
+	assert.Equal("git@host/org/repo.git", gitGot)
+	deploy := ResolveRepoIdentity(dir, func(string, string) string {
+		return "deploy@git.example.internal:org/repo.git"
+	})
+	assert.Equal("deploy@git.example.internal:org/repo.git", deploy)
+}
+
+func TestResolveRepoIdentitySCPPasswordDropsQuery(t *testing.T) {
+	dir := t.TempDir()
+	got := ResolveRepoIdentity(dir, func(string, string) string {
+		return "user:password@host:org/repo.git?x=1#f"
+	})
+	assert.Equal(t, "host:org/repo.git", got)
+	assert.NotContains(t, got, "password")
+	assert.NotContains(t, got, "x=1")
+	assert.NotContains(t, got, "#f")
+}
+
 func TestResolveRepoIdentityKeepsQueryAndFragment(t *testing.T) {
 	dir := t.TempDir()
 	assert := assert.New(t)
