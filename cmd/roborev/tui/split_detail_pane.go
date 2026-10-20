@@ -213,11 +213,62 @@ func (m model) reviewPaneScrollInfo(innerW, innerH int) (start, end, total int) 
 	return start, end, total
 }
 
+// launchOrphanWarningLines is the detail-pane warning for an uncleaned launch
+// note. An empty note returns no lines. The trailing blank line separates the
+// warning from the status card or review body.
+func launchOrphanWarningLines(job storage.ReviewJob, innerW int) []string {
+	line := storage.FormatLaunchOrphanWarning(&job)
+	if line == "" {
+		return nil
+	}
+	var lines []string
+	for _, l := range wrapText(sanitizeForDisplay(line), max(innerW-2, 20)) {
+		lines = append(lines, xansi.Truncate(errorStyle.Render(l), innerW, ""))
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return append(lines, "")
+}
+
 // renderDetailPane picks the detail pane content for the highlighted job:
 // done -> review (or loading placeholder until the follow fetch lands),
 // failed -> error text, running -> status card (+ live log),
-// queued/canceled -> status card.
+// queued/canceled -> status card. An uncleaned launch note is prepended for
+// every one of those statuses.
 func (m model) renderDetailPane(innerW, innerH int) []string {
+	fullH := innerH
+	var warn []string
+	if job, ok := m.selectedJob(); ok {
+		warn = launchOrphanWarningLines(*job, innerW)
+	}
+	if len(warn) > 0 {
+		maxWarn := fullH
+		if fullH > 1 {
+			maxWarn = fullH - 1
+		}
+		if len(warn) > maxWarn {
+			warn = warn[:maxWarn]
+		}
+		innerH = fullH - len(warn)
+	}
+	lines := m.renderDetailPaneBody(innerW, innerH)
+	if len(warn) == 0 {
+		return lines
+	}
+	out := make([]string, 0, fullH)
+	out = append(out, warn...)
+	out = append(out, lines...)
+	if len(out) > fullH {
+		out = out[:fullH]
+	}
+	for len(out) < fullH {
+		out = append(out, "")
+	}
+	return out
+}
+
+func (m model) renderDetailPaneBody(innerW, innerH int) []string {
 	pad := func(lines []string) []string {
 		for len(lines) < innerH {
 			lines = append(lines, "")

@@ -91,6 +91,7 @@ func (m model) renderReviewView() string {
 	var title string
 	var titleLen int
 	var locationLineLen int
+	var warnLines []string
 	if review.Job != nil {
 		ref := shortJobRef(*review.Job)
 		idStr := fmt.Sprintf("#%d ", review.Job.ID)
@@ -167,6 +168,12 @@ func (m model) renderReviewView() string {
 		b.WriteString(metadataLine)
 		b.WriteString("\x1b[K") // Clear to end of line
 		b.WriteString("\n")
+		// An uncleaned launch note stays above the review body.
+		warnLines = launchOrphanWarningLines(*review.Job, max(20, m.width))
+		for _, line := range warnLines {
+			b.WriteString(line)
+			b.WriteString("\x1b[K\n")
+		}
 	} else {
 		title = "Review"
 		titleLen = len(title)
@@ -212,7 +219,7 @@ func (m model) renderReviewView() string {
 	}
 
 	// Reserve title, location, review metadata, footer status, and help.
-	headerHeight := titleLines + locationLines + 1 + helpLines
+	headerHeight := titleLines + locationLines + 1 + helpLines + len(warnLines)
 	if review.Job != nil {
 		headerHeight++ // Review type/verdict/closed/tokens line
 	}

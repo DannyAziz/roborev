@@ -199,7 +199,8 @@ exist, matching the layout in the TUI review detail view.
 
 When a cursor-cloud job still has an uncleaned launch note, `roborev show`,
 `roborev wait`, and `roborev review --wait` print that note as a warning.
-`--quiet` still prints the warning line.
+`--quiet` still prints the warning line. The TUI review view and detail pane
+show the same warning for a done, failed, canceled, queued, or running job.
 
 When the daemon measured the review input, review details report the reviewed
 and excluded file counts. The counts describe change-set paths supplied to and
