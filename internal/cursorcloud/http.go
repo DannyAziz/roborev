@@ -34,19 +34,41 @@ const defaultBaseURL = "https://api.cursor.com"
 // returned. https://cursor.com/docs/cloud-agent/api/v0#list-agents
 const listPageLimit = 100
 
-// defaultResponseHeaderTimeout is how long one call waits for response
-// headers. The review loop applies its own deadline; this only stops a
-// stalled socket. 60s matches a single metadata-style HTTP call.
+// defaultRequestTimeout is the one deadline for a call. Waiting for
+// response headers and reading the body share it, so the two phases
+// cannot stack, and an injected http.Client with no header timeout
+// cannot block past it. 60s matches a single metadata-style HTTP call.
+const defaultRequestTimeout = 60 * time.Second
+
+// defaultResponseHeaderTimeout is the default transport's header wait.
+// The request deadline above is the bound that covers headers and the
+// body; this matches it for clients that use defaultHTTPClient.
 const defaultResponseHeaderTimeout = 60 * time.Second
+
+// defaultResponseBodyTimeout bounds the body read after headers arrive.
+// ResponseHeaderTimeout does not cover that read. The request deadline
+// already includes the read; this limit can be shorter and is what
+// reports a stalled body. It does not extend the request deadline.
+const defaultResponseBodyTimeout = 60 * time.Second
 
 // maxResponseBytes bounds one response body. 8 MiB covers a long review
 // document without retaining an unbounded socket body in memory.
 const maxResponseBytes = 8 << 20
 
-// responseBodyTimeout bounds the body read after headers arrive.
-// ResponseHeaderTimeout does not cover that read, so a stall after the
-// headers would otherwise block forever. 60s matches that header bound.
-var responseBodyTimeout = 60 * time.Second
+// requestDeadlineError is the cause of the per-request timeout. net/http
+// returns context.Cause, so a stalled call surfaces this error. Unwrap
+// keeps it a context.DeadlineExceeded for errors.Is.
+type requestDeadlineError struct{}
+
+func (requestDeadlineError) Error() string { return "cursor cloud: request deadline exceeded" }
+
+func (requestDeadlineError) Unwrap() error { return context.DeadlineExceeded }
+
+var errRequestDeadline error = requestDeadlineError{}
+
+// errResponseBodyDeadline is returned when the body does not arrive
+// before the body limit or the request deadline.
+var errResponseBodyDeadline = errors.New("cursor cloud: response body deadline exceeded")
 
 // maxErrorMessageBytes matches the 64 KiB error-body cap used for other
 // daemon HTTP errors (internal/mcpserver maxErrorBodyBytes). A non-2xx body
@@ -70,10 +92,12 @@ func (secret) Format(f fmt.State, _ rune) {
 func (k secret) value() string { return string(k) }
 
 type httpClient struct {
-	apiKey  secret
-	baseURL string
-	hc      *http.Client
-	cfgErr  error
+	apiKey              secret
+	baseURL             string
+	hc                  *http.Client
+	cfgErr              error
+	requestTimeout      time.Duration
+	responseBodyTimeout time.Duration
 }
 
 func (c httpClient) String() string { return c.redactedSummary() }
@@ -97,9 +121,11 @@ func (c httpClient) redactedSummary() string {
 // as a Basic Authorization header.
 func NewHTTPClient(apiKey string, opts ...Option) Client {
 	c := &httpClient{
-		apiKey:  secret(strings.TrimSpace(apiKey)),
-		baseURL: defaultBaseURL,
-		hc:      defaultHTTPClient(),
+		apiKey:              secret(strings.TrimSpace(apiKey)),
+		baseURL:             defaultBaseURL,
+		hc:                  defaultHTTPClient(),
+		requestTimeout:      defaultRequestTimeout,
+		responseBodyTimeout: defaultResponseBodyTimeout,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -369,6 +395,9 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 	if payload != nil {
 		body = bytes.NewReader(payload)
 	}
+	// One deadline covers response headers and the full body read.
+	ctx, cancel := context.WithTimeoutCause(ctx, c.requestTimeout, errRequestDeadline)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return c.redactErr(fmt.Errorf("cursor cloud: build request: %w", err))
@@ -403,33 +432,43 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 }
 
 func (c *httpClient) readResponseBody(ctx context.Context, body io.ReadCloser) ([]byte, error) {
-	timer := time.NewTimer(responseBodyTimeout)
+	timer := time.NewTimer(c.responseBodyTimeout)
 	defer timer.Stop()
-	done := make(chan struct{})
-	var data []byte
-	var err error
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	// Buffer one result so the reader can finish after this function
+	// returns. Waiting here would pin the caller when Close does not
+	// unblock Read.
+	done := make(chan readResult, 1)
 	go func() {
-		data, err = io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
-		close(done)
+		data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+		done <- readResult{data, err}
 	}()
 	select {
-	case <-done:
+	case result := <-done:
+		if result.err != nil {
+			return nil, fmt.Errorf("cursor cloud: read response: %w", result.err)
+		}
+		if int64(len(result.data)) > maxResponseBytes {
+			return nil, errors.New("cursor cloud: response body exceeds 8 MiB")
+		}
+		return result.data, nil
 	case <-timer.C:
+		// Close, then return without waiting for Read. net/http bodies
+		// unblock Read from Close. A custom body may not, and waiting
+		// would pin the caller. The buffered send lets the reader exit
+		// later if Read does return.
 		_ = body.Close()
-		<-done
-		return nil, errors.New("cursor cloud: response body deadline exceeded")
+		return nil, errResponseBodyDeadline
 	case <-ctx.Done():
 		_ = body.Close()
-		<-done
+		if errors.Is(context.Cause(ctx), errRequestDeadline) {
+			return nil, errResponseBodyDeadline
+		}
 		return nil, ctx.Err()
 	}
-	if err != nil {
-		return nil, fmt.Errorf("cursor cloud: read response: %w", err)
-	}
-	if int64(len(data)) > maxResponseBytes {
-		return nil, errors.New("cursor cloud: response body exceeds 8 MiB")
-	}
-	return data, nil
 }
 
 func (c *httpClient) endpoint(rawPath string) (string, error) {
