@@ -3,10 +3,13 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -105,17 +108,118 @@ func TestCursorCloud429ReapMarksCleaned(t *testing.T) {
 // TestCursorCloudInFlightCreateReapMarksCleaned is J2. The POST was sent, the
 // response never arrived, and the VM is already listed. Reconcile deletes it
 // and marks the launch cleaned, same as the 429 reap.
+//
+// The client-deadline cell returns context.DeadlineExceeded while Review's
+// context is still live. The canceled and expired-deadline cells finish that
+// same context after the agent is stored. Both still mark the launch cleaned.
+// A plain 500 is the same stored-then-returned shape. Skipping the cleaned
+// mark leaves the row uncleaned and these cells fail.
 func TestCursorCloudInFlightCreateReapMarksCleaned(t *testing.T) {
+	t.Run("client deadline", func(t *testing.T) {
+		assertInFlightCreateReaped(t, context.Background(), &cloudCreateScript{
+			Fake:      &cursorcloudtest.Fake{},
+			createErr: context.DeadlineExceeded,
+		}, context.DeadlineExceeded)
+	})
+	t.Run("canceled ctx", func(t *testing.T) {
+		ctx := newFinishCtx(context.Canceled)
+		script := &finishDuringCreate{finish: ctx.finish}
+		script.Fake = &cursorcloudtest.Fake{}
+		assertInFlightCreateReaped(t, ctx, script, context.Canceled)
+	})
+	t.Run("expired deadline", func(t *testing.T) {
+		ctx := newFinishCtx(context.DeadlineExceeded)
+		script := &finishDuringCreate{finish: ctx.finish}
+		script.Fake = &cursorcloudtest.Fake{}
+		assertInFlightCreateReaped(t, ctx, script, context.DeadlineExceeded)
+	})
+	t.Run("500", func(t *testing.T) {
+		apiErr := &cursorcloud.APIError{
+			Op: "create agent", StatusCode: http.StatusInternalServerError, Message: "boom",
+		}
+		assertInFlightCreateReaped(t, context.Background(), &cloudCreateScript{
+			Fake:      &cursorcloudtest.Fake{},
+			createErr: apiErr,
+		}, apiErr)
+	})
+}
+
+func assertInFlightCreateReaped(t *testing.T, ctx context.Context, client cursorcloud.Client, want error) {
+	t.Helper()
 	tc, _ := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	fake := &cursorcloudtest.Fake{}
-	script := &cloudCreateScript{Fake: fake, createErr: context.DeadlineExceeded}
-	_, err := newBoundCloud(t, tc, job, script).Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
-	require.Error(t, err)
+	_, err := newBoundCloud(t, tc, job, client).Review(ctx, tc.TmpDir, sha, "prompt", nil)
+	require.ErrorIs(t, err, want)
+	fake := clientFake(client)
 	deleted := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
 	require.NotEmpty(t, deleted)
 	assertLaunchCleaned(t, tc, job.ID, fake, deleted[0])
+}
+
+func clientFake(client cursorcloud.Client) *cursorcloudtest.Fake {
+	switch c := client.(type) {
+	case *cloudCreateScript:
+		return c.Fake
+	case *finishDuringCreate:
+		return c.Fake
+	default:
+		return nil
+	}
+}
+
+// finishCtx stays live until finish runs, then Err is the supplied context
+// error. Deadline is reported so Review keeps this context instead of wrapping
+// a fresh timeout. The pre-create check still sees a live context.
+type finishCtx struct {
+	done chan struct{}
+	err  error
+	once sync.Once
+}
+
+func newFinishCtx(err error) *finishCtx {
+	return &finishCtx{done: make(chan struct{}), err: err}
+}
+
+func (f *finishCtx) finish() { f.once.Do(func() { close(f.done) }) }
+
+func (f *finishCtx) Deadline() (time.Time, bool) {
+	if errors.Is(f.err, context.DeadlineExceeded) {
+		return time.Unix(0, 0), true
+	}
+	return time.Now().Add(time.Hour), true
+}
+
+func (f *finishCtx) Done() <-chan struct{} { return f.done }
+
+func (f *finishCtx) Err() error {
+	select {
+	case <-f.done:
+		return f.err
+	default:
+		return nil
+	}
+}
+
+func (f *finishCtx) Value(any) any { return nil }
+
+// finishDuringCreate stores the agent, then finishes the review context and
+// returns that context's error. The VM is already listed when Review sees
+// the cancel or the expired deadline.
+type finishDuringCreate struct {
+	cloudCreateScript
+	finish func()
+}
+
+func (c *finishDuringCreate) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	ag, err := c.Fake.CreateAgent(context.Background(), req)
+	if err != nil {
+		return ag, err
+	}
+	if c.finish != nil {
+		c.finish()
+	}
+	return ag, ctx.Err()
 }
 
 // TestCursorCloudSuccessDeleteMarksCleaned is the in-process success path.
