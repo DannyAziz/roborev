@@ -1631,6 +1631,13 @@ func (db *DB) ensureCloudLaunchTable() error {
 	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now') WHERE created_at = ''`); err != nil {
 		return fmt.Errorf("cloud launch created_at: %w", err)
 	}
+	// Rows written before orphan_note existed come back with an empty marker.
+	// Recovery lists cleaned = 0, and the warning is the marker, so an uncleaned
+	// row has to leave this migration with the note set.
+	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET orphan_note = ?
+		WHERE cleaned = 0 AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
+		return fmt.Errorf("cloud launch orphan note: %w", err)
+	}
 	return db.keepCloudLaunchAfterJobDelete()
 }
 

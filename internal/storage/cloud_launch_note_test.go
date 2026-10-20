@@ -103,6 +103,71 @@ func TestPostgresCloudLaunchSurvivesJobDelete(t *testing.T) { //nolint:parallelt
 	assert.Equal(t, CloudLaunchPendingNote, note)
 }
 
+func TestCloudLaunchMigrationBackfillsUncleanedMarker(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	_, _, pendingJob := createJobChain(t, db, "/tmp/marker-pending", "abc123")
+	_, _, doneJob := createJobChain(t, db, "/tmp/marker-done", "def456")
+	_, err := db.Exec(`DROP TABLE review_job_cloud_launches`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE review_job_cloud_launches (
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT NOT NULL,
+		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
+		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO review_job_cloud_launches
+		(job_id, launch_token, agent_id, cleaned, repo_identity) VALUES
+		(?, 'pending-tok', 'bc_old', 0, 'https://example.com/acme/old.git'),
+		(?, 'done-tok', 'bc_done', 1, 'https://example.com/acme/old.git')`, pendingJob.ID, doneJob.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, db.ensureCloudLaunchTable())
+	require.NoError(t, db.ensureCloudLaunchTable())
+
+	var pending, done string
+	require.NoError(t, db.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = 'pending-tok'`).Scan(&pending))
+	require.NoError(t, db.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = 'done-tok'`).Scan(&done))
+	assert.Contains(t, pending, "orphan risk")
+	assert.Empty(t, done)
+	warning, err := db.LaunchOrphanWarning(pendingJob.ID)
+	require.NoError(t, err)
+	assert.Contains(t, warning, "orphan risk")
+	rows, err := db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	var saw bool
+	for _, row := range rows {
+		if row.Token == "pending-tok" {
+			saw = true
+		}
+		assert.NotEqual(t, "done-tok", row.Token)
+	}
+	assert.True(t, saw)
+}
+
+func TestPostgresCloudLaunchMigrationBackfillsUncleanedMarker(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	pool := openTestPgPool(t)
+	ctx := t.Context()
+	token := "pg-marker-" + uuid.New().String()
+	cleanedToken := token + "-cleaned"
+	t.Cleanup(func() {
+		_, _ = pool.pool.Exec(context.Background(), `DELETE FROM review_job_cloud_launches WHERE launch_token IN ($1, $2)`, token, cleanedToken)
+	})
+	_, err := pool.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches DROP COLUMN IF EXISTS orphan_note`)
+	require.NoError(t, err)
+	_, err = pool.pool.Exec(ctx, `INSERT INTO review_job_cloud_launches (job_id, launch_token, cleaned) VALUES
+		(1, $1, FALSE), (1, $2, TRUE)`, token, cleanedToken)
+	require.NoError(t, err)
+
+	pool.ensureLocalCloudLaunchTable(ctx)
+
+	var pending, done string
+	require.NoError(t, pool.pool.QueryRow(ctx, `SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = $1`, token).Scan(&pending))
+	require.NoError(t, pool.pool.QueryRow(ctx, `SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = $1`, cleanedToken).Scan(&done))
+	assert.Contains(t, pending, "orphan risk")
+	assert.Empty(t, done)
+}
+
 func TestLaunchOrphanWarningIgnoresMissingJobRow(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)

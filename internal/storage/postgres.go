@@ -1740,4 +1740,8 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`); err != nil {
 		log.Printf("cursor-cloud: orphan_note: %v", err)
 	}
+	if _, err := p.pool.Exec(ctx, `UPDATE review_job_cloud_launches SET orphan_note = $1
+		WHERE NOT cleaned AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
+		log.Printf("cursor-cloud: orphan note backfill: %v", err)
+	}
 }
