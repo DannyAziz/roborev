@@ -1460,6 +1460,7 @@ func (panicCreate) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) 
 
 type errCreateCloud struct {
 	err     error
+	listErr error
 	creates *int
 }
 
@@ -1476,7 +1477,41 @@ func (c *errCreateCloud) UserPrompt(context.Context, string) (string, error)   {
 func (c *errCreateCloud) StopAgent(context.Context, string) error              { return nil }
 func (c *errCreateCloud) DeleteAgent(context.Context, string) error            { return nil }
 func (c *errCreateCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
 	return nil, nil
+}
+
+func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	prev := cursorCloudReconcileWindow
+	cursorCloudReconcileWindow = time.Millisecond
+	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	dns := &net.DNSError{Err: "no such host", Name: "example.invalid", IsNotFound: true}
+	cases := []struct {
+		name   string
+		create error
+		list   error
+	}{
+		{"5xx plus reconcile-dial", &cursorcloud.APIError{Op: "create agent", StatusCode: http.StatusInternalServerError, Message: "boom"}, dial},
+		{"deadline plus dial", context.DeadlineExceeded, dial},
+		{"read-reset plus DNS", &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")}, dns},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var creates int
+			a := &CursorCloudAgent{
+				Client:  &errCreateCloud{err: tc.create, listErr: tc.list, creates: &creates},
+				RepoURL: repo,
+			}
+			_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+			require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+			assert.Equal(t, 1, creates)
+		})
+	}
 }
 
 type emptyListCloud struct{}

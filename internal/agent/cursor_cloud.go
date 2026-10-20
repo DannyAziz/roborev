@@ -244,13 +244,19 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		Title:  cursorCloudTitle(repoURL, sha),
 	})
 	if err != nil {
-		if cursorCloudPreSend(err) {
+		// Classify the create error before reconcile is joined. A reconcile
+		// dial or DNS error would otherwise make cursorCloudPreSend true and
+		// drop the sentinel, and the worker would POST /v0/agents again.
+		sent := !cursorCloudPreSend(err)
+		if !sent {
 			// The POST never left, so this attempt does not spend the hour.
 			refund()
-		} else if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
+			return "", err
+		}
+		if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
-		return "", cursorCloudLaunchErr(err)
+		return "", cursorCloudNonRetryable(err)
 	}
 	// Delete is armed before any later work, including the status line, so a
 	// panic or error there still removes the VM.
@@ -328,9 +334,10 @@ func (a *CursorCloudAgent) repoURL(repoPath string) (string, error) {
 	return cleaned, nil
 }
 
-// ErrCursorCloudNonRetryable marks a cursor-cloud launch that must not reach
-// RetryJob. Match it with errors.Is. CreateAgent failures, except a proven
-// pre-send dial, and launch-cap refusals both use it.
+// ErrCursorCloudNonRetryable marks a cursor-cloud create that may already
+// have been sent. Match it with errors.Is. Pre-send dial and DNS failures,
+// and a launch-cap refusal, do not use it: those never reached CreateAgent's
+// request bytes, so a local backup may run the job.
 var ErrCursorCloudNonRetryable = errors.New("cursor-cloud: launch failed")
 
 // cursorCloudLaunchError is a typed non-retryable launch failure. A 429 or
@@ -356,17 +363,6 @@ func cursorCloudNonRetryable(err error) error {
 		return err
 	}
 	return MarkUnavailable(&cursorCloudLaunchError{cause: err})
-}
-
-// cursorCloudLaunchErr marks a launch non-retryable unless err is a dial or
-// connect that happened before any request bytes were written. A 429, a 5xx,
-// a timeout after send, and any ambiguous error are non-retryable: the server
-// may already have created an agent, and a retry would leak another VM.
-func cursorCloudLaunchErr(err error) error {
-	if err == nil || cursorCloudPreSend(err) {
-		return err
-	}
-	return cursorCloudNonRetryable(err)
 }
 
 // cursorCloudPreSend reports a failure that cannot have transmitted the

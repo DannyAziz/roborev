@@ -1868,7 +1868,6 @@ func TestResolveRepoIdentity(t *testing.T) {
 		pairs := [][2]string{
 			{"https://user:alpha@github.com/acme/one.git", "https://user:beta@github.com/acme/two.git"},
 			{"user:alpha@github.com:acme/one.git", "user:beta@github.com:acme/two.git"},
-			{"ghp_alpha@github.com:acme/one.git", "ghp_beta@github.com:acme/two.git"},
 		}
 		for _, pair := range pairs {
 			idA := ResolveRepoIdentity(dir, func(string, string) string { return pair[0] })
@@ -1878,9 +1877,13 @@ func TestResolveRepoIdentity(t *testing.T) {
 			assert.NotEqual(t, redactedURL, idB, pair[1])
 			assert.NotContains(t, idA, "alpha")
 			assert.NotContains(t, idB, "beta")
-			assert.NotContains(t, idA, "ghp_")
-			assert.NotContains(t, idB, "ghp_")
 		}
+		// A token in the SCP user slot has no ':'. Main stores that string
+		// unchanged because url.Parse rejects it. It must not become redacted-url.
+		ghp := ResolveRepoIdentity(dir, func(string, string) string {
+			return "ghp_alpha@github.com:acme/one.git"
+		})
+		assert.Equal(t, "ghp_alpha@github.com:acme/one.git", ghp)
 		gitID := ResolveRepoIdentity(dir, func(string, string) string {
 			return "git@github.com:acme/one.git"
 		})
@@ -1918,10 +1921,41 @@ func TestResolveRepoIdentityRedactedURLDoesNotCollide(t *testing.T) {
 	assert.NotEqual(t, one, two)
 	assert.NotEqual(t, RedactedURL, one)
 	assert.NotEqual(t, RedactedURL, two)
-	assert.NotContains(t, one, "ghp_")
-	assert.NotContains(t, two, "ghp_")
-	assert.Equal(t, "github.com:acme/one.git", one)
-	assert.Equal(t, "github.com:acme/two.git", two)
+	assert.Equal(t, "ghp_alpha@github.com:acme/one.git", one)
+	assert.Equal(t, "ghp_beta@github.com:acme/two.git", two)
+}
+
+func TestResolveRepoIdentityKeepsMainSCPAndPathAt(t *testing.T) {
+	dir := t.TempDir()
+	assert := assert.New(t)
+	cases := []struct{ raw, want string }{
+		{"deploy@host:org/repo.git", "deploy@host:org/repo.git"},
+		{"gitolite@git.example.com:org/repo.git", "gitolite@git.example.com:org/repo.git"},
+		{"org@vs-ssh.visualstudio.com:v3/org/project/repo", "org@vs-ssh.visualstudio.com:v3/org/project/repo"},
+		{"ssh://git@host/org/repo", "ssh://host/org/repo"},
+		{"https://example.com/foo@bar/repo.git", "https://example.com/foo@bar/repo.git"},
+	}
+	for _, tc := range cases {
+		got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
+		assert.Equal(tc.want, got, tc.raw)
+	}
+}
+
+func TestResolveRepoIdentityDropsWholeQueryAndFragment(t *testing.T) {
+	dir := t.TempDir()
+	assert := assert.New(t)
+	cases := []struct{ raw, want string }{
+		{"https://github.com/o/r.git?oauth_token=sekret", "https://github.com/o/r.git"},
+		{"https://github.com/o/r.git?password=sekret", "https://github.com/o/r.git"},
+		{"https://github.com/o/r.git?X-Amz-Signature=abc&x=1", "https://github.com/o/r.git"},
+		{"https://github.com/o/r.git#signed=1", "https://github.com/o/r.git"},
+	}
+	for _, tc := range cases {
+		got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
+		assert.Equal(tc.want, got, tc.raw)
+		assert.NotContains(got, "sekret")
+		assert.NotContains(got, "X-Amz-Signature")
+	}
 }
 
 func TestResolveModel(t *testing.T) {
