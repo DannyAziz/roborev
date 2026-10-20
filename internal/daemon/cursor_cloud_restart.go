@@ -109,7 +109,7 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 		return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
 	}
-	return db.MarkCloudLaunchCleaned(row.ID)
+	return db.MarkCloudLaunchCleanedByToken(row.Token)
 }
 
 func cloudLaunchAgedOut(createdAt string, now time.Time) bool {
