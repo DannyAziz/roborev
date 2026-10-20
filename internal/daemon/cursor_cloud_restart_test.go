@@ -1059,7 +1059,7 @@ func cursorCloudAgeLaunch(t *testing.T, db *storage.DB, jobID int64) {
 
 func cursorCloudAgeLaunchPastLag(t *testing.T, db *storage.DB, jobID int64) {
 	t.Helper()
-	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-2 minutes') WHERE job_id = ?`, jobID)
+	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-25 hours') WHERE job_id = ?`, jobID)
 	require.NoError(t, err)
 }
 
