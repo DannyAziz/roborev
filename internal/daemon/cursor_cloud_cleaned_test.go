@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -191,10 +192,10 @@ func TestCursorCloudDuplicateCreateBeforeCleaned(t *testing.T) {
 	})
 }
 
-// TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned is restart.go's
-// unusable-repository branch. The saved id's delete is confirmed, and a
-// second VM with the same token is still running. Cleaning the row there
-// drops the duplicate.
+// TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned is the
+// unusable-repository branch with a saved agent id. The marker sweep cannot
+// run. The launch stays uncleaned. Job status has no orphan_warning field and
+// this path does not write an orphan-risk note. The warning is the cleanup log.
 func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -208,6 +209,12 @@ func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 	require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, ""))
 	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, saved.ID))
 	tc.GitRepo.Run("remote", "remove", "origin")
+	var launchID int64
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT id FROM review_job_cloud_launches WHERE job_id = ? AND launch_token = ?`,
+		job.ID, token,
+	).Scan(&launchID))
+	logs := cursorCloudCaptureLog(t)
 
 	err = recoverStaleJobs(context.Background(), tc.DB, fake)
 	_, getErr := fake.GetAgent(t.Context(), saved.ID)
@@ -218,6 +225,14 @@ func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 	n, countErr := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, countErr)
 	assert.Equal(t, 1, n)
+	assert.Contains(t, logs.String(), fmt.Sprintf(
+		"cursor-cloud: cleanup job %d launch %d: cursor-cloud: launch %d has no repository to sweep",
+		job.ID, launchID, launchID,
+	))
+	updated, getErr := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, getErr)
+	assert.NotContains(t, updated.Error, "orphan_warning")
+	assert.NotContains(t, updated.Error, "orphan risk")
 	require.Error(t, err)
 }
 
