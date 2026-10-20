@@ -124,3 +124,34 @@ func TestCanonicalIdentityStillTrackedThenScrubbed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, lower, kept.Identity)
 }
+
+// A remote that carries a credential in its query or fragment must not
+// replace a credential-free stored identity. Main stores such a remote as
+// is on a new row; the scrub would newly write it over a safe one.
+func TestScrubKeepsCredentialFreeIdentity(t *testing.T) {
+	cases := []struct{ remote, stored string }{
+		{"https://git.example/org/repo.git?access_token=synthetic-secret", "https://git.example/org/repo.git"},
+		{"https://git.example/org/repo.git?access_token=synthetic-secret", "https://git.example/org/repo"},
+		{"https://git.example/org/repo.git#private_token=synthetic-secret", "https://git.example/org/repo.git"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.remote+" "+tc.stored, func(t *testing.T) {
+			db := testutil.OpenTestDB(t)
+			repo := testutil.NewTestRepo(t)
+			repo.AddRemote("origin", tc.remote)
+			mainRoot, err := gitrepo.MainRoot(context.Background(), repo.Root)
+			require.NoError(t, err)
+			row, err := db.GetOrCreateRepo(mainRoot, tc.stored)
+			require.NoError(t, err)
+			require.Equal(t, tc.stored, row.Identity)
+
+			n, err := db.ScrubCanonicalRepoIdentities()
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+			kept, err := db.GetRepoByPath(mainRoot)
+			require.NoError(t, err)
+			assert.Equal(t, tc.stored, kept.Identity)
+			assert.NotContains(t, kept.Identity, "synthetic-secret")
+		})
+	}
+}

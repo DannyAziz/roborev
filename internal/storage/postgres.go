@@ -762,7 +762,8 @@ type repoIdentityDB interface {
 
 // adoptCanonicalRepoIdentity rewrites one stack-built canonical row to the
 // stored form when RemoteIdentity says they are the same remote. An exact
-// row is returned unchanged.
+// row is returned unchanged. An identity with a query or fragment, which
+// may hold a token, is never written over the canonical row.
 func (p *PgPool) adoptCanonicalRepoIdentity(ctx context.Context, identity string) (int64, bool, error) {
 	return adoptCanonicalRepoIdentity(ctx, p.pool, identity)
 }
@@ -777,7 +778,7 @@ func adoptCanonicalRepoIdentity(ctx context.Context, q repoIdentityDB, identity 
 		return 0, false, fmt.Errorf("lookup repo identity: %w", err)
 	}
 	canonical := config.RemoteIdentity(identity)
-	if canonical == "" || canonical == identity {
+	if canonical == "" || canonical == identity || config.IdentityCarriesQuery(identity) {
 		return 0, false, nil
 	}
 	err = q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)

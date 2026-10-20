@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/cursorcloud/cursorcloudtest"
 	"go.kenn.io/roborev/internal/review"
@@ -586,4 +587,37 @@ func TestProcessJobCursorCloudFixWithoutPatchDoesNotRelaunch(t *testing.T) {
 	assert.Equal(t, 0, stored.RetryCount)
 	assert.Equal(t, storage.JobStatusFailed, stored.Status)
 	assert.Contains(t, stored.Error, "agent produced no file changes")
+}
+
+// An origin whose query carries a token is stored as main stores it, but
+// nothing the daemon sends to Cursor, and no launch row, carries the token.
+func TestProcessJobCursorCloudOmitsRemoteQueryToken(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	const secret = "synthetic-secret-q7"
+	const remote = "https://git.example/org/repo.git?access_token=" + secret
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: `{"schema_version":2,"summary":"ok","verdict":"pass","findings":[]}`}
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.CursorCloudAgent{Client: fake})
+	t.Cleanup(func() { agent.Register(prev) })
+
+	wtc := newWorkerTestContext(t, 1)
+	wtc.GitRepo.Run("remote", "add", "origin", remote)
+	identity := config.ResolveRepoIdentity(wtc.TmpDir, nil)
+	require.Contains(t, identity, secret, "main keeps the query on the stored identity")
+	require.NoError(t, wtc.DB.SetRepoIdentity(wtc.Repo.ID, identity))
+	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
+	job := wtc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+
+	wtc.Pool.processJob(testWorkerID, job)
+
+	require.Equal(t, 1, createCountFromFake(fake))
+	for _, call := range fake.Calls() {
+		raw, marshalErr := json.Marshal(call)
+		require.NoError(t, marshalErr)
+		assert.NotContains(t, string(raw), secret)
+	}
+	var launches int
+	require.NoError(t, wtc.DB.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ? AND repo_identity LIKE ?`, job.ID, "%"+secret+"%").Scan(&launches))
+	assert.Zero(t, launches)
 }

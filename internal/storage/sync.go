@@ -294,7 +294,8 @@ func (db *DB) BackfillRepoIdentities() (int, error) {
 // ScrubCanonicalRepoIdentities rewrites a stack-built canonical identity to
 // the current stored form when both name the same remote. It is idempotent:
 // once the row matches ResolveRepoIdentity, SameRepoIdentity is exact and
-// the row is left alone. A case-sensitive host is not rewritten.
+// the row is left alone. A case-sensitive host is not rewritten, and
+// neither is an identity whose query or fragment may hold a token.
 func (db *DB) ScrubCanonicalRepoIdentities() (int, error) {
 	rows, err := db.Query(`SELECT id, root_path, identity FROM repos WHERE identity IS NOT NULL AND identity != ''`)
 	if err != nil {
@@ -323,7 +324,7 @@ func (db *DB) ScrubCanonicalRepoIdentities() (int, error) {
 		if resolved == "" || resolved == r.identity {
 			continue
 		}
-		if !config.SameRepoIdentity(r.identity, resolved) {
+		if !config.SameRepoIdentity(r.identity, resolved) || config.IdentityCarriesQuery(resolved) {
 			continue
 		}
 		if err := db.SetRepoIdentity(r.id, resolved); err != nil {

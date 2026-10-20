@@ -2830,6 +2830,13 @@ func SameRepoIdentity(stored, resolved string) bool {
 	return left != "" && left == right
 }
 
+// IdentityCarriesQuery reports an identity with a ?query or #fragment. Main
+// stores such a remote as is, so it may hold a token. Code that rewrites an
+// existing identity must not write one.
+func IdentityCarriesQuery(identity string) bool {
+	return strings.ContainsAny(identity, "?#")
+}
+
 // authorityUser returns the userinfo in the authority, before the path.
 // It does not look at '@' inside the path.
 func authorityUser(raw string) (string, bool) {
