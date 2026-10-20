@@ -38,11 +38,15 @@ func TestResetStaleJobsFailsUncleanedCloudLaunch(t *testing.T) {
 	failedLaunch, err := db.GetJobByID(launchJob.ID)
 	require.NoError(t, err)
 	assert.Equal(JobStatusFailed, failedLaunch.Status)
-	assert.Equal(CloudLaunchInterruptedError, failedLaunch.Error)
+	var launchErr string
+	require.NoError(t, db.QueryRow(`SELECT error FROM review_jobs WHERE id = ?`, launchJob.ID).Scan(&launchErr))
+	assert.Equal(CloudLaunchInterruptedError, launchErr)
 	failedInvoked, err := db.GetJobByID(invoked.ID)
 	require.NoError(t, err)
 	assert.Equal(JobStatusFailed, failedInvoked.Status)
-	assert.Equal(CloudLaunchInterruptedError, failedInvoked.Error)
+	var invokedErr string
+	require.NoError(t, db.QueryRow(`SELECT error FROM review_jobs WHERE id = ?`, invoked.ID).Scan(&invokedErr))
+	assert.Equal(CloudLaunchInterruptedError, invokedErr)
 	requeued, err := db.GetJobByID(plain.ID)
 	require.NoError(t, err)
 	assert.Equal(JobStatusQueued, requeued.Status)

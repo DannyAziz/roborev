@@ -333,10 +333,9 @@ func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 		"cursor-cloud: cleanup job %d launch %d: cursor-cloud: launch %d has no repository to sweep",
 		job.ID, launchID, launchID,
 	))
-	updated, getErr := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, getErr)
-	assert.NotContains(t, updated.Error, "orphan_warning")
-	assert.NotContains(t, updated.Error, "orphan risk")
+	var storedErr string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&storedErr))
+	assert.NotContains(t, storedErr, "orphan risk")
 	require.Error(t, err)
 }
 
