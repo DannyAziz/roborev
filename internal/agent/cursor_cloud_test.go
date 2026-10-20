@@ -1171,6 +1171,32 @@ func TestCursorCloudFinishedStopStaysOutOfOutput(t *testing.T) {
 	assert.True(t, stopped)
 }
 
+// TestCursorCloudConflictFinishedStopStaysQuiet is a 409 whose text says the
+// agent finished and does not say "already". That status is quiet on its own.
+func TestCursorCloudConflictFinishedStopStaysQuiet(t *testing.T) {
+	fake := &cursorcloudtest.Fake{
+		CreateStatus: cursorcloud.StatusFinished,
+		Final:        "ok",
+		MethodErrors: map[string]error{
+			cursorcloudtest.MethodStop: &cursorcloud.APIError{
+				Op: "stop agent", StatusCode: http.StatusConflict, Message: "agent has finished",
+			},
+		},
+	}
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	out := &bytes.Buffer{}
+	_, err := (&CursorCloudAgent{
+		Client: fake, RepoURL: "https://example.com/acme/repo.git",
+	}).Review(context.Background(), t.TempDir(), "0123456789abcdef0123456789abcdef01234567", "prompt", out)
+	require.NoError(t, err)
+	assert.NotContains(t, out.String(), "stop agent")
+	assert.NotContains(t, logs.String(), "stop agent")
+	assert.Equal(t, 1, deleteCount(fake))
+}
+
 func TestCursorCloudStopHangStillDeletes(t *testing.T) {
 	prev := cursorCloudDeleteTimeout
 	cursorCloudDeleteTimeout = 150 * time.Millisecond
