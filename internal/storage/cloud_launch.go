@@ -277,12 +277,14 @@ func (db *DB) keepCloudLaunchAfterJobDelete() error {
 }
 
 // AttachLaunchOrphanWarnings fills OrphanWarning for an API job listing.
-func (db *DB) AttachLaunchOrphanWarnings(jobs []ReviewJob) {
+// A launch lookup error is returned; it is not skipped.
+func (db *DB) AttachLaunchOrphanWarnings(jobs []ReviewJob) error {
 	for i := range jobs {
 		warning, err := db.LaunchOrphanWarning(jobs[i].ID)
 		if err != nil {
-			continue
+			return fmt.Errorf("launch orphan warning: %w", err)
 		}
 		ApplyLaunchOrphanWarning(&jobs[i], warning)
 	}
+	return nil
 }

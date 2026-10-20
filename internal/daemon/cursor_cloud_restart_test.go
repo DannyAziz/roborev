@@ -52,7 +52,7 @@ func TestCursorCloudRestartStopsPersistedAgent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, logLine, string(body))
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, storage.CloudLaunchInterruptedError, updated.Error)
+	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 	assert.Equal(t, 0, updated.RetryCount)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
@@ -81,7 +81,7 @@ func TestCursorCloudRestartSweepsMarkerWithoutID(t *testing.T) {
 	_, err := fake.GetAgent(t.Context(), created.ID)
 	require.Error(t, err)
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, storage.CloudLaunchInterruptedError, updated.Error)
+	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 	assert.Equal(t, 0, updated.RetryCount)
 }
 
@@ -157,7 +157,7 @@ func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, storage.CloudLaunchInterruptedError, updated.Error)
+	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 }
 
 // TestCursorCloudRestartRetires404 marks cleanup done when delete reports
@@ -532,7 +532,7 @@ func TestCursorCloudRestartFailsSynthesisBackupLaunch(t *testing.T) {
 	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
-	assert.Equal(t, storage.CloudLaunchInterruptedError, updated.Error)
+	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 	body, err := os.ReadFile(JobLogPath(synth.ID))
 	require.NoError(t, err)
 	assert.Equal(t, logLine, string(body))
@@ -699,7 +699,7 @@ func TestCursorCloudUpdateInterruptDoesNotRelaunch(t *testing.T) {
 	handled := tc.Pool.handleUpdateInterruption(context.Background(), testWorkerID, job)
 	assert.True(t, handled)
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, storage.CloudLaunchInterruptedError, updated.Error)
+	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	claimed, err := tc.DB.ClaimJob(testWorkerID + "-update")
 	require.NoError(t, err)

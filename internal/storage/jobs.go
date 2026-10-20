@@ -2284,7 +2284,11 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	if err := db.attachExperimentAssignments(&j); err != nil {
 		return nil, err
 	}
-
+	jobs := []ReviewJob{j}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, err
+	}
+	j = jobs[0]
 	return &j, nil
 }
 

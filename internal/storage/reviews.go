@@ -556,6 +556,14 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 	if err := reviewRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate reviews: %w", err)
 	}
+	for id, entry := range result {
+		warning, err := db.LaunchOrphanWarning(entry.Job.ID)
+		if err != nil {
+			return nil, fmt.Errorf("launch orphan warning: %w", err)
+		}
+		ApplyLaunchOrphanWarning(&entry.Job, warning)
+		result[id] = entry
+	}
 
 	return result, nil
 }

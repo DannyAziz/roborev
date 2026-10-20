@@ -187,9 +187,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, updated)
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
-		stored, err := tc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.NotContains(t, stored.Error, "orphan risk")
+		assert.NotContains(t, cursorCloudStoredError(t, tc.DB, job.ID), "orphan risk")
 		cursorCloudCleanToken(t, tc.DB, "fail-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
@@ -202,7 +200,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
 		stored, err := tc.DB.GetJobByID(job.ID)
 		require.NoError(t, err)
-		assert.Empty(t, stored.Error)
+		assert.Empty(t, cursorCloudStoredError(t, tc.DB, job.ID))
 		assert.Equal(t, storage.JobStatusQueued, stored.Status)
 		cursorCloudCleanToken(t, tc.DB, "fail-over-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
@@ -214,9 +212,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, "cancel-tok", cursorCloudRestartRepo))
 		require.NoError(t, tc.DB.CancelJobWithError(job.ID, "timeout cancel"))
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
-		stored, err := tc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, "timeout cancel", stored.Error)
+		assert.Equal(t, "timeout cancel", cursorCloudStoredError(t, tc.DB, job.ID))
 		cursorCloudCleanToken(t, tc.DB, "cancel-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
@@ -235,10 +231,9 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 			SourceMachineID: *job.SourceMachineID,
 		}, job.RepoID, job.CommitID))
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
-		stored, err := tc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, "origin replay", stored.Error)
-		assert.NotContains(t, stored.Error, "orphan risk")
+		storedErr := cursorCloudStoredError(t, tc.DB, job.ID)
+		assert.Equal(t, "origin replay", storedErr)
+		assert.NotContains(t, storedErr, "orphan risk")
 		cursorCloudCleanToken(t, tc.DB, "sync-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
@@ -282,6 +277,13 @@ func cursorCloudInsertEmptyToken(t *testing.T, db *storage.DB, jobID int64, agen
 	require.NoError(t, err)
 }
 
+func cursorCloudStoredError(t *testing.T, db *storage.DB, jobID int64) string {
+	t.Helper()
+	var text string
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, jobID).Scan(&text))
+	return text
+}
+
 func cursorCloudLaunchNote(t *testing.T, db *storage.DB, jobID int64) string {
 	t.Helper()
 	var note string
@@ -299,4 +301,54 @@ func cursorCloudLaunchAgentID(t *testing.T, db *storage.DB, jobID int64) string 
 func cursorCloudCleanToken(t *testing.T, db *storage.DB, token string) {
 	t.Helper()
 	require.NoError(t, db.MarkCloudLaunchCleanedByToken(token))
+}
+
+func TestBatchJobStatusShowsLaunchOrphanWarning(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	srv := newServerWithLogs(tc.DB, config.DefaultConfig(), "", newTestErrorLog(), newTestActivityLog())
+	t.Cleanup(func() { _ = srv.Close() })
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	quiet := tc.createJobWithAgent(t, sha, "test")
+	require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, "batch-reader-tok", cursorCloudRestartRepo))
+
+	body, err := json.Marshal(map[string][]int64{"job_ids": {job.ID, quiet.ID}})
+	require.NoError(t, err)
+	rr := serveHuma(t, srv, http.MethodPost, "/api/jobs/batch", body)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp struct {
+		Results map[int64]storage.JobWithReview `json:"results"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Contains(t, resp.Results[job.ID].Job.OrphanWarning, "orphan risk")
+	assert.Contains(t, resp.Results[job.ID].Job.Error, "orphan risk")
+	assert.Empty(t, resp.Results[quiet.ID].Job.OrphanWarning)
+}
+
+func TestJobStatusReadersSurfaceLaunchLookupError(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	srv := newServerWithLogs(tc.DB, config.DefaultConfig(), "", newTestErrorLog(), newTestActivityLog())
+	t.Cleanup(func() { _ = srv.Close() })
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	_, err := tc.DB.Exec(`ALTER TABLE review_job_cloud_launches RENAME TO review_job_cloud_launches_src`)
+	require.NoError(t, err)
+	_, err = tc.DB.Exec(`CREATE VIEW review_job_cloud_launches AS
+		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at
+		FROM review_job_cloud_launches_src`)
+	require.NoError(t, err)
+
+	direct := serveHuma(t, srv, http.MethodGet, fmt.Sprintf("/api/jobs?id=%d", job.ID), nil)
+	assert.Equal(t, http.StatusInternalServerError, direct.Code, "direct: %s", direct.Body.String())
+	assert.Contains(t, direct.Body.String(), "orphan_note")
+
+	list := serveHuma(t, srv, http.MethodGet, "/api/jobs", nil)
+	assert.Equal(t, http.StatusInternalServerError, list.Code, "list: %s", list.Body.String())
+	assert.Contains(t, list.Body.String(), "orphan_note")
+
+	body, err := json.Marshal(map[string][]int64{"job_ids": {job.ID}})
+	require.NoError(t, err)
+	batch := serveHuma(t, srv, http.MethodPost, "/api/jobs/batch", body)
+	assert.Equal(t, http.StatusInternalServerError, batch.Code, "batch: %s", batch.Body.String())
+	assert.Contains(t, batch.Body.String(), "orphan_note")
 }
