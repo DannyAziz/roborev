@@ -74,19 +74,9 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 			return err
 		}
 	}
-	if row.Token == "" {
-		// A known id was deleted above (nil or 404) or this list is empty.
-		// Anything else stays uncleaned: there was no confirming delete or list.
-		if row.AgentID == "" {
-			agents, err := client.ListAgents(ctx)
-			if err != nil {
-				return err
-			}
-			if len(agents) != 0 {
-				return fmt.Errorf("cursor-cloud: launch %d has an empty token and was not listed", row.ID)
-			}
-		}
-		return db.MarkCloudLaunchCleaned(row.ID)
+	if row.TokenNull || row.Token == "" {
+		// No marker can find a VM for this row. Leave it uncleaned.
+		return reportCloudLaunchOrphan(db, row)
 	}
 	repoURL := row.RepoIdentity
 	if !agent.CursorCloudRepoUsable(repoURL) {

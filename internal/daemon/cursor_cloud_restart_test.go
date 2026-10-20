@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"log"
 	"net/http"
@@ -288,6 +289,83 @@ func TestCursorCloudRestartAgesCrashBeforePost(t *testing.T) {
 	updated, err := tc.DB.GetJobByID(job.ID)
 	require.NoError(t, err)
 	assert.Contains(t, updated.Error, "orphan risk")
+}
+
+// TestCursorCloudRestartKeepsEmptyToken is the empty-token pin. Restart
+// must not mark a ” or NULL token cleaned. The orphan warning stays, and
+// no delete runs, because there is no marker that can prove the VM is gone.
+func TestCursorCloudRestartKeepsEmptyToken(t *testing.T) {
+	for _, tokenNull := range []bool{false, true} {
+		name := "empty"
+		if tokenNull {
+			name = "null"
+		}
+		t.Run(name, func(t *testing.T) {
+			tc, fake := cursorCloudRestartFixture(t)
+			sha := testutil.GetHeadSHA(t, tc.TmpDir)
+			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+			if tokenNull {
+				cursorCloudAllowNullToken(t, tc.DB)
+				_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
+					(job_id, launch_token, repo_identity, created_at)
+					VALUES (?, NULL, ?, datetime('now'))`, job.ID, cursorCloudRestartRepo)
+				require.NoError(t, err)
+			} else {
+				// BeginCloudLaunch refuses an empty token because the pending
+				// note is keyed by token. The row is inserted the way a NULL
+				// token is: already stored, with nothing to sweep.
+				_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
+					(job_id, launch_token, repo_identity, created_at)
+					VALUES (?, '', ?, datetime('now'))`, job.ID, cursorCloudRestartRepo)
+				require.NoError(t, err)
+				_, err = tc.DB.Exec(`UPDATE review_jobs SET agent_invoked = 1 WHERE id = ?`, job.ID)
+				require.NoError(t, err)
+			}
+			logs := cursorCloudCaptureLog(t)
+
+			require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+			n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+			assert.Contains(t, logs.String(), "orphan risk")
+			assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
+			updated, err := tc.DB.GetJobByID(job.ID)
+			require.NoError(t, err)
+			assert.Contains(t, updated.Error, "orphan risk")
+
+			var stored sql.NullString
+			var cleaned int
+			require.NoError(t, tc.DB.QueryRow(
+				`SELECT launch_token, cleaned FROM review_job_cloud_launches WHERE job_id = ?`, job.ID,
+			).Scan(&stored, &cleaned))
+			assert.Equal(t, 0, cleaned)
+			assert.Equal(t, !tokenNull, stored.Valid)
+			if stored.Valid {
+				assert.Empty(t, stored.String)
+			}
+		})
+	}
+}
+
+// cursorCloudAllowNullToken rebuilds the launch table in this test database
+// so a NULL token can be inserted. Production migration of that column is
+// not this test's job.
+func cursorCloudAllowNullToken(t *testing.T, db *storage.DB) {
+	t.Helper()
+	_, err := db.Exec(`CREATE TABLE review_job_cloud_launches_nullable (
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT,
+		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
+		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO review_job_cloud_launches_nullable
+		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at)
+		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at
+		FROM review_job_cloud_launches`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DROP TABLE review_job_cloud_launches`)
+	require.NoError(t, err)
+	_, err = db.Exec(`ALTER TABLE review_job_cloud_launches_nullable RENAME TO review_job_cloud_launches`)
+	require.NoError(t, err)
 }
 
 // TestCursorCloudRestartUsesStoredRepoIdentity changes origin after the
