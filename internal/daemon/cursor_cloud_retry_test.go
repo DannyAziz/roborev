@@ -443,6 +443,7 @@ func TestCursorCloudBadRefFailoversWithoutRetry(t *testing.T) {
 	_, err := cloud.Review(context.Background(), t.TempDir(), "dirty", "prompt", nil)
 	require.Error(t, err)
 	require.True(t, agent.IsUnavailable(err))
+	require.NotErrorIs(t, err, agent.ErrCursorCloudNonRetryable)
 
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
