@@ -835,6 +835,75 @@ func TestCursorCloudCredentialFormsStayOutOfLaunch(t *testing.T) {
 	}
 }
 
+// TestCursorCloudBindRefusesUnusableRepo is the pin for the bind gate.
+// Each shape RemoteIdentity rejects is a token-only launch that must not
+// POST. Each shape it accepts still creates one agent. Removing the
+// refusal makes the rejected rows POST and this test fails.
+func TestCursorCloudBindRefusesUnusableRepo(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	cases := []struct {
+		name    string
+		raw     string
+		creates int
+		leak    string
+	}{
+		{name: "file url empty host", raw: "file:///tmp/repo.git"},
+		{name: "file scheme only", raw: "file://"},
+		{name: "file host without path", raw: "file://hostname"},
+		{name: "https host without path", raw: "https://github.com"},
+		{name: "https host slash only", raw: "https://github.com/"},
+		{name: "http host without path", raw: "http://example.com"},
+		{name: "ssh host without path", raw: "ssh://github.com"},
+		{name: "git host slash only", raw: "git://github.com/"},
+		{name: "credentialed host without path", raw: "https://user:tok@github.com", leak: "tok"},
+		{name: "protocol relative host", raw: "//github.com"},
+		{name: "protocol relative host slash", raw: "//host/"},
+		{name: "relative path", raw: "acme/repo"},
+		{name: "absolute path", raw: "/tmp/repo.git"},
+		{name: "schemeless host path", raw: "github.com/acme/repo"},
+		{name: "single path segment", raw: "repo.git"},
+		{name: "dot path", raw: "."},
+		{name: "dot git segment", raw: ".git"},
+		{name: "host path only dot git", raw: "https://github.com/.git"},
+		{name: "bare name", raw: "nocolon"},
+		{name: "https repository", raw: "https://github.com/acme/repo.git", creates: 1},
+		{name: "scp", raw: "git@github.com:acme/repo.git", creates: 1},
+		{name: "ssh with user", raw: "ssh://git@github.com/acme/repo.git", creates: 1},
+		{name: "git scheme", raw: "git://github.com/acme/repo.git", creates: 1},
+		{name: "http repository", raw: "http://example.com/acme/repo.git", creates: 1},
+		{name: "protocol relative repository", raw: "//github.com/acme/repo.git", creates: 1},
+		{name: "file url with host and path", raw: "file://localhost/tmp/repo.git", creates: 1},
+		{name: "ipv6 repository", raw: "https://[::1]/acme/repo.git", creates: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+			var binds int
+			a := &CursorCloudAgent{
+				Client:  fake,
+				RepoURL: tc.raw,
+				BindLaunch: func(string, string) error {
+					binds++
+					return nil
+				},
+			}
+			_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+			assert := assert.New(t)
+			assert.Equal(tc.creates, createCount(fake))
+			assert.Equal(tc.creates, binds)
+			if tc.creates == 0 {
+				require.Error(t, err)
+				assert.Contains(err.Error(), "refusing to bind launch")
+				if tc.leak != "" {
+					assert.NotContains(err.Error(), tc.leak)
+				}
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	cases := []struct {
