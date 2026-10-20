@@ -18,7 +18,7 @@ func recoverStaleJobs(ctx context.Context, db *storage.DB, client cursorcloud.Cl
 	if err := db.ResetStaleJobs(); err != nil {
 		return err
 	}
-	return recoverCloudLaunches(ctx, db, client)
+	return recoverCloudLaunches(ctx, db, client, nil)
 }
 
 func (s *Server) recoverStaleJobs(ctx context.Context) error {
@@ -29,13 +29,17 @@ func (s *Server) recoverStaleJobs(ctx context.Context) error {
 	if client == nil {
 		client, _ = cursorcloud.NewFromEnv()
 	}
-	if err := recoverCloudLaunches(ctx, s.db, client); err != nil {
+	var globalCfg *config.Config
+	if s.configWatcher != nil {
+		globalCfg = s.configWatcher.Config()
+	}
+	if err := recoverCloudLaunches(ctx, s.db, client, globalCfg); err != nil {
 		log.Printf("cursor-cloud: interrupted launch cleanup will retry on next start: %v", err)
 	}
 	return nil
 }
 
-func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorcloud.Client) error {
+func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorcloud.Client, globalCfg *config.Config) error {
 	rows, err := db.ListUncleanedCloudLaunches()
 	if err != nil || len(rows) == 0 {
 		return err
@@ -50,7 +54,7 @@ func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorclou
 	daemonID := machineID.String() //nolint:forbidigo // launch marker is prompt text
 	var errs []error
 	for _, row := range rows {
-		if err := recoverOneCloudLaunch(ctx, db, client, daemonID, row); err != nil {
+		if err := recoverOneCloudLaunch(ctx, db, client, daemonID, row, globalCfg); err != nil {
 			log.Printf("cursor-cloud: cleanup job %d launch %d: %v", row.JobID, row.ID, err)
 			errs = append(errs, err)
 		}
@@ -58,16 +62,8 @@ func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorclou
 	return errors.Join(errs...)
 }
 
-// cloudLaunchMaxAge is how long a launch stays uncleaned before a later
-// independent empty sweep may mark it cleaned, and before a token-only or
-// empty-token miss is an orphan risk. A same-day restart still has to be
-// able to see a VM an earlier list missed, so 24h is long enough for that
-// retry and short enough that a no-POST row cannot sit pending forever.
-// It is the existing documented bound, not a measured listing lag. Tests
-// set the variable. An empty sweep inside the same call does not use it.
-var cloudLaunchMaxAge = 24 * time.Hour
-
-func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorcloud.Client, daemonID string, row storage.CloudLaunch) error {
+func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorcloud.Client, daemonID string, row storage.CloudLaunch, globalCfg *config.Config) error {
+	cleanDelay := config.ResolveCloudLaunchCleanDelay(row.RepoPath, globalCfg)
 	if row.AgentID != "" {
 		log.Printf("cursor-cloud: stop interrupted agent %s for job %d", row.AgentID, row.JobID)
 		if err := agent.StopAndDeleteCursorCloudAgent(client, row.AgentID); err != nil {
@@ -79,7 +75,7 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		// No marker can name a VM. One empty list deletes nothing, so it
 		// does not clean. The orphan note is written now, and again after
 		// the documented age even if a later start sees other agents.
-		return reportCloudLaunchOrphan(db, row)
+		return reportCloudLaunchOrphan(db, row, cleanDelay)
 	}
 	repoURL := row.RepoIdentity
 	if !agent.CursorCloudRepoUsable(repoURL) {
@@ -91,18 +87,19 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		// A saved-id or token-only miss is noted once the launch is aged out.
 		found, err := agent.DeleteCursorCloudLaunchByToken(ctx, client, daemonID, row.Token)
 		if err != nil {
-			return err
+			// The sweep did not confirm a delete. Note that before returning.
+			return errors.Join(err, noteUnconfirmedCloudDelete(db, row))
 		}
 		now := agent.CursorCloudNow()
 		since, _ := parseCloudLaunchCreated(row.CreatedAt)
 		// This call is the sweep. It is not a later empty sweep, so the gate
 		// does not clean. A miss is noted. A saved-id or token-only row is
 		// noted once it is aged out, including when the list was non-empty.
-		if agent.SweepAllowsClean(found, row.AgentID != "", false, since, now, cloudLaunchMaxAge) {
+		if agent.SweepAllowsClean(found, row.AgentID != "", false, since, now, cleanDelay) {
 			return db.MarkCloudLaunchCleanedByToken(row.Token)
 		}
-		if !found || cloudLaunchAgedOut(row.CreatedAt, now) {
-			return reportCloudLaunchOrphan(db, row)
+		if !found || cloudLaunchAgedOut(row.CreatedAt, now, cleanDelay) {
+			return reportCloudLaunchOrphan(db, row, cleanDelay)
 		}
 		return nil
 	}
@@ -112,17 +109,17 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	}
 	// This restart is its own call. It cleans only when the sweep deleted
 	// nothing, the saved id was already removed by id, and the launch is
-	// at least cloudLaunchMaxAge old. One list, or a list that deleted a
+	// at least cloud_launch_clean_delay_hours old. One list, or a list that deleted a
 	// VM, leaves the row uncleaned with the orphan note.
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
-	if agent.SweepAllowsClean(found, row.AgentID != "", true, since, now, cloudLaunchMaxAge) {
+	if agent.SweepAllowsClean(found, row.AgentID != "", true, since, now, cleanDelay) {
 		return db.MarkCloudLaunchCleanedByToken(row.Token)
 	}
-	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now) {
+	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now, cleanDelay) {
 		// Aged out with or without listed agents. The note is not limited
 		// to an empty list.
-		return reportCloudLaunchOrphan(db, row)
+		return reportCloudLaunchOrphan(db, row, cleanDelay)
 	}
 	if err := db.NoteCloudLaunchRisk(row.JobID, agent.CursorCloudPendingOrphanNote()); err != nil {
 		return err
@@ -131,6 +128,10 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		return nil
 	}
 	return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
+}
+
+func noteUnconfirmedCloudDelete(db *storage.DB, row storage.CloudLaunch) error {
+	return db.NoteCloudLaunchRisk(row.JobID, agent.CursorCloudPendingOrphanNote())
 }
 
 func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
@@ -143,16 +144,16 @@ func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
 	return created, true
 }
 
-func cloudLaunchAgedOut(createdAt string, now time.Time) bool {
+func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bool {
 	created, ok := parseCloudLaunchCreated(createdAt)
 	if !ok {
 		return false
 	}
-	return !created.Add(cloudLaunchMaxAge).After(now)
+	return !created.Add(delay).After(now)
 }
 
-func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch) error {
-	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within %s", row.JobID, row.ID, cloudLaunchMaxAge)
+func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch, delay time.Duration) error {
+	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within %s", row.JobID, row.ID, delay)
 	log.Print(msg)
 	return db.NoteCloudLaunchRisk(row.JobID, msg)
 }

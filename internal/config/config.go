@@ -254,6 +254,7 @@ type Config struct {
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
 	JobTimeoutMinutes          int                             `toml:"job_timeout_minutes"`
+	CloudLaunchCleanDelayHours int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later empty restart sweep may clean a cursor-cloud launch. 0 uses 24. Until then the row stays uncleaned and the job keeps the orphan note."`
 	IsolateReviews             bool                            `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts."`
 	HookTimeoutSeconds         int                             `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
 	AgentQuotaCooldown         string                          `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
@@ -787,6 +788,7 @@ type RepoConfig struct {
 	ReviewMDFallback                *bool                           `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
 	ReviewGuidelinesSupersedeGlobal bool                            `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
 	JobTimeoutMinutes               int                             `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
+	CloudLaunchCleanDelayHours      int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later empty restart sweep may clean a cursor-cloud launch in this repo. 0 inherits the global value, then 24."`
 	IsolateReviews                  *bool                           `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts for this repo."`
 	HookTimeoutSeconds              int                             `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
 	ExcludedBranches                []string                        `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
@@ -1019,24 +1021,30 @@ unclear, leave it open and ask the user for direction. Then continue the task th
 	// handler's sequential git calls can exceed the non-Windows budget before
 	// it can reply. The default is raised 10x to absorb that overhead. See #916.
 	DefaultHookTimeoutWindows = 30 * time.Second
+	// DefaultCloudLaunchCleanDelayHours is how long a cursor-cloud launch
+	// stays uncleaned before a later, separate empty restart sweep may
+	// mark it cleaned. 24h is the existing bound: a same-day restart can
+	// still see a VM an earlier list missed. It is not a measured listing lag.
+	DefaultCloudLaunchCleanDelayHours = 24
 )
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	cfg := &Config{
-		ServerAddr:         "127.0.0.1:7373",
-		MaxWorkers:         4,
-		ReviewContextCount: 3,
-		DefaultAgent:       "codex",
-		JobTimeoutMinutes:  30,
-		AgentQuotaCooldown: DefaultAgentQuotaCooldown.String(),
-		CodexCmd:           "codex",
-		ClaudeCodeCmd:      "claude",
-		CursorCmd:          "agent",
-		PiCmd:              "pi",
-		OpenCodeCmd:        "opencode",
-		GrokCmd:            "grok",
-		MouseEnabled:       true,
+		ServerAddr:                 "127.0.0.1:7373",
+		MaxWorkers:                 4,
+		ReviewContextCount:         3,
+		DefaultAgent:               "codex",
+		JobTimeoutMinutes:          30,
+		CloudLaunchCleanDelayHours: DefaultCloudLaunchCleanDelayHours,
+		AgentQuotaCooldown:         DefaultAgentQuotaCooldown.String(),
+		CodexCmd:                   "codex",
+		ClaudeCodeCmd:              "claude",
+		CursorCmd:                  "agent",
+		PiCmd:                      "pi",
+		OpenCodeCmd:                "opencode",
+		GrokCmd:                    "grok",
+		MouseEnabled:               true,
 		Cost: CostConfig{
 			Timeout: "10s",
 		},
@@ -1812,6 +1820,23 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 		globalVal = clampPositive(globalCfg.JobTimeoutMinutes)
 	}
 	return resolve(30, repoVal, globalVal)
+}
+
+// ResolveCloudLaunchCleanDelay is the minimum age of a cursor-cloud launch
+// before a later independent empty restart sweep may mark it cleaned.
+// Priority: per-repo cloud_launch_clean_delay_hours, then global, then
+// DefaultCloudLaunchCleanDelayHours. Zero or negative values are ignored.
+func ResolveCloudLaunchCleanDelay(repoPath string, globalCfg *Config) time.Duration {
+	var repoVal int
+	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
+		repoVal = clampPositive(repoCfg.CloudLaunchCleanDelayHours)
+	}
+	var globalVal int
+	if globalCfg != nil {
+		globalVal = clampPositive(globalCfg.CloudLaunchCleanDelayHours)
+	}
+	hours := resolve(DefaultCloudLaunchCleanDelayHours, repoVal, globalVal)
+	return time.Duration(hours) * time.Hour
 }
 
 // DefaultHookTimeoutForOS returns the platform default post-commit hook

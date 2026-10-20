@@ -653,6 +653,15 @@ func TestResolveJobTimeout(t *testing.T) {
 	}
 }
 
+func TestResolveCloudLaunchCleanDelay(t *testing.T) {
+	tmpDir := newTempRepo(t, "")
+	assert.Equal(t, 24*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, nil))
+	assert.Equal(t, 24*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, &Config{}))
+	assert.Equal(t, 12*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, &Config{CloudLaunchCleanDelayHours: 12}))
+	repoDir := newTempRepo(t, "cloud_launch_clean_delay_hours = 6\n")
+	assert.Equal(t, 6*time.Hour, ResolveCloudLaunchCleanDelay(repoDir, &Config{CloudLaunchCleanDelayHours: 12}))
+}
+
 func TestResolveAgentQuotaCooldown(t *testing.T) {
 	tests := []struct {
 		name         string

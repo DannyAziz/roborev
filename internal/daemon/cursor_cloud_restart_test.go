@@ -265,8 +265,8 @@ func TestCursorCloudRestartKeepsTokenAcrossTwoLags(t *testing.T) {
 }
 
 // TestCursorCloudRestartReportsUnlistedOrphan ages a token-only miss past
-// the sweep window. The row stays uncleaned and the job error and log name
-// the orphan risk. A young miss does not.
+// the sweep window. The row stays uncleaned. A young miss already writes the
+// orphan warning on the job; the age-out line is what the log adds later.
 func TestCursorCloudRestartReportsUnlistedOrphan(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -279,6 +279,9 @@ func TestCursorCloudRestartReportsUnlistedOrphan(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 	assert.NotContains(t, logs.String(), "orphan risk")
+	var young string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&young))
+	assert.Contains(t, young, "orphan risk")
 
 	cursorCloudAgeLaunch(t, tc.DB, job.ID)
 	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
@@ -895,7 +898,7 @@ func TestCursorCloudRecoveryCleansLaunchAfterJobDelete(t *testing.T) {
 	_, err = conn.ExecContext(t.Context(), `DELETE FROM review_jobs WHERE id = ?`, job.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake))
+	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil))
 
 	_, err = fake.GetAgent(t.Context(), created.ID)
 	require.Error(t, err)
@@ -940,7 +943,7 @@ func TestEmptyTokenUpgradeStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
 		VALUES (?, '', '', ?, ?, 0)`, job.ID, cursorCloudRestartRepo, storage.CloudLaunchPendingNote)
 	require.NoError(t, err)
 
-	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake))
+	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil))
 
 	var cleaned int
 	var note string
@@ -1099,6 +1102,68 @@ func TestCursorCloudRestartNotesUnusableMiss(t *testing.T) {
 // launch is aged out the orphan note is written. Dropping that note because
 // the saved id was deleted, which is what the old unusable-repo branch did,
 // fails this test.
+func TestUnconfirmedDeleteNoteMatrix(t *testing.T) {
+	for _, savedID := range []bool{false, true} {
+		for _, usable := range []bool{false, true} {
+			for _, noted := range []bool{false, true} {
+				name := "no-id"
+				if savedID {
+					name = "saved-id"
+				}
+				if usable {
+					name += "/usable"
+				} else {
+					name += "/unusable"
+				}
+				if noted {
+					name += "/note-set"
+				} else {
+					name += "/note-empty"
+				}
+				t.Run(name, func(t *testing.T) {
+					tc, fake := cursorCloudRestartFixture(t)
+					sha := testutil.GetHeadSHA(t, tc.TmpDir)
+					job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+					const token = "launch-token-unconfirmed"
+					cursorCloudBeginToken(t, tc, job.ID, token)
+					if savedID {
+						require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, "bc_unconfirmed"))
+						fake.MethodErrors = map[string]error{
+							cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+								Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
+							},
+						}
+					}
+					if !usable {
+						_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ? WHERE job_id = ?`, "file:///", job.ID)
+						require.NoError(t, err)
+						tc.GitRepo.Run("remote", "remove", "origin")
+					}
+					if !noted {
+						_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET orphan_note = '' WHERE job_id = ?`, job.ID)
+						require.NoError(t, err)
+					}
+
+					_ = recoverStaleJobs(context.Background(), tc.DB, fake)
+					n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+					require.NoError(t, err)
+					assert.Equal(t, 1, n)
+					var jobErr string
+					require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+					assert.Contains(t, jobErr, "orphan risk")
+					var rowNote string
+					require.NoError(t, tc.DB.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&rowNote))
+					if noted {
+						assert.Contains(t, rowNote, "orphan risk")
+					} else {
+						assert.Empty(t, rowNote)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)

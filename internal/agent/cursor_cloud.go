@@ -75,11 +75,9 @@ func CursorCloudPendingOrphanNote() string { return cursorCloudPendingOrphanNote
 // byIDDeleted means every VM found so far was removed by id.
 // independent means this sweep is a later call (a new restart or a separate
 // reconcile), not a retry or a second list inside the same call.
-// minDelay is the documented minimum age of the launch. The daemon passes
-// cloudLaunchMaxAge (24h): a same-day restart still has to be able to see a
-// VM an earlier list missed, so an empty sweep before that age does not
-// clean. That duration is the existing documented bound, not a measured
-// listing lag, and tests can set the variable.
+// minDelay is config cloud_launch_clean_delay_hours, default 24. A same-day
+// restart still has to be able to see a VM an earlier list missed, so an
+// empty sweep before that age does not clean. It is not a measured listing lag.
 func SweepAllowsClean(found, byIDDeleted, independent bool, since, now time.Time, minDelay time.Duration) bool {
 	if found || !byIDDeleted || !independent || minDelay <= 0 || since.IsZero() {
 		return false
