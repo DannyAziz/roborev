@@ -1334,6 +1334,71 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 	))
 }
 
+func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
+	const repo = "https://github.com/acme/widgets.git"
+	const token = "slow-list-token"
+	client := &slowListCloud{
+		delay: 600 * time.Millisecond,
+		text:  "review\n" + cursorCloudLaunchMarker + token + "\n",
+	}
+	err := reconcileCursorCloudLaunch(client, repo, token, nil)
+	require.NoError(t, err)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	assert.Equal(t, []string{"stop", "delete"}, client.ops)
+}
+
+type slowListCloud struct {
+	mu    sync.Mutex
+	ops   []string
+	delay time.Duration
+	text  string
+}
+
+func (c *slowListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, errors.New("unused")
+}
+
+func (c *slowListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *slowListCloud) FinalMessage(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (c *slowListCloud) UserPrompt(context.Context, string) (string, error) {
+	return c.text, nil
+}
+
+func (c *slowListCloud) StopAgent(context.Context, string) error {
+	c.mu.Lock()
+	c.ops = append(c.ops, "stop")
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *slowListCloud) DeleteAgent(context.Context, string) error {
+	c.mu.Lock()
+	c.ops = append(c.ops, "delete")
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *slowListCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	timer := time.NewTimer(c.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+	return []cursorcloud.Agent{{
+		ID:               "bc_orphan",
+		SourceRepository: "https://github.com/acme/widgets.git",
+	}}, nil
+}
+
 type fakeCloud struct {
 	mu        sync.Mutex
 	created   cursorcloud.CreateAgentRequest

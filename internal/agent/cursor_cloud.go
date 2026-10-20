@@ -37,18 +37,24 @@ const (
 	cursorCloudDeleteAttempts = 3
 	// cursorCloudDeleteBackoff is the pause between transient DELETE attempts.
 	cursorCloudDeleteBackoff = 100 * time.Millisecond
-	// cursorCloudReconcileWindow is how long a lost create is re-listed.
-	// A server can publish the agent after the HTTP client has already given
-	// up: the pin is a 300ms create against a 50ms client timeout. One
-	// immediate list then leaves stops=0 and deletes=0. This window is longer
-	// than that client timeout and longer than the 300ms publish lag.
-	cursorCloudReconcileWindow = 500 * time.Millisecond
+	// cursorCloudReconcileWindow is how long a lost create keeps starting
+	// another list. It does not cancel a list or conversation call that
+	// has already started; those use cursorCloudDeleteTimeout.
+	//
+	// The window is 60s, the bound reconcile used before it was shortened.
+	// 500ms was only longer than this package's test fixture (a 300ms
+	// handler sleep against a 50ms client timeout) and is not a measured
+	// publish lag.
+	cursorCloudReconcileWindow = 60 * time.Second
 	// cursorCloudReconcileBackoff is the pause between those lists.
 	cursorCloudReconcileBackoff = 50 * time.Millisecond
 )
 
-// cursorCloudDeleteTimeout bounds one stop or one DELETE. Each call gets its
-// own context so a stop that never answers cannot cancel the deletes.
+// cursorCloudDeleteTimeout bounds one stop, one DELETE, one reconcile list,
+// or one reconcile conversation read. Each call gets its own context. The
+// reconcile window must not cancel an in-flight call, and a stop that never
+// answers must not cancel the deletes. 60s matches the cursorcloud client's
+// defaultRequestTimeout, its one deadline for a metadata call.
 var cursorCloudDeleteTimeout = 60 * time.Second
 
 const (
@@ -453,15 +459,25 @@ func cursorCloudStopQuiet(err error) bool {
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents
 // https://cursor.com/docs/cloud-agent/api/v0#agent-conversation
 func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string, output io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cursorCloudReconcileWindow)
-	defer cancel()
+	// started gates the next list only. list and UserPrompt each get
+	// cursorCloudDeleteTimeout, so a slow page cannot be cancelled by
+	// this window.
+	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
-	for {
-		agents, err := client.ListAgents(ctx)
+	for attempt := 0; ; attempt++ {
+		// The first list always starts. Later lists start only while the
+		// window is still open, and the check does not cancel the list
+		// already running.
+		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
+			break
+		}
+		listCtx, listCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+		agents, err := client.ListAgents(listCtx)
+		listCancel()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
-		} else if found, matchErr := deleteMatchingCursorCloudLaunch(ctx, client, agents, repoURL, marker, output); found || matchErr != nil {
+		} else if found, matchErr := deleteMatchingCursorCloudLaunch(client, agents, repoURL, marker, output); found || matchErr != nil {
 			if matchErr != nil {
 				errs = append(errs, matchErr)
 			}
@@ -469,21 +485,23 @@ func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string
 				break
 			}
 		}
-		if waitCursorCloud(ctx, cursorCloudReconcileBackoff) != nil {
+		if waitCursorCloud(context.Background(), cursorCloudReconcileBackoff) != nil {
 			break
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
+func deleteMatchingCursorCloudLaunch(client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
 	var errs []error
 	found := false
 	for _, ag := range agents {
 		if !sameCursorCloudRepo(repoURL, ag.SourceRepository) {
 			continue
 		}
-		text, promptErr := client.UserPrompt(ctx, ag.ID)
+		promptCtx, promptCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+		text, promptErr := client.UserPrompt(promptCtx, ag.ID)
+		promptCancel()
 		if promptErr != nil {
 			errs = append(errs, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, promptErr))
 			continue
