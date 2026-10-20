@@ -41,6 +41,26 @@ func TestErrorBodyIsTruncated(t *testing.T) {
 	assert.NotContains(t, apiErr.Message, "k")
 }
 
+func TestErrorBodyRedactsSecretStraddlingTruncation(t *testing.T) {
+	const partial = "xxSECRETKEY-"
+	key := partial + "TAILVALUE"
+	body := strings.Repeat("x", maxErrorMessageBytes-len(partial)) + key
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewHTTPClient(key, WithBaseURL(srv.URL))
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.NotContains(t, apiErr.Message, partial)
+	assert.NotContains(t, apiErr.Message, key)
+	assert.NotContains(t, err.Error(), partial)
+	assert.Contains(t, apiErr.Message, "[REDACTED]")
+	assert.LessOrEqual(t, len(apiErr.Message), maxErrorMessageBytes)
+}
+
 func TestHTTPBodyStallAfterHeadersTimesOut(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const bodyLimit = 30 * time.Second

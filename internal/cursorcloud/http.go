@@ -494,14 +494,18 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	if !ok {
 		message = string(data)
 	}
+	// Redact the full error text before the 64 KiB cap. Truncating first
+	// keeps the prefix of a secret that straddles the cut.
+	code = c.redact(strings.TrimSpace(code))
+	message = c.redact(message)
 	if len(message) > maxErrorMessageBytes {
 		message = message[:maxErrorMessageBytes]
 	}
 	return &APIError{
 		Op:         op,
 		StatusCode: status,
-		Code:       c.redact(strings.TrimSpace(code)),
-		Message:    c.redact(strings.TrimSpace(message)),
+		Code:       code,
+		Message:    strings.TrimSpace(message),
 	}
 }
 
