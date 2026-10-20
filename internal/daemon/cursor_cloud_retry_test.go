@@ -318,6 +318,43 @@ func TestProcessJobCursorCloudMalformedJSONDoesNotRelaunch(t *testing.T) {
 	assert.NotEqual(t, agent.CursorCloudHost, stored.Agent)
 }
 
+// A finished synthesis whose assistant text is not JSON must not launch again.
+// decodeSynthesisResult marks that decode error sent, so RetryJob does not
+// POST a second agent.
+func TestProcessSynthesisCursorCloudMalformedJSONDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	const repo = "https://example.com/acme/repo.git"
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: `{"schema_version":2,`}
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
+	t.Cleanup(func() { agent.Register(prev) })
+
+	wtc := newWorkerTestContext(t, 1)
+	wtc.Pool.retryBackoff = 0
+	wtc.GitRepo.Run("remote", "add", "origin", repo)
+	synth := claimSynthesis(t, wtc, "synth-malformed-json", agent.CursorCloudHost, "test")
+	originalID := synth.ID
+
+	for range maxRetries + 2 {
+		if synth.Agent != agent.CursorCloudHost {
+			break
+		}
+		wtc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+		next, claimErr := wtc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, claimErr)
+		if next == nil {
+			break
+		}
+		synth = next
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
+	stored, err := wtc.DB.GetJobByID(originalID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, stored.RetryCount)
+	assert.NotEqual(t, agent.CursorCloudHost, stored.Agent)
+}
+
 // A no-verdict cloud review keeps the no-verdict prefix and output, and a
 // restart does not launch another VM. The backup is cursor-cloud so a
 // result that is not marked sent failsover into another CreateAgent.

@@ -112,7 +112,7 @@ func decodeSynthesisResult(a agent.Agent, reviews []ReviewResult, raw jsontext.V
 	}
 	doc, err := DecodeSynthesisDocument(raw, reviews)
 	if err != nil {
-		return SynthesisDocument{}, err
+		return SynthesisDocument{}, sentCloudLaunch(a, err)
 	}
 	if err := validateLiveDocument(a.Name(), doc); err != nil {
 		return SynthesisDocument{}, err
