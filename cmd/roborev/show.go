@@ -265,6 +265,9 @@ Examples:
 					fmt.Println(formatReviewersSummary(members))
 				}
 			}
+			if line := storage.FormatLaunchOrphanWarning(review.Job); line != "" {
+				fmt.Println(line)
+			}
 			fmt.Println(strings.Repeat("-", 60))
 			if showPrompt {
 				fmt.Println(review.Prompt)

@@ -249,6 +249,63 @@ func TestEnqueueSkippedBranch(t *testing.T) {
 	})
 }
 
+func TestReviewWaitPrintsLaunchOrphanWarning(t *testing.T) {
+	setupFastPolling(t)
+	note := storage.CloudLaunchPendingNote
+	cases := []struct {
+		name    string
+		status  storage.JobStatus
+		quiet   bool
+		wantErr bool
+	}{
+		{name: "done", status: storage.JobStatusDone},
+		{name: "done quiet", status: storage.JobStatusDone, quiet: true},
+		{name: "failed", status: storage.JobStatusFailed, wantErr: true},
+		{name: "canceled", status: storage.JobStatusCanceled, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, mux := setupTestEnvironment(t)
+			repo.CommitFile("file.txt", "content", "initial commit")
+			mockEnqueueQueued(mux, "abc123")
+			mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+				respondJSON(w, http.StatusOK, map[string]any{
+					"jobs": []storage.ReviewJob{{
+						ID: 1, GitRef: "abc123", Agent: "cursor-cloud",
+						Status: tc.status, Error: "agent crashed", OrphanWarning: note,
+					}},
+					"has_more": false,
+				})
+			})
+			mux.HandleFunc("/api/review", func(w http.ResponseWriter, r *http.Request) {
+				respondJSON(w, http.StatusOK, storage.Review{
+					ID: 1, JobID: 1, Agent: "cursor-cloud", Output: "No issues found.",
+					VerdictBool: testutil.ReviewFixtureVerdict("No issues found."),
+					Job: &storage.ReviewJob{
+						ID: 1, Agent: "cursor-cloud", OrphanWarning: note,
+					},
+				})
+			})
+
+			args := []string{"--repo", repo.Dir, "--wait"}
+			if tc.quiet {
+				args = append(args, "--quiet")
+			}
+			stdout, stderr, err := executeReviewCmd(args...)
+			text := stdout + "\n" + stderr
+			if err != nil {
+				text += "\n" + err.Error()
+			}
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Contains(t, text, "Warning: "+note)
+		})
+	}
+}
+
 func TestWaitQuietVerdictExitCode(t *testing.T) {
 	setupFastPolling(t)
 

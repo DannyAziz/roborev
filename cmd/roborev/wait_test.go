@@ -251,6 +251,57 @@ func TestWait_Scenarios(t *testing.T) {
 	}
 }
 
+func TestWaitPrintsLaunchOrphanWarning(t *testing.T) {
+	setupFastPolling(t)
+	note := storage.CloudLaunchPendingNote
+	cases := []struct {
+		name    string
+		status  storage.JobStatus
+		quiet   bool
+		wantErr bool
+	}{
+		{name: "done", status: storage.JobStatusDone},
+		{name: "done quiet", status: storage.JobStatusDone, quiet: true},
+		{name: "failed", status: storage.JobStatusFailed, wantErr: true},
+		{name: "canceled", status: storage.JobStatusCanceled, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := storage.ReviewJob{
+				ID: 1, Agent: "cursor-cloud", Status: tc.status,
+				Error: "agent crashed", OrphanWarning: note,
+			}
+			review := &storage.Review{
+				VerdictBool: testutil.ReviewFixtureVerdict("No issues found."),
+				ID:          1, JobID: 1, Agent: "cursor-cloud", Output: "No issues found.",
+				Job: &storage.ReviewJob{
+					ID: 1, Agent: "cursor-cloud", OrphanWarning: note,
+				},
+			}
+			newWaitEnv(t, newWaitMockHandler(mockConfig{
+				Jobs:   []storage.ReviewJob{job},
+				Review: review,
+			}))
+			args := []string{"--job", "1"}
+			if tc.quiet {
+				args = append(args, "--quiet")
+			}
+			stdout, err := runWait(t, args...)
+			text := stdout
+			if err != nil {
+				text += "\n" + err.Error()
+			}
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Contains(t, text, "Warning: "+note)
+			assert.NotContains(t, job.Error, note)
+		})
+	}
+}
+
 func TestWaitJobIDPollingNon200Response(t *testing.T) {
 	setupFastPolling(t)
 	newWaitEnv(t, newWaitMockHandler(mockConfig{

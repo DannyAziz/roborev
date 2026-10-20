@@ -292,6 +292,18 @@ func (db *DB) LaunchOrphanWarning(jobID int64) (string, error) {
 	return strings.Join(notes, " "), rows.Err()
 }
 
+// FormatLaunchOrphanWarning is the line readers print for an uncleaned launch note.
+func FormatLaunchOrphanWarning(job *ReviewJob) string {
+	if job == nil {
+		return ""
+	}
+	warning := strings.TrimSpace(job.OrphanWarning)
+	if warning == "" {
+		return ""
+	}
+	return "Warning: " + warning
+}
+
 // ApplyLaunchOrphanWarning copies the launch note onto the API job status.
 func ApplyLaunchOrphanWarning(job *ReviewJob, warning string) {
 	warning = strings.TrimSpace(warning)
