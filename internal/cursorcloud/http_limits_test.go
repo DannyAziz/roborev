@@ -2,6 +2,7 @@ package cursorcloud
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,24 @@ func TestErrorBodyRedactsSecretStraddlingTruncation(t *testing.T) {
 	assert.NotContains(t, err.Error(), partial)
 	assert.Contains(t, apiErr.Message, "[REDACTED]")
 	assert.LessOrEqual(t, len(apiErr.Message), maxErrorMessageBytes)
+}
+
+func TestErrorBodyRedactsKeyInCode(t *testing.T) {
+	const key = "code-field-secret-key"
+	body := `{"code":"` + key + `","message":"plain"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewHTTPClient(key, WithBaseURL(srv.URL))
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "[REDACTED]", apiErr.Code)
+	assert.NotContains(t, apiErr.Code, key)
+	assert.NotContains(t, apiErr.Message, key)
+	assert.NotContains(t, err.Error(), key)
 }
 
 func TestHTTPBodyStallAfterHeadersTimesOut(t *testing.T) {
@@ -178,6 +197,7 @@ func requireBodyDeadline(t *testing.T, errc <-chan error) {
 	case err = <-errc:
 	default:
 	}
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.ErrorContains(t, err, "response body deadline exceeded")
 }
 
@@ -222,6 +242,35 @@ func clientWithStallBody(body io.ReadCloser, requestLimit, bodyLimit time.Durati
 	return client
 }
 
+func TestReadResponseBodyLimitReaderStopsAtMaxResponseBytes(t *testing.T) {
+	client := NewHTTPClient("k").(*httpClient)
+
+	exact := &byteReader{remaining: maxResponseBytes}
+	data, err := client.readResponseBody(context.Background(), io.NopCloser(exact))
+	require.NoError(t, err)
+	assert.Len(t, data, maxResponseBytes)
+	assert.Zero(t, exact.remaining)
+	assert.Equal(t, maxResponseBytes, exact.read)
+
+	onePast := &byteReader{remaining: maxResponseBytes + 1}
+	_, err = client.readResponseBody(context.Background(), io.NopCloser(onePast))
+	require.ErrorContains(t, err, "response body exceeds 8 MiB")
+	assert.Equal(t, maxResponseBytes+1, onePast.read)
+
+	over := &byteReader{remaining: maxResponseBytes + 64}
+	_, err = client.readResponseBody(context.Background(), io.NopCloser(over))
+	require.ErrorContains(t, err, "response body exceeds 8 MiB")
+	assert.Equal(t, maxResponseBytes+1, over.read)
+}
+
+func TestReadResponseBodyBoundsEndlessBody(t *testing.T) {
+	client := NewHTTPClient("k").(*httpClient)
+	body := &endlessReader{}
+	_, err := client.readResponseBody(context.Background(), io.NopCloser(body))
+	require.ErrorContains(t, err, "response body exceeds 8 MiB")
+	assert.Equal(t, maxResponseBytes+1, body.read)
+}
+
 func TestHTTPOversizedBodyErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(w, io.LimitReader(repeatByte('x'), maxResponseBytes+1))
@@ -230,6 +279,49 @@ func TestHTTPOversizedBodyErrors(t *testing.T) {
 	client := NewHTTPClient("k", WithBaseURL(srv.URL))
 	_, err := client.GetAgent(context.Background(), "bc_1")
 	require.ErrorContains(t, err, "response body exceeds")
+}
+
+// endlessReader never reports EOF. readResponseBody must stop it with
+// LimitReader(maxResponseBytes+1). The guard above twice that cap keeps a
+// missing limit from blocking the test; the assertion still requires the
+// production read to stop at maxResponseBytes+1.
+type endlessReader struct {
+	read int
+}
+
+func (r *endlessReader) Read(p []byte) (int, error) {
+	if r.read > 2*maxResponseBytes {
+		return 0, errors.New("endless body was not capped")
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.read += len(p)
+	return len(p), nil
+}
+
+// byteReader supplies remaining bytes and records how many were read.
+// readResponseBody wraps it in LimitReader(maxResponseBytes+1), so an
+// oversized body stops at that limit instead of draining remaining.
+type byteReader struct {
+	remaining int
+	read      int
+}
+
+func (b *byteReader) Read(p []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), b.remaining)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.remaining -= n
+	b.read += n
+	return n, nil
 }
 
 type repeatByte byte

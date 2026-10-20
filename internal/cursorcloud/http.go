@@ -49,6 +49,10 @@ const defaultResponseHeaderTimeout = 60 * time.Second
 // ResponseHeaderTimeout does not cover that read. The request deadline
 // already includes the read; this limit can be shorter and is what
 // reports a stalled body. It does not extend the request deadline.
+//
+// With the defaults, the header timer and the body timer are unreachable.
+// Both equal defaultRequestTimeout, and the request deadline starts
+// before either of them and is never longer, so it is the one that fires.
 const defaultResponseBodyTimeout = 60 * time.Second
 
 // maxResponseBytes bounds one response body. 8 MiB covers a long review
@@ -66,9 +70,18 @@ func (requestDeadlineError) Unwrap() error { return context.DeadlineExceeded }
 
 var errRequestDeadline error = requestDeadlineError{}
 
-// errResponseBodyDeadline is returned when the body does not arrive
-// before the body limit or the request deadline.
-var errResponseBodyDeadline = errors.New("cursor cloud: response body deadline exceeded")
+// responseBodyDeadlineError is returned when the body does not arrive
+// before the body limit or the request deadline. Unwrap keeps it a
+// context.DeadlineExceeded for errors.Is, same as requestDeadlineError.
+type responseBodyDeadlineError struct{}
+
+func (responseBodyDeadlineError) Error() string {
+	return "cursor cloud: response body deadline exceeded"
+}
+
+func (responseBodyDeadlineError) Unwrap() error { return context.DeadlineExceeded }
+
+var errResponseBodyDeadline error = responseBodyDeadlineError{}
 
 // maxErrorMessageBytes matches the 64 KiB error-body cap used for other
 // daemon HTTP errors (internal/mcpserver maxErrorBodyBytes). A non-2xx body
@@ -136,7 +149,9 @@ func NewHTTPClient(apiKey string, opts ...Option) Client {
 }
 
 // WithHTTPClient uses hc for calls. A nil client is ignored. The caller's
-// timeout and transport are left as set.
+// timeout and transport are left as set. Each call is still capped at
+// 60s (defaultRequestTimeout): the context passed to RoundTrip is
+// canceled when that deadline expires, including when hc has no timeout.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *httpClient) {
 		if hc != nil {
@@ -492,7 +507,10 @@ func (c *httpClient) readResponseBody(ctx context.Context, body io.ReadCloser) (
 	}
 	// Buffer one result so the reader can finish after this function
 	// returns. Waiting here would pin the caller when Close does not
-	// unblock Read.
+	// unblock Read. A RoundTripper that ignores the request context,
+	// and Body.Close, are the caller's responsibility. Callers who
+	// inject a custom body must make Close unblock Read, or the reader
+	// goroutine leaks.
 	done := make(chan readResult, 1)
 	go func() {
 		data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
@@ -546,8 +564,8 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	if !ok {
 		message = string(data)
 	}
-	// Redact the full error text before the 64 KiB cap. Truncating first
-	// keeps the prefix of a secret that straddles the cut.
+	// Redact the full error text, Code and Message, before the 64 KiB cap.
+	// Truncating first keeps the prefix of a secret that straddles the cut.
 	code = c.redact(strings.TrimSpace(code))
 	message = c.redact(message)
 	if len(message) > maxErrorMessageBytes {
