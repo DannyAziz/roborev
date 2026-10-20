@@ -143,3 +143,38 @@ func runBackupFail(t *testing.T, db *DB, job *ReviewJob) {
 	require.NoError(t, err)
 	require.True(t, ok)
 }
+
+// TestClassifyRewriteKeepsOrphanNote is the auto-design classify pin. A
+// classify attempt that launched cursor-cloud leaves an uncleaned launch
+// and an orphan note on the job error. Promoting it to a design review, or
+// marking it skipped with an error detail, rewrites that error in place.
+// Writing NULL or the detail over the note drops the warning from the job.
+func TestClassifyRewriteKeepsOrphanNote(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, db *DB, jobID int64)
+	}{
+		{name: "promote", run: func(t *testing.T, db *DB, jobID int64) {
+			require.NoError(t, db.PromoteClassifyToDesignReview(jobID, "w1", "claude-code", ""))
+		}},
+		{name: "skip", run: func(t *testing.T, db *DB, jobID int64) {
+			require.NoError(t, db.MarkClassifyAsSkippedDesign(jobID, "w1", "classifier failed", "classifier: timeout"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db := openTestDB(t)
+			t.Cleanup(func() { db.Close() })
+			jobID := seedRunningClassify(t, db, t.TempDir(), "abc", "w1")
+			_, err := db.Exec(`INSERT INTO review_job_cloud_launches
+				(job_id, launch_token, orphan_note) VALUES (?, ?, ?)`, jobID, fmt.Sprintf("classify-tok-%d", jobID), keepOrphanNote)
+			require.NoError(t, err)
+			require.NoError(t, db.NoteCloudLaunchRisk(jobID, keepOrphanNote))
+
+			tc.run(t, db, jobID)
+			assert.Contains(t, storedJobError(t, db, jobID), keepOrphanNote)
+			assert.Equal(t, keepOrphanNote, storedLaunchNote(t, db, jobID))
+		})
+	}
+}
