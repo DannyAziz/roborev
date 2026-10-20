@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"go.kenn.io/roborev/internal/config"
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
@@ -734,6 +736,9 @@ func (p *PgPool) RegisterMachine(ctx context.Context, machineID uuid.UUID, name 
 
 // GetOrCreateRepo finds or creates a repo by identity, returns the PostgreSQL ID
 func (p *PgPool) GetOrCreateRepo(ctx context.Context, identity string) (int64, error) {
+	if id, ok, err := p.adoptCanonicalRepoIdentity(ctx, identity); err != nil || ok {
+		return id, err
+	}
 	var id int64
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO repos (identity)
@@ -745,6 +750,35 @@ func (p *PgPool) GetOrCreateRepo(ctx context.Context, identity string) (int64, e
 		return 0, fmt.Errorf("get or create repo: %w", err)
 	}
 	return id, nil
+}
+
+// adoptCanonicalRepoIdentity rewrites one stack-built canonical row to the
+// stored form when RemoteIdentity says they are the same remote. An exact
+// row is returned unchanged.
+func (p *PgPool) adoptCanonicalRepoIdentity(ctx context.Context, identity string) (int64, bool, error) {
+	var id int64
+	err := p.pool.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, identity).Scan(&id)
+	if err == nil {
+		return id, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, fmt.Errorf("lookup repo identity: %w", err)
+	}
+	canonical := config.RemoteIdentity(identity)
+	if canonical == "" || canonical == identity {
+		return 0, false, nil
+	}
+	err = p.pool.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup canonical repo identity: %w", err)
+	}
+	if _, err := p.pool.Exec(ctx, `UPDATE repos SET identity = $1 WHERE id = $2 AND identity = $3`, identity, id, canonical); err != nil {
+		return 0, false, fmt.Errorf("rewrite canonical repo identity: %w", err)
+	}
+	return id, true, nil
 }
 
 // GetOrCreateCommit finds or creates a commit, returns the PostgreSQL ID

@@ -59,7 +59,7 @@ func resolveTrackedRepo(
 		return agenthook.TrackedRepoResolution{}, fmt.Errorf("lookup repo: %w", err)
 	}
 	if repo.Identity != "" &&
-		config.ResolveRepoIdentity(lookupPath, nil) != repo.Identity {
+		!config.SameRepoIdentity(repo.Identity, config.ResolveRepoIdentity(lookupPath, nil)) {
 		return agenthook.TrackedRepoResolution{}, nil
 	}
 	resolved := agenthook.TrackedRepoResolution{

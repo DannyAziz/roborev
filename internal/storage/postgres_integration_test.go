@@ -1916,3 +1916,23 @@ func TestIntegration_TickerSync(t *testing.T) { //nolint:paralleltest // shares 
 	env.assertPgCount("review_jobs", 2)
 	env.assertPgCount("reviews", 2)
 }
+
+func TestIntegration_CanonicalRepoIdentityRewritten(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
+	canonical := "https://github.com/acme/widgets"
+	id, err := env.Pool.GetOrCreateRepo(env.Ctx, canonical)
+	require.NoError(t, err)
+	stored := "https://github.com/Acme/Widgets.git"
+	id2, err := env.Pool.GetOrCreateRepo(env.Ctx, stored)
+	require.NoError(t, err)
+	assert.Equal(t, id, id2)
+	var got string
+	require.NoError(t, env.Pool.pool.QueryRow(env.Ctx, `SELECT identity FROM repos WHERE id = $1`, id).Scan(&got))
+	assert.Equal(t, stored, got)
+
+	upperID, err := env.Pool.GetOrCreateRepo(env.Ctx, "https://git.example.internal/Org/Repo")
+	require.NoError(t, err)
+	lowerID, err := env.Pool.GetOrCreateRepo(env.Ctx, "https://git.example.internal/org/repo")
+	require.NoError(t, err)
+	assert.NotEqual(t, upperID, lowerID)
+}

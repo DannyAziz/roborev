@@ -2738,6 +2738,20 @@ func credentialMaterial(raw string) bool {
 	return ok && strings.Contains(user, ":")
 }
 
+// SameRepoIdentity reports whether a stored repos.identity and a freshly
+// resolved identity name the same remote. Exact string equality is the
+// stored form. RemoteIdentity is the stack-built canonical form
+// (lowercased github.com path, .git dropped, ssh rewritten to https).
+// A case-sensitive host stays unequal because RemoteIdentity keeps its path case.
+func SameRepoIdentity(stored, resolved string) bool {
+	if stored == resolved {
+		return true
+	}
+	left := RemoteIdentity(stored)
+	right := RemoteIdentity(resolved)
+	return left != "" && left == right
+}
+
 // authorityUser returns the userinfo in the authority, before the path.
 // It does not look at '@' inside the path.
 func authorityUser(raw string) (string, bool) {
