@@ -253,7 +253,9 @@ func (f *Fake) DeleteAgent(ctx context.Context, id string) error {
 		return err
 	}
 	if _, ok := f.agents[id]; !ok {
-		return fmt.Errorf("cursor cloud fake: agent %s not found", id)
+		// A second DELETE of an agent this fake already removed is the v0
+		// 404. deleteCursorCloudAgent treats that as already gone.
+		return notFound("delete agent")
 	}
 	delete(f.agents, id)
 	delete(f.finals, id)
