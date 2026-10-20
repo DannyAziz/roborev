@@ -1365,6 +1365,61 @@ func TestCursorCloudPanicReleasesLaunchSlot(t *testing.T) {
 	require.NoError(t, err)
 }
 
+type panicOutput struct{}
+
+func (panicOutput) Write([]byte) (int, error) {
+	panic("output exploded")
+}
+
+func TestCursorCloudStopErrorPanicStillDeletes(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	fake := &cursorcloudtest.Fake{
+		CreateStatus: cursorcloud.StatusFinished,
+		Final:        "ok",
+		MethodErrors: map[string]error{
+			cursorcloudtest.MethodStop: errors.New("stop exploded"),
+		},
+	}
+	require.PanicsWithValue(t, "output exploded", func() {
+		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", panicOutput{})
+	})
+	var ops []string
+	var createdID, deletedID string
+	for _, call := range fake.Calls() {
+		switch call.Method {
+		case cursorcloudtest.MethodCreate:
+			createdID = "bc_fake_1"
+		case cursorcloudtest.MethodStop:
+			ops = append(ops, "stop")
+			createdID = call.ID
+		case cursorcloudtest.MethodDelete:
+			ops = append(ops, "delete")
+			deletedID = call.ID
+		}
+	}
+	assert.Equal(t, []string{"stop", "delete"}, ops)
+	assert.NotEmpty(t, createdID)
+	assert.Equal(t, createdID, deletedID)
+}
+
+func TestCursorCloudOutputPanicStillDeletes(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	require.PanicsWithValue(t, "output exploded", func() {
+		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", panicOutput{})
+	})
+	var deletes int
+	for _, call := range fake.Calls() {
+		if call.Method == cursorcloudtest.MethodDelete {
+			deletes++
+			assert.NotEmpty(t, call.ID)
+		}
+	}
+	assert.Equal(t, 1, deletes)
+}
+
 func TestCursorCloudReadErrorKeepsQuotaAndIsNotRetried(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"

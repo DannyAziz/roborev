@@ -405,10 +405,7 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 	stopCancel()
 	if stopErr != nil && !cursorCloudStopQuiet(stopErr) {
 		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, stopErr)
-		log.Printf("%s", note.Error())
-		if output != nil {
-			fmt.Fprintln(output, note.Error())
-		}
+		writeCursorCloudCleanupNote(output, note.Error())
 	}
 	var err error
 	for attempt := 1; attempt <= cursorCloudDeleteAttempts; attempt++ {
@@ -427,11 +424,22 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 		}
 	}
 	surfaced := fmt.Errorf("cursor-cloud: delete agent %s: %w", id, err)
-	log.Printf("%s", surfaced.Error())
-	if output != nil {
-		fmt.Fprintln(output, surfaced.Error())
-	}
+	writeCursorCloudCleanupNote(output, surfaced.Error())
 	return surfaced
+}
+
+// writeCursorCloudCleanupNote records a cleanup failure. A panicking
+// writer must not skip DeleteAgent or replace the panic that entered
+// cleanup; that original panic still leaves Review.
+func writeCursorCloudCleanupNote(output io.Writer, note string) {
+	if note == "" {
+		return
+	}
+	defer func() { _ = recover() }()
+	log.Printf("%s", note)
+	if output != nil {
+		fmt.Fprintln(output, note)
+	}
 }
 
 // cursorCloudDeleteFinal reports a DELETE that must not be retried.
