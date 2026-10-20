@@ -1834,6 +1834,24 @@ func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
 	})
 }
 
+// TestCursorCloudReconcileWindowOutlastsHalfSecond keeps the default 60s
+// window. The launch shows up after 600ms, which is past a 500ms window and
+// inside 60s. The first list that can see it is the one at 750ms.
+func TestCursorCloudReconcileWindowOutlastsHalfSecond(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const repo = "https://github.com/acme/widgets.git"
+		const token = "late-tok"
+		client := &lateWindowCloud{
+			delay:  600 * time.Millisecond,
+			repo:   repo,
+			prompt: "review\n" + cursorCloudLaunchMarker + token + "\n",
+		}
+		err := reconcileCursorCloudLaunch(context.Background(), client, repo, token, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"bc_late"}, client.deleted)
+	})
+}
+
 func TestReconcileWindowEndIsNotSilent(t *testing.T) {
 	var logs bytes.Buffer
 	prevOut := log.Writer()
@@ -1918,6 +1936,42 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type lateWindowCloud struct {
+	delay   time.Duration
+	repo    string
+	prompt  string
+	started time.Time
+	deleted []string
+}
+
+func (c *lateWindowCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, errors.New("unused")
+}
+func (c *lateWindowCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *lateWindowCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *lateWindowCloud) UserPrompt(context.Context, string) (string, error) {
+	return c.prompt, nil
+}
+func (c *lateWindowCloud) StopAgent(context.Context, string) error { return nil }
+func (c *lateWindowCloud) DeleteAgent(_ context.Context, id string) error {
+	c.deleted = append(c.deleted, id)
+	return nil
+}
+func (c *lateWindowCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	if c.started.IsZero() {
+		c.started = time.Now()
+	}
+	if time.Since(c.started) < c.delay {
+		return nil, nil
+	}
+	return []cursorcloud.Agent{{
+		ID:               "bc_late",
+		SourceRepository: c.repo,
+	}}, nil
 }
 
 type stampListCloud struct {
