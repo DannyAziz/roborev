@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/testenv"
 	"go.kenn.io/roborev/internal/testutil"
 )
@@ -110,6 +116,111 @@ func (h *reviewHarness) run(opts runOpts) error {
 	}
 
 	return h.runCmd(args...)
+}
+
+// blockCursorCloudDials replaces the transport the cursor-cloud client clones.
+// Any dial fails the test, so a launch that gets past the agent's binding
+// check is caught before a request leaves the process.
+func blockCursorCloudDials(t *testing.T) {
+	t.Helper()
+	prev := http.DefaultTransport
+	http.DefaultTransport = &http.Transport{
+		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+			t.Errorf("cursor-cloud dial: %s %s", network, addr)
+			return nil, errors.New("cursor-cloud dial blocked in test")
+		},
+	}
+	t.Cleanup(func() { http.DefaultTransport = prev })
+}
+
+// TestLocalReviewNeverReachesCursorCloud pins that no --local route launches
+// cursor-cloud. The registry agent has no client and no launch binding, so
+// every route that selects it stops at the binding check before a dial. Host
+// sources are not read by --local on this line, so a test agent runs. Each
+// cell goes red if a route is added that dials, binds a launch, or sends a
+// host source to cursor-cloud.
+func TestLocalReviewNeverReachesCursorCloud(t *testing.T) {
+	const bindingRefusal = "cursor-cloud: refusing to launch without a daemon launch binding"
+	cloud, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	registry, ok := cloud.(*agent.CursorCloudAgent)
+	require.True(t, ok)
+	require.Nil(t, registry.Client)
+	require.Nil(t, registry.BindLaunch)
+	blockCursorCloudDials(t)
+
+	// Only git stays on PATH, so no local CLI agent is available to pick.
+	realGit, err := exec.LookPath("git")
+	require.NoError(t, err)
+	binDir := t.TempDir()
+	require.NoError(t, os.Symlink(realGit, filepath.Join(binDir, "git")))
+
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		repo   string
+		global string
+		env    bool
+		// want is the error; empty means the local test agent ran.
+		want string
+	}{
+		{name: "--agent cursor-cloud", args: []string{"--agent", agent.CursorCloudHost}, want: bindingRefusal},
+		{name: "--agent cursor-cloud --dirty", args: []string{"--agent", agent.CursorCloudHost, "--dirty"}, want: bindingRefusal},
+		{name: "repo agent", repo: "agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "repo workflow agent", repo: "review_agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "repo level agent", repo: "review_agent_thorough = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "global default agent", global: "default_agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "global workflow agent", global: "review_agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "repo backup agent", repo: "agent = \"codex\"\nbackup_agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "global backup agent", repo: "agent = \"codex\"\n", global: "default_backup_agent = \"cursor-cloud\"\n", want: bindingRefusal},
+		{name: "CURSOR_API_KEY only", want: "get agent: no configured agent available"},
+		{name: "--host", args: []string{"--host", agent.CursorCloudHost}, repo: "agent = \"test\"\n", want: "unknown flag: --host"},
+		{name: "repo host", repo: "agent = \"test\"\nhost = \"cursor-cloud\"\n"},
+		{name: "global host", repo: "agent = \"test\"\n", global: "host = \"cursor-cloud\"\n"},
+		{name: "ROBOREV_DEFAULT_HOST", repo: "agent = \"test\"\n", env: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+			t.Setenv(agent.EnvDefaultHost, "")
+			if tc.env {
+				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
+			}
+			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+			dataDir := testenv.SetDataDir(t)
+			if tc.global != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dataDir, "config.toml"), []byte(tc.global), 0o600))
+			}
+			h := newReviewHarness(t)
+			// A remote lets a launch past the binding check reach the dial.
+			out, err := exec.Command("git", "-C", h.Dir, "remote", "add", "origin", "https://github.com/example/repo.git").CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			require.NoError(t, os.WriteFile(filepath.Join(h.Dir, "dirty.txt"), []byte("dirty-local-diff\n"), 0o644))
+			if tc.repo != "" {
+				h.writeConfig(tc.repo)
+			}
+			t.Setenv("PATH", binDir)
+			err = h.runCmd(append([]string{"--local", "--repo", h.Dir, "--quiet"}, tc.args...)...)
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+
+	t.Run("goal --agent cursor-cloud", func(t *testing.T) {
+		t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+		t.Setenv(agent.EnvDefaultHost, "")
+		t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+		testenv.SetDataDir(t)
+		h := newReviewHarness(t)
+		spec := "docs/superpowers/specs/feature-design.md"
+		require.NoError(t, os.MkdirAll(filepath.Join(h.Dir, "docs", "superpowers", "specs"), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(h.Dir, spec), []byte("# Feature\n"), 0o600))
+		t.Setenv("PATH", binDir)
+		err := h.runCmd("--type", "goal", "--local", "--repo", h.Dir, "--quiet", "--agent", agent.CursorCloudHost, "--spec", spec)
+		require.ErrorContains(t, err, "goal review requires a tool-disabled schema agent")
+	})
 }
 
 func TestLocalReviewFlag(t *testing.T) {
