@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -212,6 +213,55 @@ func ApplyLaunchOrphanWarning(job *ReviewJob, warning string) {
 	if !strings.Contains(job.Error, warning) {
 		job.Error = strings.TrimSpace(strings.TrimSpace(job.Error) + " " + warning)
 	}
+}
+
+// keepCloudLaunchAfterJobDelete drops the job foreign key so deleting a job
+// leaves the launch row, its id, and orphan_note in place. Ids are copied.
+func (db *DB) keepCloudLaunchAfterJobDelete() error {
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='review_job_cloud_launches'`).Scan(&ddl); err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "REFERENCES") {
+		return nil
+	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		`CREATE TABLE review_job_cloud_launches_keep (
+			id INTEGER PRIMARY KEY,
+			job_id INTEGER,
+			launch_token TEXT NOT NULL,
+			agent_id TEXT NOT NULL DEFAULT '',
+			cleaned INTEGER NOT NULL DEFAULT 0,
+			repo_identity TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT '',
+			orphan_note TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO review_job_cloud_launches_keep
+			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note)
+			SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note
+			FROM review_job_cloud_launches`,
+		`DROP TABLE review_job_cloud_launches`,
+		`ALTER TABLE review_job_cloud_launches_keep RENAME TO review_job_cloud_launches`,
+	} {
+		if _, err = tx.Exec(stmt); err != nil {
+			return fmt.Errorf("keep cloud launch after job delete: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // AttachLaunchOrphanWarnings fills OrphanWarning for an API job listing.

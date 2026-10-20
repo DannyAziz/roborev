@@ -1631,7 +1631,7 @@ func (db *DB) ensureCloudLaunchTable() error {
 	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now') WHERE created_at = ''`); err != nil {
 		return fmt.Errorf("cloud launch created_at: %w", err)
 	}
-	return nil
+	return db.keepCloudLaunchAfterJobDelete()
 }
 
 // drainAndDropOldCIBatchTables retires the legacy CI batch tracking

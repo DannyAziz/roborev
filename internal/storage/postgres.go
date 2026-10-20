@@ -532,6 +532,7 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 	}
 
 	p.ensureSearchVectorsSchema(ctx)
+	p.ensureLocalCloudLaunchTable(ctx)
 
 	if err := p.migrateLegacyReviews(ctx); err != nil {
 		return err
@@ -1715,4 +1716,28 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
 		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return nil
+}
+
+// localCloudLaunchDDL is machine-local. Sync export and import never read it.
+// It has no foreign key, so deleting a job does not drop the note. The schema
+// version stays at 23 because older binaries refuse a newer version.
+const localCloudLaunchDDL = `CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
+	id BIGSERIAL PRIMARY KEY,
+	job_id BIGINT,
+	launch_token TEXT NOT NULL DEFAULT '',
+	agent_id TEXT NOT NULL DEFAULT '',
+	cleaned BOOLEAN NOT NULL DEFAULT FALSE,
+	repo_identity TEXT NOT NULL DEFAULT '',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	orphan_note TEXT NOT NULL DEFAULT ''
+)`
+
+func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
+	if _, err := p.pool.Exec(ctx, localCloudLaunchDDL); err != nil {
+		log.Printf("cursor-cloud: local launch table: %v", err)
+		return
+	}
+	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`); err != nil {
+		log.Printf("cursor-cloud: orphan_note: %v", err)
+	}
 }
