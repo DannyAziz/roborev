@@ -155,18 +155,40 @@ func (db *DB) NoteCloudLaunchRisk(jobID int64, msg string) error {
 	return err
 }
 
+// currentAttemptCloudLaunchSQL is the fail-not-relaunch predicate for a
+// running review_jobs row. A launch row counts only for this attempt:
+// created_at is at or after started_at. Cleanup can mark that row cleaned
+// before CompleteJob, so cleaned is not the key. A row from an earlier
+// attempt is not, cleaned or not. A running row with no started_at has no
+// later attempt to separate, so any of its launch rows still count.
+//
+// agent_invoked with agent cursor-cloud is this attempt's primary. Attempt
+// resets clear it. backup_agent is the configured failover, not evidence
+// that the backup ran.
+func currentAttemptCloudLaunchSQL() string {
+	created := sqliteNormalizedTimestampExpr("l.created_at")
+	started := sqliteNormalizedTimestampExpr("review_jobs.started_at")
+	return `EXISTS (
+		SELECT 1 FROM review_job_cloud_launches l
+		WHERE l.job_id = review_jobs.id
+		  AND (
+			COALESCE(review_jobs.started_at, '') = ''
+			OR ` + created + ` >= ` + started + `
+		  )
+	) OR (review_jobs.agent_invoked = 1 AND review_jobs.agent = 'cursor-cloud')`
+}
+
 // FailSentCloudLaunch fails a running attempt that already launched a
-// cursor-cloud VM. Any launch row counts, including one deferred cleanup
-// already marked cleaned, and so does agent_invoked when the primary or
-// the backup is cursor-cloud. Other jobs are unchanged.
+// cursor-cloud VM on this attempt. A sent row still counts after cleanup
+// marks it cleaned. A configured cursor-cloud backup that did not launch,
+// and a launch row from an earlier attempt, do not. Other jobs are unchanged.
 func (db *DB) FailSentCloudLaunch(jobID int64, workerID string) (bool, error) {
 	now := time.Now().Format(time.RFC3339)
 	res, err := db.Exec(`UPDATE review_jobs
 		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
 		    updated_at = ?, synced_at = NULL
 		WHERE id = ? AND status = 'running' AND worker_id = ?
-		  AND (id IN (SELECT job_id FROM review_job_cloud_launches)
-		    OR (agent_invoked = 1 AND (agent = 'cursor-cloud' OR backup_agent = 'cursor-cloud')))`,
+		  AND (`+currentAttemptCloudLaunchSQL()+`)`,
 		now, CloudLaunchInterruptedError, now, jobID, workerID)
 	if err != nil {
 		return false, err
