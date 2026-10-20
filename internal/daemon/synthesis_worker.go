@@ -285,10 +285,13 @@ func (wp *WorkerPool) completeSynthesisLocked(
 		// Leaving the job running would strand the panel with no comment.
 		// Route the storage failure through the ordinary retry/fail path.
 		log.Printf("[%s] Error storing synthesis review for job %d: %v", workerID, job.ID, completeErr)
-		wp.failOrRetryInnerLocked(
-			workerID, job, agentName,
-			fmt.Sprintf("store synthesis review: %v", completeErr), false, nil,
-		)
+		errorMsg := fmt.Sprintf("store synthesis review: %v", completeErr)
+		if res.captureUsage && agent.CanonicalName(agentName) == agent.CursorCloudHost {
+			// The cloud synthesis already ran. A retry would POST another agent.
+			wp.failSentCursorCloudLocked(workerID, job, agentName, errorMsg)
+			return
+		}
+		wp.failOrRetryInnerLocked(workerID, job, agentName, errorMsg, false, nil)
 		return
 	}
 

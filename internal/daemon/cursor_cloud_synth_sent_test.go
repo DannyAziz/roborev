@@ -59,3 +59,36 @@ func TestProcessSynthesisCursorCloudRejectedResultDoesNotRelaunch(t *testing.T) 
 		})
 	}
 }
+
+// A cloud synthesis whose document is valid but cannot be stored must not
+// launch again. completeSynthesisLocked routes the storage error through the
+// ordinary retry path, and a retry of a sent attempt POSTs a second agent.
+func TestProcessSynthesisCursorCloudStoreFailureDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	wtc, fake := cursorCloudRestartFixture(t)
+	wtc.Pool.retryBackoff = 0
+	fake.CreateStatus = cursorcloud.StatusFinished
+	fake.Final = backupCloudSynthesisFinal
+	synth := claimSynthesis(t, wtc, "synth-store-failure", agent.CursorCloudHost, "test")
+	originalID := synth.ID
+	_, err := wtc.DB.Exec(`CREATE TRIGGER fail_review_insert BEFORE INSERT ON reviews
+		BEGIN SELECT RAISE(ABORT, 'synthetic store failure'); END`)
+	require.NoError(t, err)
+
+	for range maxRetries + 2 {
+		if synth.Agent != agent.CursorCloudHost {
+			break
+		}
+		wtc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+		next, claimErr := wtc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, claimErr)
+		if next == nil {
+			break
+		}
+		synth = next
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
+	stored, err := wtc.DB.GetJobByID(originalID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, stored.RetryCount)
+}

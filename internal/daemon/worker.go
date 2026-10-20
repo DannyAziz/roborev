@@ -1927,16 +1927,18 @@ func (wp *WorkerPool) failCursorCloudWithoutRetry(workerID string, job *storage.
 // failSentCursorCloud records errorMsg and does not run cursor-cloud again.
 // A backup that is not cursor-cloud still receives the job.
 func (wp *WorkerPool) failSentCursorCloud(workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
+	wp.runAttemptTransition(workerID, job, func() {
+		wp.failSentCursorCloudLocked(workerID, job, agentName, errorMsg)
+	})
+}
+
+func (wp *WorkerPool) failSentCursorCloudLocked(workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
 	backup := wp.resolveBackupAgent(job)
 	if backup != "" && agent.CanonicalName(backup) != agent.CursorCloudHost {
-		wp.failoverOrFailNonRetryableAgentContext(
-			context.Background(), workerID, job, agentName, errorMsg,
-		)
+		wp.failoverOrFailNonRetryableAgentLocked(workerID, job, agentName, errorMsg)
 		return
 	}
-	wp.runAttemptTransition(workerID, job, func() {
-		wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg)
-	})
+	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg)
 }
 
 func (wp *WorkerPool) failoverOrFailNonRetryableAgentContext(
