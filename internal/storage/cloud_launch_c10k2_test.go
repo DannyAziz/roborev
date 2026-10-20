@@ -146,3 +146,29 @@ func TestBeginCloudLaunchMissReturnsUpdateError(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&n))
 	assert.Equal(t, 0, n)
 }
+
+// TestFailSentCloudLaunchKeepsStoredOrphanNote is the pin for the job error
+// FailSentCloudLaunch writes. The launch row is uncleaned and the job error
+// already names the agent that may still be running. The interrupted error
+// is added, and that orphan note stays. Writing the interrupted error over it
+// drops the warning from the job.
+func TestFailSentCloudLaunchKeepsStoredOrphanNote(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	_, _, job := createJobChain(t, db, t.TempDir(), "abc123")
+	_, err := db.Exec(`UPDATE review_jobs SET status = 'running', worker_id = ? WHERE id = ?`, "w-keep", job.ID)
+	require.NoError(t, err)
+	require.NoError(t, db.BeginCloudLaunch(job.ID, "w-keep", "keep-note-tok", "https://example.com/acme/repo.git"))
+	const msg = "cursor-cloud orphan risk: pending cleanup for agent bc_keep: status 500"
+	require.NoError(t, db.NoteCloudLaunchRisk(job.ID, msg))
+
+	failed, err := db.FailSentCloudLaunch(job.ID, "w-keep")
+	require.NoError(t, err)
+	assert.True(t, failed)
+
+	var jobErr string
+	require.NoError(t, db.QueryRow(`SELECT error FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+	assert.Contains(t, jobErr, CloudLaunchInterruptedError)
+	assert.Contains(t, jobErr, msg)
+}
