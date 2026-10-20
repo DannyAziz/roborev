@@ -446,7 +446,8 @@ func cursorCloudStopQuiet(err error) bool {
 // has no idempotency key (Launch an Agent request body: prompt, model,
 // source, target, webhook). List Agents returns source.repository and
 // source.ref but not the prompt. Repository equality uses config.RemoteIdentity
-// so .git, scp versus https, and case still match. The launch token in the
+// so .git and scp versus https still match. Path case is folded only for
+// github.com. The launch token in the
 // user_message confirms it is this launch. A cleanup error names the orphan id.
 // https://cursor.com/docs/cloud-agent/api/v0#launch-an-agent
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents

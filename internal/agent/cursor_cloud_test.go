@@ -1317,6 +1317,23 @@ func TestCursorCloudReconcileDeletesAgentPublishedAfterClientTimeout(t *testing.
 	assert.Equal(t, 1, deletes)
 }
 
+func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
+	assert := assert.New(t)
+	const upper = "https://git.example.internal/Org/Repo"
+	const lower = "https://git.example.internal/org/repo"
+	dir := t.TempDir()
+	idUpper := config.ResolveRepoIdentity(dir, func(string, string) string { return upper })
+	idLower := config.ResolveRepoIdentity(dir, func(string, string) string { return lower })
+	assert.NotEqual(idUpper, idLower)
+	assert.Equal(upper, idUpper)
+	assert.Equal(lower, idLower)
+	assert.False(sameCursorCloudRepo(upper, lower))
+	assert.True(sameCursorCloudRepo(
+		"https://GitHub.com/Acme/Widgets.git",
+		"git@github.com:acme/widgets.git",
+	))
+}
+
 type fakeCloud struct {
 	mu        sync.Mutex
 	created   cursorcloud.CreateAgentRequest

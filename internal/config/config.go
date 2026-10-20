@@ -2579,15 +2579,15 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	}
 	remoteURL := getRemoteURL(repoPath, "")
 	if remoteURL != "" {
-		// Identity is the canonical remote, not the fail-closed launch
-		// redaction. stripURLCredentials collapses unclean URLs to one
-		// redacted-url, which would merge different repositories. A remote
-		// that does not name a repository falls through to local://.
-		if cleaned := RemoteIdentity(remoteURL); cleaned != "" {
+		// Keep the historical identity string. RemoteIdentity lowercases,
+		// drops .git, and rewrites ssh to https, so a repo registered
+		// before that change stops matching and Postgres ON CONFLICT
+		// (identity) splits machines. stripURLCredentials collapses
+		// unclean remotes onto one redacted-url. A result that still
+		// carries a credential falls through to local://.
+		cleaned := stripRepoIdentityURL(remoteURL)
+		if cleaned != "" && cleaned != redactedURL && !identityHasCredential(cleaned) {
 			return cleaned
-		}
-		if !strings.Contains(remoteURL, "://") && !strings.Contains(remoteURL, "@") {
-			return remoteURL
 		}
 	}
 
@@ -2665,11 +2665,182 @@ func stripURLCredentials(rawURL string) string {
 	return parsed.String()
 }
 
-// RemoteIdentity is the canonical repository identity shared by Postgres sync
-// and cursor-cloud reconcile. Userinfo, query, and fragment are dropped. A
-// trailing .git is ignored, case is folded, and git@host:path matches
-// https://host/path. An empty result does not name a repository. Two
-// different repositories stay different strings.
+// stripRepoIdentityURL keeps the historical remote identity. Unlike
+// stripURLCredentials it never collapses two repositories to redacted-url.
+// git@host:path is unchanged. Any other SCP user is dropped so the host:path
+// stays distinct without storing the token. Transport URLs lose userinfo
+// and credential query or fragment keys. Case, a trailing .git, and ssh://
+// are left as stored.
+func stripRepoIdentityURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		if id, ok := scpIdentity(rawURL); ok {
+			return id
+		}
+		return rawURL
+	}
+	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
+		if id, ok := scpIdentity(rawURL); ok {
+			return id
+		}
+		return rawURL
+	}
+	changed := false
+	if parsed.User != nil {
+		parsed.User = nil
+		changed = true
+	}
+	if stripCredentialQuery(parsed) {
+		changed = true
+	}
+	if stripCredentialFragment(parsed) {
+		changed = true
+	}
+	if !changed {
+		return rawURL
+	}
+	return parsed.String()
+}
+
+// scpIdentity returns a secret-free SCP identity. git@host:path is kept
+// whole. Any other user is removed, leaving host:path.
+func scpIdentity(raw string) (string, bool) {
+	if strings.Contains(raw, "://") {
+		return "", false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || rest == "" || strings.Contains(rest, "@") {
+		return "", false
+	}
+	if user == "git" {
+		return raw, true
+	}
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
+// identityHasCredential reports a value that still carries a secret and
+// therefore must not be stored as a repository identity.
+func identityHasCredential(raw string) bool {
+	if raw == "" || raw == redactedURL {
+		return true
+	}
+	return credentialMaterial(raw)
+}
+
+func stripCredentialQuery(u *url.URL) bool {
+	q := u.Query()
+	changed := false
+	for key := range q {
+		if credentialQueryKey(key) {
+			q.Del(key)
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	u.RawQuery = q.Encode()
+	return true
+}
+
+func stripCredentialFragment(u *url.URL) bool {
+	if u.Fragment == "" {
+		return false
+	}
+	values, err := url.ParseQuery(u.Fragment)
+	if err != nil {
+		if credentialMaterial("#" + u.Fragment) {
+			u.Fragment = ""
+			u.RawFragment = ""
+			return true
+		}
+		return false
+	}
+	changed := false
+	for key := range values {
+		if credentialQueryKey(key) {
+			values.Del(key)
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	if len(values) == 0 {
+		u.Fragment = ""
+	} else {
+		u.Fragment = values.Encode()
+	}
+	u.RawFragment = ""
+	return true
+}
+
+func credentialQueryKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "access_token", "private_token", "token":
+		return true
+	default:
+		return false
+	}
+}
+
+// credentialMaterial reports userinfo, a credential query or fragment key,
+// or an SCP user other than git. git@host:path has no password.
+func credentialMaterial(raw string) bool {
+	if userinfoBeforeAt(raw) {
+		return true
+	}
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, "access_token=") || strings.Contains(lower, "private_token=") {
+		return true
+	}
+	if hasSeparatedKey(lower, "token") {
+		return true
+	}
+	if strings.Contains(raw, "://") {
+		return false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || rest == "" || strings.Contains(user, "/") {
+		return false
+	}
+	return user != "git"
+}
+
+func hasSeparatedKey(lower, key string) bool {
+	for _, prefix := range []string{"?", "&", "#"} {
+		if strings.Contains(lower, prefix+key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// userinfoBeforeAt reports a user:password@ prefix. SCP git@host:path has
+// the colon after @ and is not userinfo.
+func userinfoBeforeAt(raw string) bool {
+	at := strings.Index(raw, "@")
+	if at <= 0 {
+		return false
+	}
+	return strings.Contains(raw[:at], ":")
+}
+
+// RemoteIdentity compares cursor-cloud repository URLs. It is not the stored
+// repo identity; ResolveRepoIdentity keeps the historical string and does not
+// lowercase paths. Userinfo, query, and fragment are dropped. A trailing
+// .git is ignored, and git@host:path matches https://host/path. The host is
+// lowercased because DNS names are case-insensitive. The path is lowercased
+// only for github.com, whose owner and repository names are case-insensitive
+// (https://docs.github.com/en/rest/repos/repos#get-a-repository).
+// Other hosts keep path case, so Org/Repo and org/repo stay distinct. An
+// empty result does not name a repository.
 func RemoteIdentity(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
@@ -2703,11 +2874,26 @@ func RemoteIdentity(rawURL string) string {
 	}
 	host = strings.ToLower(host)
 	path = strings.Trim(path, "/")
-	path = strings.TrimSuffix(strings.ToLower(path), ".git")
+	// Path case is part of the repository name on a self-hosted server.
+	// github.com is the host whose names are case-insensitive.
+	if githubRepoHost(host) {
+		path = strings.ToLower(path)
+	}
+	path = strings.TrimSuffix(path, ".git")
 	if host == "" || path == "" {
 		return ""
 	}
 	return scheme + "://" + host + "/" + path
+}
+
+// githubRepoHost reports the public GitHub host. Owner and repository names
+// there compare case-insensitively. A self-hosted host is not assumed to.
+func githubRepoHost(host string) bool {
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	return name == "github.com"
 }
 
 // gitSCP reports git@host:path, which has no password.

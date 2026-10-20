@@ -1775,7 +1775,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo" {
+		if id != "https://github.com/user/repo.git" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL, got: %q", id)
@@ -1807,10 +1807,10 @@ func TestResolveRepoIdentity(t *testing.T) {
 
 		// With nil getRemoteURL, should use git.GetRemoteURL and find the remote
 		id := ResolveRepoIdentity(tmpDir, nil)
-		if id != "https://github.com/test/repo" {
+		if id != "https://github.com/test/repo.git" {
 			assert.Condition(t, func() bool {
 				return false
-			}, "Expected 'https://github.com/test/repo', got: %q", id)
+			}, "Expected 'https://github.com/test/repo.git', got: %q", id)
 		}
 	})
 
@@ -1841,7 +1841,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo" {
+		if id != "https://github.com/user/repo.git" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL when roborev-id is invalid, got: %q", id)
@@ -1856,7 +1856,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/org/repo" {
+		if id != "https://github.com/org/repo.git" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected credentials stripped from URL, got: %q", id)
@@ -1887,9 +1887,41 @@ func TestResolveRepoIdentity(t *testing.T) {
 		httpsID := ResolveRepoIdentity(dir, func(string, string) string {
 			return "https://GitHub.com/Acme/One.git"
 		})
-		assert.Equal(t, "https://github.com/acme/one", gitID)
-		assert.Equal(t, gitID, httpsID)
+		assert.Equal(t, "git@github.com:acme/one.git", gitID)
+		assert.Equal(t, "https://GitHub.com/Acme/One.git", httpsID)
+		assert.NotEqual(t, gitID, httpsID)
 	})
+}
+
+func TestResolveRepoIdentityCaseIsNotMerged(t *testing.T) {
+	dir := t.TempDir()
+	const upperURL = "https://git.example.internal/Org/Repo"
+	const lowerURL = "https://git.example.internal/org/repo"
+	upper := ResolveRepoIdentity(dir, func(string, string) string { return upperURL })
+	lower := ResolveRepoIdentity(dir, func(string, string) string { return lowerURL })
+	// Postgres GetOrCreateRepo inserts ON CONFLICT (identity). Equal
+	// strings would merge these checkouts. git.example.internal is a
+	// self-hosted host whose path case is significant.
+	assert.NotEqual(t, upper, lower)
+	assert.Equal(t, upperURL, upper)
+	assert.Equal(t, lowerURL, lower)
+}
+
+func TestResolveRepoIdentityRedactedURLDoesNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	one := ResolveRepoIdentity(dir, func(string, string) string {
+		return "ghp_alpha@github.com:acme/one.git"
+	})
+	two := ResolveRepoIdentity(dir, func(string, string) string {
+		return "ghp_beta@github.com:acme/two.git"
+	})
+	assert.NotEqual(t, one, two)
+	assert.NotEqual(t, RedactedURL, one)
+	assert.NotEqual(t, RedactedURL, two)
+	assert.NotContains(t, one, "ghp_")
+	assert.NotContains(t, two, "ghp_")
+	assert.Equal(t, "github.com:acme/one.git", one)
+	assert.Equal(t, "github.com:acme/two.git", two)
 }
 
 func TestResolveModel(t *testing.T) {
