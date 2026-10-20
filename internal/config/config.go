@@ -2728,7 +2728,16 @@ func identityHasCredential(raw string) bool {
 // password.
 func credentialMaterial(raw string) bool {
 	user, ok := authorityUser(raw)
-	return ok && strings.Contains(user, ":")
+	if !ok {
+		return false
+	}
+	if strings.Contains(user, ":") {
+		return true
+	}
+	// url.Parse rejects a bad escape and stripRepoIdentityURL then returns
+	// the raw remote. %3A is still the colon in user:password, including an
+	// empty user (%3Asecret) and a password that itself contains '@'.
+	return strings.Contains(strings.ToLower(user), "%3a")
 }
 
 // SameRepoIdentity reports whether a stored repos.identity and a freshly

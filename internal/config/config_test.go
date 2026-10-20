@@ -1941,6 +1941,38 @@ func TestResolveRepoIdentityKeepsMainSCPAndPathAt(t *testing.T) {
 	}
 }
 
+func TestResolveRepoIdentityRejectsMalformedCredentials(t *testing.T) {
+	dir := t.TempDir()
+	// stripRepoIdentityURL returns these strings unchanged: url.Parse fails,
+	// or an SCP password contains '@' so scpIdentity refuses the cut.
+	// identityHasCredential is what keeps the secret out of repos.identity.
+	cases := []struct {
+		name, raw, secret string
+	}{
+		{name: "odd escape", raw: "https://user:sekret%zz@github.com/org/repo.git", secret: "sekret"},
+		{name: "encoded colon", raw: "https://user%3Asekret%zz@github.com/org/repo.git", secret: "sekret"},
+		{name: "encoded colon lower", raw: "https://user%3asekret%gg@host/org/repo.git", secret: "sekret"},
+		{name: "empty user encoded", raw: "https://%3Asekret%zz@host/org/repo.git", secret: "sekret"},
+		{name: "empty user", raw: ":sekret@github.com:org/repo.git", secret: "sekret"},
+		{name: "empty user at-password", raw: "https://:sekret%40more%zz@host/org/repo.git", secret: "sekret"},
+		{name: "password contains at", raw: "user:sekret@ret@github.com:org/repo.git", secret: "sekret"},
+		{name: "encoded at in password", raw: "user%3Asekret@ret@github.com:org/repo.git", secret: "sekret"},
+		{name: "encoded at-password", raw: "https://user:sekret%40more%zz@host/repo.git", secret: "sekret"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			cleaned := stripRepoIdentityURL(tc.raw)
+			assert.Equal(tc.raw, cleaned, "strip leaves this remote for the credential check")
+			assert.True(identityHasCredential(cleaned))
+			got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
+			assert.NotEqual(tc.raw, got)
+			assert.NotContains(got, tc.secret)
+			assert.True(strings.HasPrefix(got, "local://"))
+		})
+	}
+}
+
 func TestResolveRepoIdentityKeepsQueryAndFragment(t *testing.T) {
 	dir := t.TempDir()
 	assert := assert.New(t)
