@@ -507,14 +507,18 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	if !ok {
 		message = string(data)
 	}
+	// Redact before the 64KiB cut. Truncating first can split the API key
+	// across the boundary so the surviving prefix is no longer the key.
+	code = c.redact(strings.TrimSpace(code))
+	message = c.redact(strings.TrimSpace(message))
 	if len(message) > maxErrorMessageBytes {
 		message = message[:maxErrorMessageBytes]
 	}
 	return &APIError{
 		Op:         op,
 		StatusCode: status,
-		Code:       c.redact(strings.TrimSpace(code)),
-		Message:    c.redact(strings.TrimSpace(message)),
+		Code:       code,
+		Message:    message,
 	}
 }
 

@@ -1775,7 +1775,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo.git" {
+		if id != "https://github.com/user/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL, got: %q", id)
@@ -1807,10 +1807,10 @@ func TestResolveRepoIdentity(t *testing.T) {
 
 		// With nil getRemoteURL, should use git.GetRemoteURL and find the remote
 		id := ResolveRepoIdentity(tmpDir, nil)
-		if id != "https://github.com/test/repo.git" {
+		if id != "https://github.com/test/repo" {
 			assert.Condition(t, func() bool {
 				return false
-			}, "Expected 'https://github.com/test/repo.git', got: %q", id)
+			}, "Expected 'https://github.com/test/repo', got: %q", id)
 		}
 	})
 
@@ -1841,7 +1841,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo.git" {
+		if id != "https://github.com/user/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL when roborev-id is invalid, got: %q", id)
@@ -1856,11 +1856,39 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/org/repo.git" {
+		if id != "https://github.com/org/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected credentials stripped from URL, got: %q", id)
 		}
+	})
+
+	t.Run("credentialed remotes stay distinct", func(t *testing.T) {
+		dir := t.TempDir()
+		pairs := [][2]string{
+			{"https://user:alpha@github.com/acme/one.git", "https://user:beta@github.com/acme/two.git"},
+			{"user:alpha@github.com:acme/one.git", "user:beta@github.com:acme/two.git"},
+			{"ghp_alpha@github.com:acme/one.git", "ghp_beta@github.com:acme/two.git"},
+		}
+		for _, pair := range pairs {
+			idA := ResolveRepoIdentity(dir, func(string, string) string { return pair[0] })
+			idB := ResolveRepoIdentity(dir, func(string, string) string { return pair[1] })
+			assert.NotEqual(t, idA, idB, pair)
+			assert.NotEqual(t, redactedURL, idA, pair[0])
+			assert.NotEqual(t, redactedURL, idB, pair[1])
+			assert.NotContains(t, idA, "alpha")
+			assert.NotContains(t, idB, "beta")
+			assert.NotContains(t, idA, "ghp_")
+			assert.NotContains(t, idB, "ghp_")
+		}
+		gitID := ResolveRepoIdentity(dir, func(string, string) string {
+			return "git@github.com:acme/one.git"
+		})
+		httpsID := ResolveRepoIdentity(dir, func(string, string) string {
+			return "https://GitHub.com/Acme/One.git"
+		})
+		assert.Equal(t, "https://github.com/acme/one", gitID)
+		assert.Equal(t, gitID, httpsID)
 	})
 }
 
@@ -3497,6 +3525,46 @@ func TestStripURLCredentials(t *testing.T) {
 			name:     "access_token query is removed",
 			input:    "https://github.com/o/r.git?access_token=sekret",
 			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "scp token user is redacted",
+			input:    "ghp_x@github.com:o/r.git",
+			expected: redactedURL,
+		},
+		{
+			name:     "token query is removed",
+			input:    "https://github.com/o/r.git?token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "private_token query is removed",
+			input:    "https://github.com/o/r.git?private_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "access_token fragment is removed",
+			input:    "https://github.com/o/r.git#access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "token query drops every query field",
+			input:    "https://github.com/o/r.git?x=1&token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "oauth_token query is removed",
+			input:    "https://github.com/o/r.git?oauth_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "ACCESS_TOKEN query is removed regardless of case",
+			input:    "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "schemeless userinfo is removed",
+			input:    "//user:tok@host/x",
+			expected: "//host/x",
 		},
 		{
 			name:     "ssh userinfo is removed",

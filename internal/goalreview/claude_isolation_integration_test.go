@@ -24,9 +24,9 @@ func TestClaudeGoalReviewSuppressesRepositoryHooks(t *testing.T) {
 		t.Skip("Claude CLI is required for the local transport isolation check")
 	}
 	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, ".claude"), 0700))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "auth"), 0700))
-	require.NoError(t, os.WriteFile(filepath.Join(root, ".claude", "settings.json"), []byte(`{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"echo hook > hook-ran"}]}]}}`), 0600))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".claude"), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "auth"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".claude", "settings.json"), []byte(`{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"echo hook > hook-ran"}]}]}}`), 0o600))
 	received := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

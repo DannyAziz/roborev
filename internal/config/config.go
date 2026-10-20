@@ -2579,8 +2579,16 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	}
 	remoteURL := getRemoteURL(repoPath, "")
 	if remoteURL != "" {
-		// Strip credentials from URL to avoid persisting secrets
-		return stripURLCredentials(remoteURL)
+		// Identity is the canonical remote, not the fail-closed launch
+		// redaction. stripURLCredentials collapses unclean URLs to one
+		// redacted-url, which would merge different repositories. A remote
+		// that does not name a repository falls through to local://.
+		if cleaned := RemoteIdentity(remoteURL); cleaned != "" {
+			return cleaned
+		}
+		if !strings.Contains(remoteURL, "://") && !strings.Contains(remoteURL, "@") {
+			return remoteURL
+		}
 	}
 
 	// 4. Fallback to local path
@@ -2592,49 +2600,147 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 }
 
 // StripURLCredentials removes credentials from a URL before it is sent or stored.
-// A URL that cannot be stripped safely becomes redactedURL.
+// A URL that cannot be stripped safely becomes RedactedURL.
 func StripURLCredentials(rawURL string) string {
 	return stripURLCredentials(rawURL)
 }
 
-// redactedURL is returned when a URL cannot be parsed or still carries a
-// credential. It contains no userinfo from the input.
-const redactedURL = "redacted-url"
+// RedactedURL is the fail-closed result of StripURLCredentials. It contains
+// no userinfo, query, or fragment from the input. Callers that would send
+// this value on must refuse instead of treating it as a repository URL.
+const RedactedURL = "redacted-url"
 
-// stripURLCredentials removes userinfo and access_token from a URL.
-// SCP git@host:path has no password and stays unchanged so the launch URL
-// still names the repository. user:password@host:path, a bad percent-escape,
-// and any URL that cannot be cleaned fail closed as redactedURL.
+// redactedURL is the same value for in-package callers.
+const redactedURL = RedactedURL
+
+// stripURLCredentials removes userinfo and every query and fragment.
+// git@host:path has no password and stays unchanged so the launch URL still
+// names the repository. Anything url.Parse rejects, including a token in the
+// SCP user slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is
+// redactedURL. Callers must not launch with that value.
 func stripURLCredentials(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		if strings.Contains(rawURL, "://") || userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
-			return redactedURL
-		}
-		return rawURL
-	}
-	if parsed.Scheme == "" {
-		if userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
-			return redactedURL
-		}
-		return rawURL
-	}
-	if !transportScheme(parsed.Scheme) && strings.Contains(rawURL, "@") {
-		// user:tok@host:o/r parses as scheme "user" and would otherwise be returned raw.
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
 		return redactedURL
 	}
-	changed := false
-	if parsed.User != nil {
-		parsed.User = nil
-		changed = true
-	}
-	if stripAccessTokenQuery(parsed) {
-		changed = true
-	}
-	if !changed {
+	if _, ok := gitSCP(rawURL); ok {
 		return rawURL
 	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return redactedURL
+	}
+	if strings.HasPrefix(rawURL, "//") {
+		if parsed.Host == "" {
+			return redactedURL
+		}
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return "//" + parsed.Host + parsed.EscapedPath()
+	}
+	if parsed.Scheme == "" && parsed.Host == "" {
+		if strings.Contains(rawURL, "@") {
+			return redactedURL
+		}
+		return rawURL
+	}
+	if parsed.Scheme == "file" {
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		parsed.RawFragment = ""
+		return parsed.String()
+	}
+	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
+		return redactedURL
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Host == "" {
+		return redactedURL
+	}
 	return parsed.String()
+}
+
+// RemoteIdentity is the canonical repository identity shared by Postgres sync
+// and cursor-cloud reconcile. Userinfo, query, and fragment are dropped. A
+// trailing .git is ignored, case is folded, and git@host:path matches
+// https://host/path. An empty result does not name a repository. Two
+// different repositories stay different strings.
+func RemoteIdentity(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	var scheme, host, path string
+	var scpHost, scpPath string
+	if scpUserPath(rawURL, &scpHost, &scpPath) {
+		scheme, host, path = "https", scpHost, scpPath
+	} else {
+		parsed, err := url.Parse(rawURL)
+		if err != nil || parsed.Host == "" {
+			return ""
+		}
+		scheme = parsed.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		host = parsed.Host
+		path = parsed.EscapedPath()
+		if path == "" {
+			path = parsed.Path
+		}
+	}
+	scheme = strings.ToLower(scheme)
+	if scheme == "ssh" || scheme == "git" {
+		scheme = "https"
+	}
+	if !transportScheme(scheme) && scheme != "https" {
+		return ""
+	}
+	host = strings.ToLower(host)
+	path = strings.Trim(path, "/")
+	path = strings.TrimSuffix(strings.ToLower(path), ".git")
+	if host == "" || path == "" {
+		return ""
+	}
+	return scheme + "://" + host + "/" + path
+}
+
+// gitSCP reports git@host:path, which has no password.
+func gitSCP(raw string) (string, bool) {
+	var host, path string
+	if !scpUserPath(raw, &host, &path) {
+		return "", false
+	}
+	user, _, _ := strings.Cut(raw, "@")
+	if user != "git" {
+		return "", false
+	}
+	return raw, true
+}
+
+func scpUserPath(raw string, host, path *string) bool {
+	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "//") {
+		return false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || user == "" || strings.Contains(user, "/") {
+		return false
+	}
+	h, p, ok := strings.Cut(rest, ":")
+	if !ok || h == "" || p == "" || strings.Contains(h, "/") {
+		return false
+	}
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	*host = h
+	*path = p
+	return true
 }
 
 func transportScheme(scheme string) bool {
@@ -2644,24 +2750,4 @@ func transportScheme(scheme string) bool {
 	default:
 		return false
 	}
-}
-
-func stripAccessTokenQuery(u *url.URL) bool {
-	q := u.Query()
-	if _, ok := q["access_token"]; !ok {
-		return false
-	}
-	q.Del("access_token")
-	u.RawQuery = q.Encode()
-	return true
-}
-
-// userinfoBeforeAt reports a user:password@ prefix. SCP git@host:path has
-// the colon after @ and is not userinfo.
-func userinfoBeforeAt(raw string) bool {
-	at := strings.Index(raw, "@")
-	if at <= 0 {
-		return false
-	}
-	return strings.Contains(raw[:at], ":")
 }
