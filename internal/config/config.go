@@ -2671,31 +2671,24 @@ func stripURLCredentials(rawURL string) string {
 // identity, including a non-git user such as deploy@ or org@vs-ssh. A
 // user:password SCP user is the exception: the password is dropped and
 // host:path is kept so two remotes stay distinct. Transport URLs lose
-// userinfo and the entire query and fragment. Case, a trailing .git, and
-// an '@' in the path are left as stored.
+// userinfo only. Query and fragment are kept, matching main. Case, a
+// trailing .git, and an '@' in the path are left as stored.
 func stripRepoIdentityURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return dropRawQueryFragment(rawURL)
+		return rawURL
 	}
 	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
 		if id, ok := scpIdentity(rawURL); ok {
 			return id
 		}
-		return dropRawQueryFragment(rawURL)
+		return rawURL
+	}
+	if parsed.User == nil {
+		return rawURL
 	}
 	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	parsed.RawFragment = ""
 	return parsed.String()
-}
-
-func dropRawQueryFragment(raw string) string {
-	if i := strings.IndexAny(raw, "?#"); i >= 0 {
-		return raw[:i]
-	}
-	return raw
 }
 
 // scpIdentity returns an SCP identity. A user without ':' is kept, matching
@@ -2718,7 +2711,7 @@ func scpIdentity(raw string) (string, bool) {
 	if strings.Contains(user, ":") {
 		return rest, true
 	}
-	return dropRawQueryFragment(raw), true
+	return raw, true
 }
 
 // identityHasCredential reports a value that still carries a secret and

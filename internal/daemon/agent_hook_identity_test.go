@@ -33,6 +33,33 @@ func TestAgentHookTracksHistoricalRepoIdentity(t *testing.T) {
 	assert.Equal(t, historical, resolved.Identity)
 }
 
+func TestAgentHookTracksMainFormIdentity(t *testing.T) {
+	// These are the strings main's stripURLCredentials stores. They are
+	// written literally, not computed by the function under test.
+	for _, historical := range []string{
+		"deploy@git.example.internal:org/repo.git",
+		"https://host.example/org/repo@v2.git",
+	} {
+		t.Run(historical, func(t *testing.T) {
+			db := testutil.OpenTestDB(t)
+			repo := testutil.NewTestRepo(t)
+			repo.AddRemote("origin", historical)
+			mainRoot, err := gitrepo.MainRoot(context.Background(), repo.Root)
+			require.NoError(t, err)
+			stored, err := db.GetOrCreateRepo(mainRoot, historical)
+			require.NoError(t, err)
+			require.Equal(t, historical, stored.Identity)
+
+			resolved, ok := daemonAgentHookSource{db: db}.ResolveTrackedRepo(
+				context.Background(), repo.Root, "main",
+			)
+			require.True(t, ok)
+			assert.True(t, resolved.Tracked)
+			assert.Equal(t, historical, resolved.Identity)
+		})
+	}
+}
+
 func TestAgentHookTracksSSHAndSCPIdentities(t *testing.T) {
 	cases := []struct{ remote, stored string }{
 		{"ssh://git@host/org/repo", "ssh://host/org/repo"},

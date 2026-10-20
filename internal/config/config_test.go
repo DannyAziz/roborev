@@ -1929,11 +1929,11 @@ func TestResolveRepoIdentityKeepsMainSCPAndPathAt(t *testing.T) {
 	dir := t.TempDir()
 	assert := assert.New(t)
 	cases := []struct{ raw, want string }{
-		{"deploy@host:org/repo.git", "deploy@host:org/repo.git"},
+		{"deploy@git.example.internal:org/repo.git", "deploy@git.example.internal:org/repo.git"},
 		{"gitolite@git.example.com:org/repo.git", "gitolite@git.example.com:org/repo.git"},
 		{"org@vs-ssh.visualstudio.com:v3/org/project/repo", "org@vs-ssh.visualstudio.com:v3/org/project/repo"},
 		{"ssh://git@host/org/repo", "ssh://host/org/repo"},
-		{"https://example.com/foo@bar/repo.git", "https://example.com/foo@bar/repo.git"},
+		{"https://host.example/org/repo@v2.git", "https://host.example/org/repo@v2.git"},
 	}
 	for _, tc := range cases {
 		got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
@@ -1941,20 +1941,18 @@ func TestResolveRepoIdentityKeepsMainSCPAndPathAt(t *testing.T) {
 	}
 }
 
-func TestResolveRepoIdentityDropsWholeQueryAndFragment(t *testing.T) {
+func TestResolveRepoIdentityKeepsQueryAndFragment(t *testing.T) {
 	dir := t.TempDir()
 	assert := assert.New(t)
-	cases := []struct{ raw, want string }{
-		{"https://github.com/o/r.git?oauth_token=sekret", "https://github.com/o/r.git"},
-		{"https://github.com/o/r.git?password=sekret", "https://github.com/o/r.git"},
-		{"https://github.com/o/r.git?X-Amz-Signature=abc&x=1", "https://github.com/o/r.git"},
-		{"https://github.com/o/r.git#signed=1", "https://github.com/o/r.git"},
+	cases := []string{
+		"https://github.com/o/r.git?oauth_token=sekret",
+		"https://github.com/o/r.git?password=sekret",
+		"https://github.com/o/r.git?X-Amz-Signature=abc&x=1",
+		"https://github.com/o/r.git#signed=1",
 	}
-	for _, tc := range cases {
-		got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
-		assert.Equal(tc.want, got, tc.raw)
-		assert.NotContains(got, "sekret")
-		assert.NotContains(got, "X-Amz-Signature")
+	for _, raw := range cases {
+		got := ResolveRepoIdentity(dir, func(string, string) string { return raw })
+		assert.Equal(raw, got)
 	}
 }
 
