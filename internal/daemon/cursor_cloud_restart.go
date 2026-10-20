@@ -86,20 +86,25 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		repoURL = config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
 	}
 	if !agent.CursorCloudRepoUsable(repoURL) {
-		// A saved id was deleted above. Another VM from the same token is
-		// only visible to the marker sweep, so the row stays uncleaned.
-		if row.AgentID != "" {
-			return errors.Join(
-				fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID),
-				reportCloudLaunchOrphan(db, row),
-			)
+		// The repository cannot select a list filter. The token is unique,
+		// so the marker sweep still deletes by id. One list does not clean.
+		// A saved-id or token-only miss is noted once the launch is aged out.
+		found, err := agent.DeleteCursorCloudLaunchByToken(ctx, client, daemonID, row.Token)
+		if err != nil {
+			return err
 		}
-		// Nothing to list, so this is not list lag. A token-only row can still
-		// have a live VM. Surface the orphan on this start and every later
-		// start. The created_at age-out does not apply on this path. The row
-		// stays uncleaned. NoteCloudLaunchRisk is the NoteCleanupFailure path.
-		// A missed list still waits out created_at.
-		return reportCloudLaunchOrphan(db, row)
+		now := agent.CursorCloudNow()
+		since, _ := parseCloudLaunchCreated(row.CreatedAt)
+		// This call is the sweep. It is not a later empty sweep, so the gate
+		// does not clean. A miss is noted. A saved-id or token-only row is
+		// noted once it is aged out, including when the list was non-empty.
+		if agent.SweepAllowsClean(found, row.AgentID != "", false, since, now, cloudLaunchMaxAge) {
+			return db.MarkCloudLaunchCleanedByToken(row.Token)
+		}
+		if !found || cloudLaunchAgedOut(row.CreatedAt, now) {
+			return reportCloudLaunchOrphan(db, row)
+		}
+		return nil
 	}
 	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
 	if err != nil {
