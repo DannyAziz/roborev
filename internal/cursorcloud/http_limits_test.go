@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +21,9 @@ func TestDefaultResponseHeaderTimeout(t *testing.T) {
 	tr, ok := c.hc.Transport.(*http.Transport)
 	require.True(t, ok)
 	assert.Equal(t, defaultResponseHeaderTimeout, tr.ResponseHeaderTimeout)
+	assert.Equal(t, defaultRequestTimeout, c.requestTimeout)
+	assert.Equal(t, defaultResponseBodyTimeout, c.responseBodyTimeout)
+	assert.Equal(t, defaultResponseHeaderTimeout, c.requestTimeout)
 }
 
 func TestErrorBodyIsTruncated(t *testing.T) {
@@ -36,13 +41,10 @@ func TestErrorBodyIsTruncated(t *testing.T) {
 	assert.NotContains(t, apiErr.Message, "k")
 }
 
-func TestErrorBodyRedactsKeyStraddlingTruncation(t *testing.T) {
-	const key = "straddle-secret-key-value"
-	head := maxErrorMessageBytes - len(key)/2
-	body := strings.Repeat("a", head) + key + strings.Repeat("b", 64)
-	require.Greater(t, len(body), maxErrorMessageBytes)
-	require.Contains(t, body[:maxErrorMessageBytes], key[:8])
-
+func TestErrorBodyRedactsSecretStraddlingTruncation(t *testing.T) {
+	const partial = "xxSECRETKEY-"
+	key := partial + "TAILVALUE"
+	body := strings.Repeat("x", maxErrorMessageBytes-len(partial)) + key
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, body)
@@ -52,46 +54,172 @@ func TestErrorBodyRedactsKeyStraddlingTruncation(t *testing.T) {
 	_, err := client.GetAgent(context.Background(), "bc_1")
 	var apiErr *APIError
 	require.ErrorAs(t, err, &apiErr)
+	assert.NotContains(t, apiErr.Message, partial)
 	assert.NotContains(t, apiErr.Message, key)
-	assert.NotContains(t, apiErr.Message, key[:8])
+	assert.NotContains(t, err.Error(), partial)
+	assert.Contains(t, apiErr.Message, "[REDACTED]")
 	assert.LessOrEqual(t, len(apiErr.Message), maxErrorMessageBytes)
 }
 
 func TestHTTPBodyStallAfterHeadersTimesOut(t *testing.T) {
-	old := responseBodyTimeout
-	responseBodyTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { responseBodyTimeout = old })
+	synctest.Test(t, func(t *testing.T) {
+		const bodyLimit = 30 * time.Second
+		release := make(chan struct{})
+		body := &stallBody{release: release, unblockOnClose: true}
+		client := clientWithStallBody(body, time.Hour, bodyLimit)
+		errc := make(chan error, 1)
+		go func() {
+			_, err := client.GetAgent(context.Background(), "bc_1")
+			errc <- err
+		}()
+		synctest.Wait()
+		synctest.Sleep(bodyLimit)
+		requireBodyDeadline(t, errc)
+	})
+}
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		close(started)
+func TestHTTPRequestDeadlineCoversBodyRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const requestLimit = 45 * time.Second
+		release := make(chan struct{})
+		body := &stallBody{release: release, unblockOnClose: true}
+		client := clientWithStallBody(body, requestLimit, time.Hour)
+		errc := make(chan error, 1)
+		go func() {
+			_, err := client.GetAgent(context.Background(), "bc_1")
+			errc <- err
+		}()
+		synctest.Wait()
+		synctest.Sleep(requestLimit)
+		requireBodyDeadline(t, errc)
+	})
+}
+
+func TestHTTPBodyCloseDoesNotPinCaller(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const bodyLimit = 30 * time.Second
+		release := make(chan struct{})
+		body := &stallBody{release: release}
+		client := clientWithStallBody(body, time.Hour, bodyLimit)
+		errc := make(chan error, 1)
+		go func() {
+			_, err := client.GetAgent(context.Background(), "bc_1")
+			errc <- err
+		}()
+		synctest.Wait()
+		synctest.Sleep(bodyLimit)
+		requireBodyDeadline(t, errc)
+		// Read is still blocked. Releasing it lets the abandoned reader
+		// exit so the bubble can finish.
+		body.unblock()
+	})
+}
+
+func TestHTTPBodyReadCancelDoesNotWaitForBodyTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		body := &stallBody{release: release, unblockOnClose: true}
+		client := clientWithStallBody(body, time.Hour, time.Hour)
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() {
+			_, err := client.GetAgent(ctx, "bc_1")
+			errc <- err
+		}()
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		var err error
 		select {
-		case <-release:
-		case <-r.Context().Done():
+		case err = <-errc:
+		default:
 		}
+		require.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+func TestHTTPInjectedClientHeaderStallReturnsDeadline(t *testing.T) {
+	// A socket read is not a durable block, so a synctest bubble cannot
+	// advance this deadline while Client.Do waits for headers.
+	const limit = 200 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
 	}))
 	t.Cleanup(srv.Close)
-	t.Cleanup(func() { close(release) })
 
+	client := NewHTTPClient("k", WithBaseURL(srv.URL), WithHTTPClient(&http.Client{})).(*httpClient)
+	client.requestTimeout = limit
 	errc := make(chan error, 1)
 	go func() {
-		client := NewHTTPClient("k", WithBaseURL(srv.URL))
 		_, err := client.GetAgent(context.Background(), "bc_1")
 		errc <- err
 	}()
+	var err error
 	select {
-	case err := <-errc:
-		require.ErrorContains(t, err, "response body deadline exceeded")
-	case <-time.After(2 * time.Second):
-		t.Fatal("GetAgent blocked after response headers")
+	case err = <-errc:
+	case <-time.After(2 * time.Second): // socket stall; synctest cannot drive it
 	}
-	<-started
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func requireBodyDeadline(t *testing.T, errc <-chan error) {
+	t.Helper()
+	var err error
+	select {
+	case err = <-errc:
+	default:
+	}
+	require.ErrorContains(t, err, "response body deadline exceeded")
+}
+
+type stallBody struct {
+	once           sync.Once
+	release        chan struct{}
+	unblockOnClose bool
+}
+
+func (b *stallBody) unblock() {
+	b.once.Do(func() { close(b.release) })
+}
+
+func (b *stallBody) Read([]byte) (int, error) {
+	<-b.release
+	return 0, io.EOF
+}
+
+func (b *stallBody) Close() error {
+	if b.unblockOnClose {
+		b.unblock()
+	}
+	return nil
+}
+
+type limitRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f limitRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func clientWithStallBody(body io.ReadCloser, requestLimit, bodyLimit time.Duration) *httpClient {
+	hc := &http.Client{Transport: limitRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        make(http.Header),
+			Body:          body,
+			ContentLength: -1,
+		}, nil
+	})}
+	client := NewHTTPClient("k", WithHTTPClient(hc), WithBaseURL("https://example.com")).(*httpClient)
+	client.requestTimeout = requestLimit
+	client.responseBodyTimeout = bodyLimit
+	return client
 }
 
 func TestHTTPOversizedBodyErrors(t *testing.T) {
