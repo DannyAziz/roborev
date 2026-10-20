@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
@@ -54,6 +55,15 @@ func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorclou
 	return errors.Join(errs...)
 }
 
+// cloudLaunchMaxAge is how long a token-only row may miss List Agents before
+// that miss is an orphan risk. The list can lag the create, so a young miss
+// is not a delete and not a 404: the row stays uncleaned and the next start
+// sweeps it again. A crash before the POST saved a token and no VM; 24h is
+// long enough that a same-day restart still retries a lagging list, and short
+// enough that a no-POST row cannot sit pending forever. Past that age the row
+// is still not cleaned. The risk is written to the log and the job error.
+const cloudLaunchMaxAge = 24 * time.Hour
+
 func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorcloud.Client, daemonID string, row storage.CloudLaunch) error {
 	if row.AgentID != "" {
 		log.Printf("cursor-cloud: stop interrupted agent %s for job %d", row.AgentID, row.JobID)
@@ -61,11 +71,46 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 			return err
 		}
 	}
-	if row.Token != "" {
-		repoURL := config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
-		if err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL); err != nil {
-			return err
+	if row.Token == "" {
+		return db.MarkCloudLaunchCleaned(row.ID)
+	}
+	repoURL := row.RepoIdentity
+	if !agent.CursorCloudRepoUsable(repoURL) {
+		repoURL = config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
+	}
+	if !agent.CursorCloudRepoUsable(repoURL) {
+		if row.AgentID != "" {
+			return db.MarkCloudLaunchCleaned(row.ID)
 		}
+		return fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID)
+	}
+	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
+	if err != nil {
+		return err
+	}
+	// A token with no saved agent id is cleaned only when this list contained
+	// it. An empty list is the lag, not a confirmed delete.
+	if row.AgentID == "" && !found {
+		if cloudLaunchAgedOut(row.CreatedAt, time.Now().UTC()) {
+			return reportCloudLaunchOrphan(db, row)
+		}
+		return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
 	}
 	return db.MarkCloudLaunchCleaned(row.ID)
+}
+
+func cloudLaunchAgedOut(createdAt string, now time.Time) bool {
+	created, err := time.ParseInLocation("2006-01-02 15:04:05", createdAt, time.UTC)
+	if err != nil {
+		if created, err = time.Parse(time.RFC3339, createdAt); err != nil {
+			return false
+		}
+	}
+	return !created.Add(cloudLaunchMaxAge).After(now)
+}
+
+func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch) error {
+	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within %s", row.JobID, row.ID, cloudLaunchMaxAge)
+	log.Print(msg)
+	return db.NoteCloudLaunchRisk(row.JobID, msg)
 }

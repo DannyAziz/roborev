@@ -478,6 +478,16 @@ func (wp *WorkerPool) handleUpdateInterruptionLocked(
 	if !targeted {
 		return false
 	}
+	// A sent cursor-cloud create must not be queued again.
+	failedSent, err := wp.db.FailSentCloudLaunch(job.ID, workerID)
+	if err != nil {
+		log.Printf("[%s] Error failing sent cursor-cloud launch for update-interrupted job %d: %v", workerID, job.ID, err)
+		return true
+	}
+	if failedSent {
+		log.Printf("[%s] cursor-cloud sent launch for job %d was not requeued", workerID, job.ID)
+		return true
+	}
 	requeued, err := wp.db.RequeueUpdateInterruptedJob(job.ID, workerID)
 	if err != nil {
 		log.Printf("[%s] Error requeueing update-interrupted job %d: %v", workerID, job.ID, err)
@@ -703,12 +713,15 @@ func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.Review
 	copied := *cloud
 	machineID, err := wp.db.GetMachineID()
 	if err != nil {
-		copied.BindLaunch = func(string) error { return err }
+		copied.BindLaunch = func(string, string) error { return err }
 		return &copied
 	}
 	copied.DaemonID = machineID.String() //nolint:forbidigo // launch marker is prompt text
-	copied.BindLaunch = func(token string) error { return wp.db.BeginCloudLaunch(job.ID, workerID, token) }
+	copied.BindLaunch = func(token, repoURL string) error {
+		return wp.db.BeginCloudLaunch(job.ID, workerID, token, repoURL)
+	}
 	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
+	copied.NoteCleanupFailure = func(msg string) error { return wp.db.NoteCloudLaunchRisk(job.ID, msg) }
 	return &copied
 }
 

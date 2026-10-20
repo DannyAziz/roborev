@@ -181,8 +181,11 @@ type CursorCloudAgent struct {
 	// leaves it nil and uses cursorCloudLaunches.
 	launches   *cursorCloudLaunchGate
 	DaemonID   string
-	BindLaunch func(token string) error
+	BindLaunch func(token, repoURL string) error
 	BindAgent  func(token, id string) error
+	// NoteCleanupFailure records a stop or delete that did not finish.
+	// The launch row stays uncleaned.
+	NoteCleanupFailure func(msg string) error
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -222,6 +225,12 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	if a == nil {
 		a = &CursorCloudAgent{}
 	}
+	// The registry agent has no Client. Batch and plan call Review on that
+	// agent, which has no launch row. The worker sets BindLaunch first.
+	// A test double sets Client and may omit the binding.
+	if a.Client == nil && a.BindLaunch == nil {
+		return "", errors.New("cursor-cloud: refusing to launch without a daemon launch binding")
+	}
 	client, err := a.client()
 	if err != nil {
 		if IsCursorCloudConfig(err) {
@@ -258,7 +267,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// be found by listing agents and reading the conversation.
 	token := newLaunchToken()
 	if a.BindLaunch != nil {
-		if bindErr := a.BindLaunch(token); bindErr != nil {
+		if bindErr := a.BindLaunch(token, repoURL); bindErr != nil {
 			refund()
 			return "", bindErr
 		}
@@ -297,8 +306,15 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		if delErr == nil {
 			return
 		}
-		// A review whose VM was not deleted is not success. The sentinel
-		// keeps the worker from POSTing /agents again to clean it up.
+		// The VM is still there. Say so now; the row stays uncleaned for the
+		// next startup sweep. Do not wait for that restart to mention it.
+		msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup for agent %s: %v", created.ID, delErr)
+		log.Print(msg)
+		if a.NoteCleanupFailure != nil {
+			if noteErr := a.NoteCleanupFailure(msg); noteErr != nil {
+				delErr = errors.Join(delErr, noteErr)
+			}
+		}
 		if err != nil {
 			err = errors.Join(err, delErr)
 			return
@@ -643,26 +659,34 @@ func StopAndDeleteCursorCloudAgent(client cursorcloud.Client, id string) error {
 	return deleteCursorCloudAgent(client, id, nil)
 }
 
-func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) error {
-	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || strings.TrimSpace(repoURL) == "" {
-		return errors.New("cursor-cloud: cleanup marker is incomplete")
+// CursorCloudRepoUsable is false for empty input and the redacted-url sentinel.
+func CursorCloudRepoUsable(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == config.RedactedURL {
+		return false
+	}
+	return config.RemoteIdentity(raw) != ""
+}
+
+func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) (bool, error) {
+	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || !CursorCloudRepoUsable(repoURL) {
+		return false, errors.New("cursor-cloud: cleanup marker is incomplete")
 	}
 	listCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 	agents, err := client.ListAgents(listCtx)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+		return false, fmt.Errorf("cursor-cloud: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	_, err = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
-	return err
+	return deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
 }
 
 func sameCursorCloudRepo(want, got string) bool {
-	// A missing or unparseable source is not evidence of this repository.
-	// The launch token is only read after the source names the same repo.
-	if strings.TrimSpace(want) == "" || strings.TrimSpace(got) == "" {
+	// A missing, redacted, or unparseable source is not evidence of this
+	// repository. The launch token is only read after the source names it.
+	if !CursorCloudRepoUsable(want) || !CursorCloudRepoUsable(got) {
 		return false
 	}
 	wantID := config.RemoteIdentity(want)

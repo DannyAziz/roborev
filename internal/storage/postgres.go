@@ -22,26 +22,16 @@ import (
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
-// v24 adds review_job_cloud_launches. backup_auto is local SQLite state, like budget_routing_locked,
+// It stays at 23: backup_auto is local SQLite state, like budget_routing_locked,
 // and is not a Postgres column. Writing 24 would make older binaries refuse
 // the shared database ("schema version 24 is newer").
-const pgSchemaVersion = 24
+const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
 //go:embed schemas/postgres_v23.sql
 var pgSchemaSQL string
-
-func (p *PgPool) ensureCloudLaunchTable(ctx context.Context) error {
-	_, err := p.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
-		id BIGSERIAL PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES review_jobs(id) ON DELETE CASCADE,
-		launch_token TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', cleaned BOOLEAN NOT NULL DEFAULT FALSE)`)
-	if err != nil {
-		return fmt.Errorf("cloud launch table: %w", err)
-	}
-	return nil
-}
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
 // Parsed from the embedded SQL file.
@@ -189,9 +179,6 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 	}
 
 	if currentVersion == 0 {
-		if err = p.ensureCloudLaunchTable(ctx); err != nil {
-			return err
-		}
 		// First time - insert version with ON CONFLICT to handle races
 		_, err = p.pool.Exec(ctx, `INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, pgSchemaVersion)
 		if err != nil {
@@ -484,11 +471,6 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 			// so every machine can label the review and compose its banner.
 			if _, err = p.pool.Exec(ctx, `ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS non_voting BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
 				return fmt.Errorf("v23 migration (add non_voting): %w", err)
-			}
-		}
-		if currentVersion < 24 {
-			if err = p.ensureCloudLaunchTable(ctx); err != nil {
-				return err
 			}
 		}
 		// Update version

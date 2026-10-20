@@ -392,6 +392,32 @@ func TestCloudLaunchTableMigrationKeepsRows(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCloudLaunchIdentityMigrationKeepsRows(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	_, err := db.Exec(`DROP TABLE review_job_cloud_launches`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE review_job_cloud_launches (
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT NOT NULL,
+		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO review_job_cloud_launches (job_id, launch_token, agent_id) VALUES (7, 'keep-tok', 'bc_old')`)
+	require.NoError(t, err)
+
+	require.NoError(t, db.ensureCloudLaunchTable())
+	require.NoError(t, db.ensureCloudLaunchTable())
+
+	var token, agentID, ident, created string
+	var cleaned int
+	require.NoError(t, db.QueryRow(`SELECT launch_token, agent_id, repo_identity, created_at, cleaned
+		FROM review_job_cloud_launches WHERE job_id = 7`).Scan(&token, &agentID, &ident, &created, &cleaned))
+	assert.Equal(t, "keep-tok", token)
+	assert.Equal(t, "bc_old", agentID)
+	assert.Empty(t, ident)
+	assert.NotEmpty(t, created)
+	assert.Equal(t, 0, cleaned)
+}
+
 func TestMigrationFromOldSchema(t *testing.T) {
 	t.Parallel()
 	db := prepareMigratedDB(
