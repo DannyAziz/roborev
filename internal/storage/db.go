@@ -2429,13 +2429,16 @@ func (db *DB) ResetStaleJobs() error {
 		return err
 	}
 	now := time.Now().Format(time.RFC3339)
+	// A sent cursor-cloud create must not be queued again. Cleanup can mark
+	// the launch row cleaned before CompleteJob, and the backup can be
+	// cursor-cloud while agent is still the primary.
 	if _, err := db.Exec(`
 		UPDATE review_jobs
 		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
 		    updated_at = ?, synced_at = NULL
 		WHERE status = 'running' AND (
-		  id IN (SELECT job_id FROM review_job_cloud_launches WHERE cleaned = 0)
-		  OR (agent = 'cursor-cloud' AND agent_invoked = 1))
+		  id IN (SELECT job_id FROM review_job_cloud_launches)
+		  OR (agent_invoked = 1 AND (agent = 'cursor-cloud' OR backup_agent = 'cursor-cloud')))
 	`, now, CloudLaunchInterruptedError, now); err != nil {
 		return err
 	}

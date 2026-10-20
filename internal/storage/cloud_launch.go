@@ -139,16 +139,18 @@ func (db *DB) NoteCloudLaunchRisk(jobID int64, msg string) error {
 	return err
 }
 
-// FailSentCloudLaunch fails a running cursor-cloud attempt that already
-// launched. Other jobs are unchanged, and the launch row stays uncleaned.
+// FailSentCloudLaunch fails a running attempt that already launched a
+// cursor-cloud VM. Any launch row counts, including one deferred cleanup
+// already marked cleaned, and so does agent_invoked when the primary or
+// the backup is cursor-cloud. Other jobs are unchanged.
 func (db *DB) FailSentCloudLaunch(jobID int64, workerID string) (bool, error) {
 	now := time.Now().Format(time.RFC3339)
 	res, err := db.Exec(`UPDATE review_jobs
 		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
 		    updated_at = ?, synced_at = NULL
 		WHERE id = ? AND status = 'running' AND worker_id = ?
-		  AND (id IN (SELECT job_id FROM review_job_cloud_launches WHERE cleaned = 0)
-		    OR (agent = 'cursor-cloud' AND agent_invoked = 1))`,
+		  AND (id IN (SELECT job_id FROM review_job_cloud_launches)
+		    OR (agent_invoked = 1 AND (agent = 'cursor-cloud' OR backup_agent = 'cursor-cloud')))`,
 		now, CloudLaunchInterruptedError, now, jobID, workerID)
 	if err != nil {
 		return false, err
