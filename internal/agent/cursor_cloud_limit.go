@@ -49,9 +49,10 @@ func (a *CursorCloudAgent) launchGate() *cursorCloudLaunchGate {
 	return cursorCloudLaunches
 }
 
-func (g *cursorCloudLaunchGate) acquire() (func(), error) {
+func (g *cursorCloudLaunchGate) acquire() (func(), func(), error) {
+	noop := func() {}
 	if g == nil {
-		return func() {}, nil
+		return noop, noop, nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -62,20 +63,35 @@ func (g *cursorCloudLaunchGate) acquire() (func(), error) {
 	concurrent, perHour := g.limits()
 	g.prune(now)
 	if g.active >= concurrent {
-		return nil, fmt.Errorf("cursor-cloud: launch refused: %d agents already running (max concurrent %d)", g.active, concurrent)
+		return nil, nil, fmt.Errorf("cursor-cloud: launch refused: %d agents already running (max concurrent %d)", g.active, concurrent)
 	}
 	if len(g.launched) >= perHour {
-		return nil, fmt.Errorf("cursor-cloud: launch refused: %d launches in the last hour (max %d per hour)", len(g.launched), perHour)
+		return nil, nil, fmt.Errorf("cursor-cloud: launch refused: %d launches in the last hour (max %d per hour)", len(g.launched), perHour)
 	}
 	g.active++
-	g.launched = append(g.launched, now)
-	return func() {
+	stamp := now
+	g.launched = append(g.launched, stamp)
+	release := func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		if g.active > 0 {
 			g.active--
 		}
-	}, nil
+	}
+	// refund drops the hourly charge. Call it only when the POST cannot
+	// have been sent. A create that may have reached the server keeps the
+	// charge so a retry cannot buy a second VM inside the cap.
+	refund := func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for i, item := range g.launched {
+			if item.Equal(stamp) {
+				g.launched = append(g.launched[:i], g.launched[i+1:]...)
+				return
+			}
+		}
+	}
+	return release, refund, nil
 }
 
 func (g *cursorCloudLaunchGate) limits() (concurrent, perHour int) {

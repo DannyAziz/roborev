@@ -35,20 +35,24 @@ const (
 	// cursorCloudDeleteAttempts bounds retries of one failed DELETE.
 	// A 4xx is not retried; it will not succeed on the next attempt.
 	cursorCloudDeleteAttempts = 3
-	// cursorCloudDeleteBackoff is the pause between transient DELETE attempts.
+	// cursorCloudDeleteBackoff separates this process's DELETE attempts.
+	// DELETE /v0/agents does not define a retry interval
+	// (https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent).
+	// 100ms only keeps the three local attempts from being one burst.
 	cursorCloudDeleteBackoff = 100 * time.Millisecond
-	// cursorCloudReconcileWindow is how long a lost create keeps starting
-	// another list. It does not cancel a list or conversation call that
-	// has already started; those use cursorCloudDeleteTimeout.
-	//
-	// The window is 60s, the bound reconcile used before it was shortened.
-	// 500ms was only longer than this package's test fixture (a 300ms
-	// handler sleep against a 50ms client timeout) and is not a measured
-	// publish lag.
-	cursorCloudReconcileWindow = 60 * time.Second
 	// cursorCloudReconcileBackoff is the pause between those lists.
 	cursorCloudReconcileBackoff = 50 * time.Millisecond
 )
+
+// cursorCloudReconcileWindow is how long a lost create keeps starting
+// another list. It does not cancel a list or conversation call that
+// has already started; those use cursorCloudDeleteTimeout.
+//
+// The window is 60s, the bound reconcile used before it was shortened.
+// 500ms was only longer than this package's test fixture (a 300ms
+// handler sleep against a 50ms client timeout) and is not a measured
+// publish lag.
+var cursorCloudReconcileWindow = 60 * time.Second
 
 // cursorCloudDeleteTimeout bounds one stop, one DELETE, one reconcile list,
 // or one reconcile conversation read. Each call gets its own context. The
@@ -202,24 +206,27 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		if IsCursorCloudConfig(err) {
 			return "", err
 		}
-		return "", cursorCloudNonRetryable(err)
+		// Client setup has not launched. A local backup may run it.
+		return "", MarkUnavailable(err)
 	}
 	sha, err := a.commitSHA(ctx, repoPath, commitSHA)
 	if err != nil {
-		return "", cursorCloudNonRetryable(err)
+		return "", MarkUnavailable(err)
 	}
 	repoURL, err := a.repoURL(repoPath)
 	if err != nil {
-		return "", cursorCloudNonRetryable(err)
+		return "", MarkUnavailable(err)
 	}
 	// Every cloud call runs under a deadline. withTimeout keeps one the
 	// caller already set, and otherwise uses the host handoff bound.
 	ctx, cancel := a.withTimeout(ctx)
 	defer cancel()
 
-	release, err := a.launchGate().acquire()
+	release, refund, err := a.launchGate().acquire()
 	if err != nil {
-		return "", cursorCloudNonRetryable(err)
+		// The cap refused before CreateAgent. Nothing was launched, so a
+		// local backup may take the job. The hourly counter was not charged.
+		return "", MarkUnavailable(err)
 	}
 	defer release()
 
@@ -237,10 +244,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		Title:  cursorCloudTitle(repoURL, sha),
 	})
 	if err != nil {
-		if !cursorCloudPreSend(err) {
-			if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
-				err = errors.Join(err, recErr)
-			}
+		if cursorCloudPreSend(err) {
+			// The POST never left, so this attempt does not spend the hour.
+			refund()
+		} else if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
+			err = errors.Join(err, recErr)
 		}
 		return "", cursorCloudLaunchErr(err)
 	}
@@ -362,19 +370,24 @@ func cursorCloudLaunchErr(err error) error {
 }
 
 // cursorCloudPreSend reports a failure that cannot have transmitted the
-// launch. Only a dial or connect qualifies. A timeout or a dropped response
-// is not proof that the POST never left.
+// launch. net.OpError.Op is "dial" while Dial is still establishing the
+// socket, and a DNSError is that lookup failing before a connection exists
+// (https://pkg.go.dev/net#OpError, https://pkg.go.dev/net#DNSError).
+// "read" and "write" mean the conn already exists, so the POST may have
+// been sent. A timeout or a dropped response is not proof that it never left.
 func cursorCloudPreSend(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) && dns != nil {
+		return true
+	}
 	var op *net.OpError
 	if !errors.As(err, &op) || op == nil {
 		return false
 	}
-	switch op.Op {
-	case "dial", "connect":
-		return true
-	default:
-		return false
-	}
+	return op.Op == "dial"
 }
 
 func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writer) error {
@@ -402,10 +415,11 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 		delCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
 		err = client.DeleteAgent(delCtx, id)
 		cancel()
-		if err == nil || cursorCloudDeleteFinal(err) {
-			if err == nil {
-				return nil
-			}
+		if err == nil || cursorCloudDeleteGone(err) {
+			// 404 means the agent is already gone. That attempt is done.
+			return nil
+		}
+		if cursorCloudDeleteFinal(err) {
 			break
 		}
 	}
@@ -417,16 +431,24 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 	return surfaced
 }
 
+// cursorCloudDeleteFinal reports a DELETE that must not be retried.
+// 4xx other than 404 is the client's request, not a transient server
+// failure. 500 is not final: it is retried, and the delete stays not-done
+// when every attempt fails.
+func cursorCloudDeleteFinal(err error) bool {
+	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
+	return ok && apiErr != nil && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusNotFound
+}
+
+// cursorCloudDeleteGone reports a DELETE whose agent is already absent.
+func cursorCloudDeleteGone(err error) bool {
+	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
+	return ok && apiErr != nil && apiErr.StatusCode == http.StatusNotFound
+}
+
 // cursorCloudStopQuiet reports a stop that failed because the agent was
 // already finished or stopped. That response is expected after a successful
 // review and is not written to the review output.
-// cursorCloudDeleteFinal reports a DELETE that must not be retried.
-// 4xx is the client's request, not a transient server failure.
-func cursorCloudDeleteFinal(err error) bool {
-	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
-	return ok && apiErr != nil && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
-}
-
 func cursorCloudStopQuiet(err error) bool {
 	if err == nil {
 		return false
@@ -465,6 +487,7 @@ func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string
 	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
+	foundLaunch := false
 	for attempt := 0; ; attempt++ {
 		// The first list always starts. Later lists start only while the
 		// window is still open, and the check does not cancel the list
@@ -482,12 +505,16 @@ func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string
 				errs = append(errs, matchErr)
 			}
 			if found {
+				foundLaunch = true
 				break
 			}
 		}
 		if waitCursorCloud(context.Background(), cursorCloudReconcileBackoff) != nil {
 			break
 		}
+	}
+	if !foundLaunch {
+		errs = append(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
 	}
 	return errors.Join(errs...)
 }
@@ -518,8 +545,10 @@ func deleteMatchingCursorCloudLaunch(client cursorcloud.Client, agents []cursorc
 }
 
 func sameCursorCloudRepo(want, got string) bool {
-	if strings.TrimSpace(got) == "" {
-		return true
+	// A missing or unparseable source is not evidence of this repository.
+	// The launch token is only read after the source names the same repo.
+	if strings.TrimSpace(want) == "" || strings.TrimSpace(got) == "" {
+		return false
 	}
 	wantID := config.RemoteIdentity(want)
 	gotID := config.RemoteIdentity(got)

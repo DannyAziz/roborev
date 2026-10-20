@@ -1418,9 +1418,9 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		}
 		// A cursor-cloud create that may already have been sent, including a
 		// 429 and a deadline after send, and a wait-loop timeout, carries
-		// ErrCursorCloudNonRetryable. Honor that before the deadline path
-		// below, which would otherwise drop the sentinel and requeue a
-		// second POST /agents.
+		// ErrCursorCloudNonRetryable. Pre-launch validation and the launch
+		// cap do not. Honor the sentinel before the deadline path below,
+		// which would otherwise drop it and requeue a second POST /agents.
 		if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
 			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
 			wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)

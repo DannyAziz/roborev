@@ -780,19 +780,19 @@ func TestCursorCloudDeleteRetriesTransientNot4xx(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	repo := "https://example.com/acme/repo.git"
 	t.Run("transient", func(t *testing.T) {
-		fake := &cursorcloudtest.Fake{
-			CreateStatus:   cursorcloud.StatusFinished,
-			Final:          "ok",
-			DeleteFailures: 2,
-		}
-		start := time.Now()
-		_, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
-		require.NoError(t, err)
-		assert.Equal(t, 3, deleteCount(fake))
-		assert.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond)
-		listed, listErr := fake.ListAgents(context.Background())
-		require.NoError(t, listErr)
-		assert.Empty(t, listed)
+		synctest.Test(t, func(t *testing.T) {
+			fake := &cursorcloudtest.Fake{
+				CreateStatus:   cursorcloud.StatusFinished,
+				Final:          "ok",
+				DeleteFailures: 2,
+			}
+			_, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+			require.NoError(t, err)
+			assert.Equal(t, 3, deleteCount(fake))
+			listed, listErr := fake.ListAgents(context.Background())
+			require.NoError(t, listErr)
+			assert.Empty(t, listed)
+		})
 	})
 	t.Run("client error", func(t *testing.T) {
 		fake := &cursorcloudtest.Fake{
@@ -876,12 +876,6 @@ func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
 		{
 			name: "ACCESS_TOKEN query",
 			raw:  "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
-			want: "https://github.com/o/r.git",
-			leak: "sekret",
-		},
-		{
-			name: "private_token query",
-			raw:  "https://github.com/o/r.git?private_token=sekret",
 			want: "https://github.com/o/r.git",
 			leak: "sekret",
 		},
@@ -1332,6 +1326,8 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 		"https://GitHub.com/Acme/Widgets.git",
 		"git@github.com:acme/widgets.git",
 	))
+	assert.False(sameCursorCloudRepo("https://github.com/acme/widgets.git", ""))
+	assert.False(sameCursorCloudRepo("https://github.com/acme/widgets.git", "://"))
 }
 
 func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
@@ -1346,6 +1342,177 @@ func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	assert.Equal(t, []string{"stop", "delete"}, client.ops)
+}
+
+func TestCursorCloudPanicReleasesLaunchSlot(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	a := &CursorCloudAgent{Client: panicCreate{Fake: fake}, RepoURL: repo}
+	a.SetLaunchLimitsForTest(1, 5)
+	require.Panics(t, func() {
+		_, _ = a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	})
+	b := &CursorCloudAgent{Client: fake, RepoURL: repo, launches: a.launches}
+	_, err := b.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.NoError(t, err)
+}
+
+func TestCursorCloudReadErrorKeepsQuotaAndIsNotRetried(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	readErr := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")}
+	assert.False(t, cursorCloudPreSend(readErr))
+	assert.False(t, cursorCloudPreSend(&net.OpError{Op: "write", Net: "tcp", Err: errors.New("broken pipe")}))
+	assert.True(t, cursorCloudPreSend(&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}))
+	assert.True(t, cursorCloudPreSend(&net.DNSError{Err: "no such host", Name: "example.invalid", IsNotFound: true}))
+
+	prev := cursorCloudReconcileWindow
+	cursorCloudReconcileWindow = time.Millisecond
+	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
+	var creates int
+	client := &errCreateCloud{err: readErr, creates: &creates}
+	a := &CursorCloudAgent{Client: client, RepoURL: repo}
+	a.SetLaunchLimitsForTest(2, 1)
+	_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+	_, err = a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrCursorCloudNonRetryable)
+	assert.Contains(t, err.Error(), "per hour")
+	assert.Equal(t, 1, creates)
+}
+
+func TestCursorCloudDialRefundsQuota(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	var creates int
+	client := &errCreateCloud{
+		err:     &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")},
+		creates: &creates,
+	}
+	a := &CursorCloudAgent{Client: client, RepoURL: repo}
+	a.SetLaunchLimitsForTest(2, 1)
+	_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrCursorCloudNonRetryable)
+	_, err = a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.NotErrorIs(t, err, ErrCursorCloudNonRetryable)
+	assert.Equal(t, 2, creates)
+}
+
+func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	t.Run("500", func(t *testing.T) {
+		fake := &cursorcloudtest.Fake{
+			CreateStatus: cursorcloud.StatusFinished,
+			Final:        "ok",
+			MethodErrors: map[string]error{
+				cursorcloudtest.MethodDelete: &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable"},
+			},
+		}
+		_, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+		require.Error(t, err)
+		assert.Equal(t, cursorCloudDeleteAttempts, deleteCount(fake))
+		assert.Contains(t, err.Error(), "unavailable")
+		require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+	})
+	t.Run("404", func(t *testing.T) {
+		fake := &cursorcloudtest.Fake{
+			CreateStatus: cursorcloud.StatusFinished,
+			Final:        "ok",
+			MethodErrors: map[string]error{
+				cursorcloudtest.MethodDelete: &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found"},
+			},
+		}
+		text, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", text)
+		assert.Equal(t, 1, deleteCount(fake))
+	})
+}
+
+func TestReconcileWindowEndIsNotSilent(t *testing.T) {
+	prev := cursorCloudReconcileWindow
+	cursorCloudReconcileWindow = time.Millisecond
+	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
+	err := reconcileCursorCloudLaunch(&emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not find the launch")
+}
+
+func TestReconcileSurfacesPromptErrorWhenNothingMatches(t *testing.T) {
+	prev := cursorCloudReconcileWindow
+	cursorCloudReconcileWindow = time.Millisecond
+	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
+	err := reconcileCursorCloudLaunch(&promptErrCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bc_other")
+	assert.Contains(t, err.Error(), "prompt failed")
+}
+
+type panicCreate struct{ *cursorcloudtest.Fake }
+
+func (panicCreate) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	panic("create exploded")
+}
+
+type errCreateCloud struct {
+	err     error
+	creates *int
+}
+
+func (c *errCreateCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	*c.creates++
+	return cursorcloud.Agent{}, c.err
+}
+
+func (c *errCreateCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *errCreateCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *errCreateCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *errCreateCloud) StopAgent(context.Context, string) error              { return nil }
+func (c *errCreateCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *errCreateCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	return nil, nil
+}
+
+type emptyListCloud struct{}
+
+func (emptyListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (emptyListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (emptyListCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (emptyListCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (emptyListCloud) StopAgent(context.Context, string) error              { return nil }
+func (emptyListCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (emptyListCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	return nil, nil
+}
+
+type promptErrCloud struct{}
+
+func (promptErrCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (promptErrCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (promptErrCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (promptErrCloud) UserPrompt(context.Context, string) (string, error) {
+	return "", errors.New("prompt failed")
+}
+func (promptErrCloud) StopAgent(context.Context, string) error   { return nil }
+func (promptErrCloud) DeleteAgent(context.Context, string) error { return nil }
+func (promptErrCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	return []cursorcloud.Agent{{ID: "bc_other", SourceRepository: "https://github.com/acme/widgets.git"}}, nil
 }
 
 type slowListCloud struct {

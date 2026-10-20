@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -124,4 +125,71 @@ func TestSynthesisCursorCloudLaunchIsNotRetried(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, claimed)
 	assert.Contains(t, updated.Error, agent.ErrCursorCloudNonRetryable.Error())
+}
+
+// TestFailOrRetryExecutionContextKeepsCursorCloudSentinel pins the check
+// inside failOrRetryAgentExecutionContext. The processJob check is not on
+// this path, so removing only that earlier check leaves this test green.
+func TestFailOrRetryExecutionContextKeepsCursorCloudSentinel(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "test")
+	job.BackupAgent = "codex"
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, job.Agent,
+		fmt.Errorf("create agent: %w", agent.ErrCursorCloudNonRetryable),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.Equal(t, "test", updated.Agent)
+	assert.Equal(t, 0, updated.RetryCount)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
+}
+
+// TestProcessJobCursorCloudDeadlineCheckStandsAlone pins the processJob
+// check that runs before the deadline formatter. Removing only the
+// execution-context check still fails the job here, because this error is
+// both a deadline and the sentinel.
+func TestProcessJobCursorCloudDeadlineCheckStandsAlone(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.FakeAgent{
+		NameStr: agent.CursorCloudHost,
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			return "", fmt.Errorf("wait: %w", errors.Join(context.DeadlineExceeded, agent.ErrCursorCloudNonRetryable))
+		},
+	})
+	t.Cleanup(func() { agent.Register(prev) })
+
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	job.BackupAgent = "test"
+
+	tc.Pool.processJob(testWorkerID, job)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.Equal(t, agent.CursorCloudHost, updated.Agent)
+	assert.Equal(t, 0, updated.RetryCount)
+	claimed, claimErr := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, claimErr)
+	assert.Nil(t, claimed)
+}
+
+func TestCursorCloudPreLaunchValidationCanFailOver(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	job.BackupAgent = "test"
+
+	tc.Pool.processJob(testWorkerID, job)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
+	assert.Equal(t, 0, updated.RetryCount)
 }
