@@ -1435,6 +1435,20 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	})
 }
 
+func TestReconcileConversationRateLimitStops(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		prev := cursorCloudReconcileWindow
+		cursorCloudReconcileWindow = time.Minute
+		defer func() { cursorCloudReconcileWindow = prev }()
+		limited := &conversationLimitCloud{}
+		err := reconcileCursorCloudLaunch(context.Background(), limited, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		assert.Equal(t, 1, limited.lists)
+		assert.Equal(t, 1, limited.prompts)
+		assert.Contains(t, err.Error(), "slow down")
+	})
+}
+
 func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
 	prev := cursorCloudReconcileWindow
 	cursorCloudReconcileWindow = time.Minute
@@ -1528,6 +1542,37 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type conversationLimitCloud struct {
+	lists   int
+	prompts int
+}
+
+func (c *conversationLimitCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *conversationLimitCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *conversationLimitCloud) FinalMessage(context.Context, string) (string, error) {
+	return "", nil
+}
+func (c *conversationLimitCloud) UserPrompt(context.Context, string) (string, error) {
+	c.prompts++
+	return "", &cursorcloud.APIError{Op: "conversation", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
+}
+func (c *conversationLimitCloud) StopAgent(context.Context, string) error { return nil }
+func (c *conversationLimitCloud) DeleteAgent(context.Context, string) error {
+	return nil
+}
+func (c *conversationLimitCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	return []cursorcloud.Agent{
+		{ID: "bc_a", SourceRepository: "https://github.com/acme/widgets.git"},
+		{ID: "bc_b", SourceRepository: "https://github.com/acme/widgets.git"},
+	}, nil
 }
 
 type rateLimitCloud struct{ lists int }

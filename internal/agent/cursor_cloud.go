@@ -519,6 +519,12 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 				foundLaunch = true
 				break
 			}
+			// A conversation 429 stops the reconcile the same way a list 429
+			// does. Reading more candidates or listing again would keep
+			// spending the rate limit.
+			if cursorCloudRateLimited(matchErr) {
+				break
+			}
 		}
 		if waitCursorCloud(ctx, backoff) != nil {
 			break
@@ -564,6 +570,9 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 		text, promptErr := client.UserPrompt(ctx, ag.ID)
 		if promptErr != nil {
 			errs = append(errs, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, promptErr))
+			if cursorCloudRateLimited(promptErr) {
+				break
+			}
 			continue
 		}
 		if !strings.Contains(text, marker) {
