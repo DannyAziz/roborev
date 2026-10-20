@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -37,6 +38,19 @@ const (
 	cursorCloudDeleteTimeout = 60 * time.Second
 	// cursorCloudDeleteAttempts bounds retries of one failed DELETE.
 	cursorCloudDeleteAttempts = 3
+	// cursorCloudDeleteBackoff is the pause between those DELETE attempts.
+	// Each attempt has its own cursorCloudDeleteTimeout, so a stalled first
+	// call cannot consume the budget of the next. The gap is short so a
+	// transient failure is retried without holding cleanup for another minute.
+	cursorCloudDeleteBackoff = 100 * time.Millisecond
+	// cursorCloudReconcileAttempts is how many times a lost create is listed
+	// before the VM is left for the operator. One immediate list misses an
+	// agent that becomes visible slightly after the response is dropped.
+	cursorCloudReconcileAttempts = 3
+	// cursorCloudReconcileBackoff is the pause between those lists. It stays
+	// inside the reconcile context so a cancelled cleanup does not sleep out
+	// the full cursorCloudDeleteTimeout between attempts.
+	cursorCloudReconcileBackoff = 100 * time.Millisecond
 	// cursorCloudLaunchMarker prefixes the unique token embedded in the
 	// prompt. v0 launch has no idempotency key, so a create that fails after
 	// send is found again by this token.
@@ -217,7 +231,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	})
 	if err != nil {
 		if !cursorCloudPreSend(err) {
-			if recErr := reconcileCursorCloudLaunch(client, repoURL, sha, token, output); recErr != nil {
+			if recErr := reconcileCursorCloudLaunch(client, token, output); recErr != nil {
 				err = errors.Join(err, recErr)
 			}
 		}
@@ -282,7 +296,14 @@ func (a *CursorCloudAgent) repoURL(repoPath string) (string, error) {
 	}
 	// A credentialed remote (https://user:token@host/...) must not be sent to
 	// Cursor or stored on the launch. Strip before the URL is used anywhere.
-	return config.StripURLCredentials(raw), nil
+	// redacted-url means the secret could not be removed. Launching with that
+	// placeholder would send a review at a repository that does not exist and
+	// still counts as a create, so refuse before CreateAgent.
+	cleaned := config.StripURLCredentials(raw)
+	if cleaned == "" || cleaned == config.RedactedURL {
+		return "", errors.New("cursor-cloud: refusing to launch because the git remote credentials cannot be removed safely")
+	}
+	return cleaned, nil
 }
 
 // ErrCursorCloudNonRetryable marks a cursor-cloud launch that must not reach
@@ -343,14 +364,17 @@ func cursorCloudPreSend(err error) bool {
 }
 
 func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
-	defer cancel()
 	// Stop pauses the VM. v0 Delete is documented as permanent and does not
 	// say it stops billing, so stop runs first and delete still runs when
 	// stop fails. https://cursor.com/docs/cloud-agent/api/v0#stop-an-agent
 	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
-	if err := client.StopAgent(ctx, id); err != nil {
-		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, err)
+	// Stop and each DELETE get a fresh timeout. Sharing one 60s context let
+	// a stalled stop starve the deletes.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+	stopErr := client.StopAgent(stopCtx, id)
+	stopCancel()
+	if stopErr != nil && !cursorCloudStopQuiet(stopErr) {
+		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, stopErr)
 		log.Printf("%s", note.Error())
 		if output != nil {
 			fmt.Fprintln(output, note.Error())
@@ -358,7 +382,12 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 	}
 	var err error
 	for attempt := 1; attempt <= cursorCloudDeleteAttempts; attempt++ {
-		err = client.DeleteAgent(ctx, id)
+		if attempt > 1 {
+			time.Sleep(cursorCloudDeleteBackoff)
+		}
+		delCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+		err = client.DeleteAgent(delCtx, id)
+		cancel()
 		if err == nil {
 			return nil
 		}
@@ -371,44 +400,90 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 	return surfaced
 }
 
+// cursorCloudStopQuiet reports a stop that failed because the agent was
+// already finished or stopped. That response is expected after a successful
+// review and is not written to the review output.
+func cursorCloudStopQuiet(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	finished := strings.Contains(msg, "finish") || strings.Contains(msg, "stopped") || strings.Contains(msg, "not running")
+	if !finished {
+		return false
+	}
+	if apiErr, ok := errors.AsType[*cursorcloud.APIError](err); ok {
+		switch apiErr.StatusCode {
+		case http.StatusConflict, http.StatusBadRequest, http.StatusNotFound:
+			return true
+		default:
+			return strings.Contains(msg, "already")
+		}
+	}
+	return strings.Contains(msg, "already")
+}
+
 // reconcileCursorCloudLaunch finds an agent created by a launch whose
 // response never yielded an id, then stops and deletes it. v0 POST /v0/agents
 // has no idempotency key (Launch an Agent request body: prompt, model,
 // source, target, webhook). List Agents returns source.repository and
-// source.ref but not the prompt, so the match is the launch token in the
+// source.ref but not the prompt. Those fields are not compared: the service
+// may normalize them, so the match is only the launch token in the
 // conversation user_message.
 // https://cursor.com/docs/cloud-agent/api/v0#launch-an-agent
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents
 // https://cursor.com/docs/cloud-agent/api/v0#agent-conversation
-func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, ref, token string, output io.Writer) error {
+func reconcileCursorCloudLaunch(client cursorcloud.Client, token string, output io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
 	defer cancel()
-	agents, err := client.ListAgents(ctx)
-	if err != nil {
-		return fmt.Errorf("cursor-cloud: reconcile list: %w", err)
-	}
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
-	for _, ag := range agents {
-		if ag.SourceRepository != "" && ag.SourceRepository != repoURL {
+	for attempt := 1; attempt <= cursorCloudReconcileAttempts; attempt++ {
+		if attempt > 1 {
+			if err := waitCursorCloud(ctx, cursorCloudReconcileBackoff); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+		agents, err := client.ListAgents(ctx)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
-		if ag.SourceRef != "" && ag.SourceRef != ref {
-			continue
+		matched := false
+		for _, ag := range agents {
+			text, promptErr := client.UserPrompt(ctx, ag.ID)
+			if promptErr != nil {
+				errs = append(errs, fmt.Errorf("cursor-cloud: reconcile %s: %w", ag.ID, promptErr))
+				continue
+			}
+			if !strings.Contains(text, marker) {
+				continue
+			}
+			matched = true
+			if delErr := deleteCursorCloudAgent(client, ag.ID, output); delErr != nil {
+				errs = append(errs, delErr)
+			}
 		}
-		text, promptErr := client.UserPrompt(ctx, ag.ID)
-		if promptErr != nil {
-			errs = append(errs, fmt.Errorf("cursor-cloud: reconcile %s: %w", ag.ID, promptErr))
-			continue
-		}
-		if !strings.Contains(text, marker) {
-			continue
-		}
-		if delErr := deleteCursorCloudAgent(client, ag.ID, output); delErr != nil {
-			errs = append(errs, delErr)
+		if matched || ctx.Err() != nil {
+			break
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func waitCursorCloud(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func newLaunchToken() string {
@@ -505,14 +580,10 @@ func cloudFinalMessage(ctx context.Context, client cursorcloud.Client, id string
 	if err == nil {
 		return text, nil
 	}
-	if noAssistantMessage(err) {
+	if errors.Is(err, cursorcloud.ErrNoAssistantMessage) {
 		return "", fmt.Errorf("cursor-cloud agent %s finished with no assistant message: %w", id, err)
 	}
 	return "", err
-}
-
-func noAssistantMessage(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "no assistant message")
 }
 
 func cloudPrompt(prompt string, schema jsontext.Value) string {

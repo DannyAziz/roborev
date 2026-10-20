@@ -2579,8 +2579,15 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	}
 	remoteURL := getRemoteURL(repoPath, "")
 	if remoteURL != "" {
-		// Strip credentials from URL to avoid persisting secrets
-		return stripURLCredentials(remoteURL)
+		// Identity uses the historical strip, not the fail-closed launch
+		// redaction. stripURLCredentials collapses every unclean remote to
+		// one redacted-url, which would merge different repositories in
+		// Postgres sync. A result that still carries a credential falls
+		// through to the local:// path so the secret is not stored.
+		cleaned := stripRepoIdentityURL(remoteURL)
+		if cleaned != "" && cleaned != redactedURL && !identityHasCredential(cleaned) {
+			return cleaned
+		}
 	}
 
 	// 4. Fallback to local path
@@ -2592,49 +2599,131 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 }
 
 // StripURLCredentials removes credentials from a URL before it is sent or stored.
-// A URL that cannot be stripped safely becomes redactedURL.
+// A URL that cannot be stripped safely becomes RedactedURL.
 func StripURLCredentials(rawURL string) string {
 	return stripURLCredentials(rawURL)
 }
 
-// redactedURL is returned when a URL cannot be parsed or still carries a
-// credential. It contains no userinfo from the input.
-const redactedURL = "redacted-url"
+// RedactedURL is the fail-closed result of StripURLCredentials. It contains
+// no userinfo, query, or fragment from the input. Callers that would send
+// this value on must refuse instead of treating it as a repository URL.
+const RedactedURL = "redacted-url"
 
-// stripURLCredentials removes userinfo and access_token from a URL.
-// SCP git@host:path has no password and stays unchanged so the launch URL
-// still names the repository. user:password@host:path, a bad percent-escape,
-// and any URL that cannot be cleaned fail closed as redactedURL.
+// redactedURL is the same value for in-package callers.
+const redactedURL = RedactedURL
+
+// stripURLCredentials removes userinfo and credential query or fragment
+// parameters from a URL. SCP git@host:path has no password and stays
+// unchanged so the launch URL still names the repository.
+// user:password@host:path, a token in the SCP user slot, token query
+// keys, a bad percent-escape, and any URL that cannot be cleaned fail
+// closed as redactedURL.
 func stripURLCredentials(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		if strings.Contains(rawURL, "://") || userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
+		if strings.Contains(rawURL, "://") || credentialMaterial(rawURL) {
 			return redactedURL
 		}
 		return rawURL
 	}
-	if parsed.Scheme == "" {
-		if userinfoBeforeAt(rawURL) || strings.Contains(rawURL, "access_token=") {
+	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
+		// user:tok@host:o/r parses as scheme "user". A non-git SCP user
+		// such as ghp_x@github.com:o/r.git fails parsing. Both still carry
+		// a credential and must not be returned raw.
+		if credentialMaterial(rawURL) {
 			return redactedURL
 		}
 		return rawURL
-	}
-	if !transportScheme(parsed.Scheme) && strings.Contains(rawURL, "@") {
-		// user:tok@host:o/r parses as scheme "user" and would otherwise be returned raw.
-		return redactedURL
 	}
 	changed := false
 	if parsed.User != nil {
 		parsed.User = nil
 		changed = true
 	}
-	if stripAccessTokenQuery(parsed) {
+	if stripCredentialQuery(parsed) {
+		changed = true
+	}
+	if stripCredentialFragment(parsed) {
+		changed = true
+	}
+	if !changed {
+		if credentialMaterial(rawURL) {
+			return redactedURL
+		}
+		return rawURL
+	}
+	out := parsed.String()
+	if credentialMaterial(out) {
+		return redactedURL
+	}
+	return out
+}
+
+// stripRepoIdentityURL keeps the historical remote identity. Unlike
+// stripURLCredentials it never collapses two repositories to redactedURL.
+// git@host:path is unchanged. Any other SCP user is dropped so the host:path
+// stays distinct without storing the token. Transport URLs lose userinfo
+// and credential query or fragment keys.
+func stripRepoIdentityURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		if id, ok := scpIdentity(rawURL); ok {
+			return id
+		}
+		return rawURL
+	}
+	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
+		if id, ok := scpIdentity(rawURL); ok {
+			return id
+		}
+		return rawURL
+	}
+	changed := false
+	if parsed.User != nil {
+		parsed.User = nil
+		changed = true
+	}
+	if stripCredentialQuery(parsed) {
+		changed = true
+	}
+	if stripCredentialFragment(parsed) {
 		changed = true
 	}
 	if !changed {
 		return rawURL
 	}
 	return parsed.String()
+}
+
+// scpIdentity returns a secret-free SCP identity. git@host:path is kept
+// whole. Any other user is removed, leaving host:path.
+func scpIdentity(raw string) (string, bool) {
+	if strings.Contains(raw, "://") {
+		return "", false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || rest == "" || strings.Contains(rest, "@") {
+		return "", false
+	}
+	if user == "git" {
+		return raw, true
+	}
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
+// identityHasCredential reports a value that still carries a secret and
+// therefore must not be stored as a repository identity.
+func identityHasCredential(raw string) bool {
+	if raw == "" || raw == redactedURL {
+		return true
+	}
+	return credentialMaterial(raw)
 }
 
 func transportScheme(scheme string) bool {
@@ -2646,14 +2735,93 @@ func transportScheme(scheme string) bool {
 	}
 }
 
-func stripAccessTokenQuery(u *url.URL) bool {
+func stripCredentialQuery(u *url.URL) bool {
 	q := u.Query()
-	if _, ok := q["access_token"]; !ok {
+	changed := false
+	for key := range q {
+		if credentialQueryKey(key) {
+			q.Del(key)
+			changed = true
+		}
+	}
+	if !changed {
 		return false
 	}
-	q.Del("access_token")
 	u.RawQuery = q.Encode()
 	return true
+}
+
+func stripCredentialFragment(u *url.URL) bool {
+	if u.Fragment == "" {
+		return false
+	}
+	values, err := url.ParseQuery(u.Fragment)
+	if err != nil {
+		if credentialMaterial("#" + u.Fragment) {
+			u.Fragment = ""
+			u.RawFragment = ""
+			return true
+		}
+		return false
+	}
+	changed := false
+	for key := range values {
+		if credentialQueryKey(key) {
+			values.Del(key)
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	if len(values) == 0 {
+		u.Fragment = ""
+	} else {
+		u.Fragment = values.Encode()
+	}
+	u.RawFragment = ""
+	return true
+}
+
+func credentialQueryKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "access_token", "private_token", "token":
+		return true
+	default:
+		return false
+	}
+}
+
+// credentialMaterial reports userinfo, a credential query or fragment key,
+// or an SCP user other than git. git@host:path has no password.
+func credentialMaterial(raw string) bool {
+	if userinfoBeforeAt(raw) {
+		return true
+	}
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, "access_token=") || strings.Contains(lower, "private_token=") {
+		return true
+	}
+	if hasSeparatedKey(lower, "token") {
+		return true
+	}
+	if strings.Contains(raw, "://") {
+		return false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || rest == "" || strings.Contains(user, "/") {
+		return false
+	}
+	return user != "git"
+}
+
+func hasSeparatedKey(lower, key string) bool {
+	for _, prefix := range []string{"?", "&", "#"} {
+		if strings.Contains(lower, prefix+key+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 // userinfoBeforeAt reports a user:password@ prefix. SCP git@host:path has

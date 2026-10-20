@@ -1416,6 +1416,16 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			wp.releaseIfPanelMember(job)
 			return // Job already marked as canceled in DB, nothing more to do
 		}
+		// A cursor-cloud create that may already have been sent, including a
+		// 429 and a deadline after send, and a wait-loop timeout, carries
+		// ErrCursorCloudNonRetryable. Honor that before the deadline path
+		// below, which would otherwise drop the sentinel and requeue a
+		// second POST /agents.
+		if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+			wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
 			timeoutErr := fmt.Sprintf(
 				"%s %s",
@@ -1672,6 +1682,13 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	agentName string,
 	executionErr error,
 ) {
+	// Same sentinel as the processJob deadline branch. A 429 is classified
+	// as transient from its text and would reach RetryJob if this ran only
+	// when the classification is LimitKindNone.
+	if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
+		wp.failCursorCloudWithoutRetry(workerID, job, agentName, executionErr)
+		return
+	}
 	// A review that ran but produced no verdict (typically an unreadable
 	// diff) is deterministic for that agent: retrying it wastes runs. Fail
 	// over to the backup agent at once, or fail with the agent output kept
@@ -1832,6 +1849,15 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
 		}
 	}
+}
+
+// failCursorCloudWithoutRetry marks a cursor-cloud launch failed without
+// RetryJob and without failover. The create may already have allocated a VM,
+// so another attempt would POST /agents again.
+func (wp *WorkerPool) failCursorCloudWithoutRetry(workerID string, job *storage.ReviewJob, agentName string, err error) {
+	wp.runAttemptTransition(workerID, job, func() {
+		wp.failWithoutRetryLocked(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
+	})
 }
 
 func (wp *WorkerPool) failoverOrFailNonRetryableAgentContext(
