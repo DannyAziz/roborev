@@ -144,7 +144,9 @@ func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bo
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
 	if noted && agent.SweepAllowsClean(false, row.AgentID != "", seen, since, now, cleanDelay) {
-		return db.MarkCloudLaunchCleanedByToken(row.JobID, row.RepoID, row.Token)
+		// A blank token names no launch. Another blank row on this job has
+		// its own saved id and delete result, so only this row is cleaned.
+		return db.MarkCloudLaunchCleaned(row.ID)
 	}
 	return reportCloudLaunchOrphan(db, row, cleanDelay)
 }

@@ -363,3 +363,38 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
 	})
 }
+
+// TestCursorCloudRestartEmptyTokenCleanKeepsRefusedSibling pins the blank
+// token clean to its own row. Two empty-token launches on one job pass the
+// confirming-sweep gate. The first sibling's saved-id delete is refused, so
+// its VM is still up. The second row's clean must not mark the first one
+// cleaned. Cleaning every blank-token row on the job fails this test.
+func TestCursorCloudRestartEmptyTokenCleanKeepsRefusedSibling(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	refused := cursorCloudSeedAgent(t, fake, sha, "refused")
+	deleted := cursorCloudSeedAgent(t, fake, sha, "deleted")
+	cursorCloudInsertBareLaunch(t, tc, job.ID, "", refused.ID)
+	cursorCloudInsertBareLaunch(t, tc, job.ID, "", deleted.ID)
+	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET sweep_seen = 1 WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+	_, err = tc.DB.Exec(`UPDATE review_jobs SET error = ? WHERE id = ?`, agent.CursorCloudPendingOrphanNote(), job.ID)
+	require.NoError(t, err)
+	cursorCloudAgeLaunch(t, tc.DB, job.ID)
+
+	err = recoverCloudLaunches(context.Background(), tc.DB, &cursorCloudRefuseDelete{Fake: fake, id: refused.ID}, nil)
+	require.Error(t, err)
+	got, getErr := fake.GetAgent(t.Context(), refused.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, refused.ID, got.ID)
+	var refusedCleaned, deletedCleaned int
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT cleaned FROM review_job_cloud_launches WHERE agent_id = ?`, refused.ID,
+	).Scan(&refusedCleaned))
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT cleaned FROM review_job_cloud_launches WHERE agent_id = ?`, deleted.ID,
+	).Scan(&deletedCleaned))
+	assert.Equal(t, 0, refusedCleaned)
+	assert.Equal(t, 1, deletedCleaned)
+}
