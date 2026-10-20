@@ -377,6 +377,21 @@ func prepareMigratedDB(
 	return db
 }
 
+func TestCloudLaunchTableMigrationKeepsRows(t *testing.T) {
+	t.Parallel()
+	db := prepareMigratedDB(t, "cloud-launch.db", legacyReviewJobSchema, legacyReviewJobSeed)
+
+	var gitRef, agentName string
+	require.NoError(t, db.QueryRow(`SELECT git_ref, agent FROM review_jobs WHERE id = 1`).Scan(&gitRef, &agentName))
+	assert.Equal(t, "abc123", gitRef)
+	assert.Equal(t, "codex", agentName)
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches`).Scan(&n))
+	assert.Equal(t, 0, n)
+	_, err := db.Exec(`INSERT INTO review_job_cloud_launches (job_id, launch_token) VALUES (1, 'tok')`)
+	require.NoError(t, err)
+}
+
 func TestMigrationFromOldSchema(t *testing.T) {
 	t.Parallel()
 	db := prepareMigratedDB(

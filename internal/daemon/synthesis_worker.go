@@ -353,6 +353,7 @@ func (wp *WorkerPool) runSynthesisAgent(
 	if err != nil {
 		return reviewpkg.SynthesisDocument{}, "", "", err
 	}
+	a = wp.bindCursorCloudLaunch(workerID, job, a)
 
 	wp.broadcaster.Broadcast(Event{
 		Type:     "review.started",

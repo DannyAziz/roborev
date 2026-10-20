@@ -78,6 +78,14 @@ const (
 	cursorCloudLaunchMarker = "roborev-launch:"
 )
 
+func CursorCloudLaunchMarker(daemonID, token string) string {
+	token = strings.TrimSpace(token)
+	if daemonID = strings.TrimSpace(daemonID); daemonID == "" {
+		return cursorCloudLaunchMarker + token
+	}
+	return cursorCloudLaunchMarker + daemonID + ":" + token
+}
+
 // cursorCloudSafety is sent with every cloud review. The API has no fields
 // that enforce it; see the docs limitation.
 const cursorCloudSafety = `Remote review constraints:
@@ -171,7 +179,10 @@ type CursorCloudAgent struct {
 	RepoURL string
 	// launches overrides the process-wide launch cap. Tests set it. Production
 	// leaves it nil and uses cursorCloudLaunches.
-	launches *cursorCloudLaunchGate
+	launches   *cursorCloudLaunchGate
+	DaemonID   string
+	BindLaunch func(token string) error
+	BindAgent  func(token, id string) error
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -246,10 +257,21 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// stripped of userinfo. The marker lets a create that fails after send
 	// be found by listing agents and reading the conversation.
 	token := newLaunchToken()
+	if a.BindLaunch != nil {
+		if bindErr := a.BindLaunch(token); bindErr != nil {
+			refund()
+			return "", bindErr
+		}
+	}
+	marker := CursorCloudLaunchMarker(a.DaemonID, token)
+	reconcileToken := token
+	if id := strings.TrimSpace(a.DaemonID); id != "" {
+		reconcileToken = id + ":" + token
+	}
 	created, err := client.CreateAgent(ctx, cursorcloud.CreateAgentRequest{
 		Repo:   repoURL,
 		Ref:    sha,
-		Prompt: cloudPrompt(prompt, schema) + "\n" + cursorCloudLaunchMarker + token + "\n",
+		Prompt: cloudPrompt(prompt, schema) + "\n" + marker + "\n",
 		Model:  a.Model,
 		Title:  cursorCloudTitle(repoURL, sha),
 	})
@@ -263,7 +285,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			refund()
 			return "", err
 		}
-		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, token, output); recErr != nil {
+		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
 		return "", cursorCloudNonRetryable(err)
@@ -283,6 +305,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		}
 		err = cursorCloudNonRetryable(delErr)
 	}()
+	if a.BindAgent != nil {
+		if bindErr := a.BindAgent(token, created.ID); bindErr != nil {
+			return "", cursorCloudNonRetryable(bindErr)
+		}
+	}
 	if output != nil {
 		fmt.Fprintf(output, "cursor-cloud: created agent %s at %s\n", created.ID, sha)
 	}
@@ -610,6 +637,26 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 		}
 	}
 	return found, errors.Join(errs...)
+}
+
+func StopAndDeleteCursorCloudAgent(client cursorcloud.Client, id string) error {
+	return deleteCursorCloudAgent(client, id, nil)
+}
+
+func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) error {
+	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || strings.TrimSpace(repoURL) == "" {
+		return errors.New("cursor-cloud: cleanup marker is incomplete")
+	}
+	listCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
+	agents, err := client.ListAgents(listCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+	}
+	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
+	defer passCancel()
+	_, err = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
+	return err
 }
 
 func sameCursorCloudRepo(want, got string) bool {

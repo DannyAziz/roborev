@@ -326,19 +326,43 @@ func TestPostgresMigration_BackupColumns(t *testing.T) { //nolint:paralleltest /
 	require.Empty(t, bm)
 }
 
-// TestPostgresMigration_DefaultConfigLeavesSchemaAtV23 proves EnsureSchema,
-// the path a daemon takes for any config including the default, does not
-// advance a v23 database. Older binaries reject a newer schema_version.
-func TestPostgresMigration_DefaultConfigLeavesSchemaAtV23(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
-	openTestPgPoolRawAtVersion(t, 23)
+// TestPostgresMigration_CloudLaunchTable upgrades a v23 database that already
+// has rows. The job survives and the launch history table is empty.
+func TestPostgresMigration_CloudLaunchTable(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	oldPool := openTestPgPoolRawAtVersion(t, 23)
 	ctx := context.Background()
+
+	var repoID int
+	require.NoError(t, pgxPool(oldPool).QueryRow(ctx,
+		`INSERT INTO roborev.repos (identity) VALUES ($1) RETURNING id`,
+		"example.com/owner/cloud-launch.git").Scan(&repoID))
+	jobUUID := uuid.New()
+	_, err := pgxPool(oldPool).Exec(ctx, `
+		INSERT INTO roborev.review_jobs
+		  (uuid, repo_id, git_ref, agent, status, enqueued_at, source_machine_id)
+		VALUES ($1, $2, 'abc123', 'cursor-cloud', 'running', NOW(), $3)
+	`, jobUUID, repoID, uuid.New())
+	require.NoError(t, err)
 
 	pg := openTestPgPool(t)
 	defer pg.Close()
 
 	var version int
 	require.NoError(t, pgxPool(pg).QueryRow(ctx, `SELECT MAX(version) FROM roborev.schema_version`).Scan(&version))
-	assert.Equal(t, 23, version)
+	assert.Equal(t, 24, version)
+
+	var gitRef, agentName string
+	require.NoError(t, pgxPool(pg).QueryRow(ctx,
+		`SELECT git_ref, agent FROM roborev.review_jobs WHERE uuid = $1`, jobUUID,
+	).Scan(&gitRef, &agentName))
+	assert.Equal(t, "abc123", gitRef)
+	assert.Equal(t, "cursor-cloud", agentName)
+
+	var launches int
+	require.NoError(t, pgxPool(pg).QueryRow(ctx, `
+		SELECT COUNT(*) FROM roborev.review_job_cloud_launches
+	`).Scan(&launches))
+	assert.Equal(t, 0, launches)
 
 	var autoCols int
 	require.NoError(t, pgxPool(pg).QueryRow(ctx, `

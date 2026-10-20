@@ -316,8 +316,9 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("clear interrupted shutdown drain: %w", err)
 	}
 
-	// Reset stale jobs from previous runs
-	if err := s.db.ResetStaleJobs(); err != nil {
+	// Reset stale jobs from previous runs. A cursor-cloud launch that may
+	// already exist is failed and its agents are stopped.
+	if err := s.recoverStaleJobs(ctx); err != nil {
 		log.Printf("Warning: failed to reset stale jobs: %v", err)
 	}
 

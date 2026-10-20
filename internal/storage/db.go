@@ -1603,7 +1603,11 @@ func (db *DB) migrate() error {
 	if err := db.migrateRepoNames(); err != nil {
 		return fmt.Errorf("migrate repository names: %w", err)
 	}
-
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES review_jobs(id) ON DELETE CASCADE,
+		launch_token TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		return fmt.Errorf("cloud launch table: %w", err)
+	}
 	return nil
 }
 
@@ -2387,6 +2391,17 @@ func (db *DB) ResetStaleJobs() error {
 		SET worker_id = NULL
 		WHERE status != 'running' AND worker_id IS NOT NULL
 	`); err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	if _, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
+		    updated_at = ?, synced_at = NULL
+		WHERE status = 'running' AND agent = 'cursor-cloud'
+		  AND (agent_invoked = 1 OR id IN (
+			SELECT job_id FROM review_job_cloud_launches WHERE cleaned = 0))
+	`, now, CloudLaunchInterruptedError, now); err != nil {
 		return err
 	}
 	_, err := db.Exec(`
