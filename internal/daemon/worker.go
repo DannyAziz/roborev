@@ -1851,10 +1851,18 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 	}
 }
 
-// failCursorCloudWithoutRetry marks a cursor-cloud launch failed without
-// RetryJob and without failover. The create may already have allocated a VM,
-// so another attempt would POST /agents again.
+// failCursorCloudWithoutRetry stops another cursor-cloud launch. A backup
+// that is not cursor-cloud still receives the job. With no such backup the
+// failure is permanent: the cap and a sent create are not retried on
+// cursor-cloud.
 func (wp *WorkerPool) failCursorCloudWithoutRetry(workerID string, job *storage.ReviewJob, agentName string, err error) {
+	backup := wp.resolveBackupAgent(job)
+	if backup != "" && agent.CanonicalName(backup) != agent.CursorCloudHost {
+		wp.failoverOrFailNonRetryableAgentContext(
+			context.Background(), workerID, job, agentName, fmt.Sprintf("agent: %v", err),
+		)
+		return
+	}
 	wp.runAttemptTransition(workerID, job, func() {
 		wp.failWithoutRetryLocked(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
 	})

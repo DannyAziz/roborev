@@ -88,12 +88,13 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 			tc.Pool.processJob(testWorkerID, job)
 
 			assert.Equal(t, int32(1), posts.Load())
-			updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-			assert.Equal(t, agent.CursorCloudHost, updated.Agent)
+			updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+			assert.Equal(t, "test", updated.Agent)
 			assert.Equal(t, 0, updated.RetryCount)
 			claimed, claimErr := tc.DB.ClaimJob(testWorkerID)
 			require.NoError(t, claimErr)
-			assert.Nil(t, claimed)
+			require.NotNil(t, claimed)
+			assert.Equal(t, "test", claimed.Agent)
 		})
 	}
 }
@@ -117,14 +118,14 @@ func TestSynthesisCursorCloudLaunchIsNotRetried(t *testing.T) {
 
 	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
 
-	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
-	assert.Equal(t, synthAgent, updated.Agent)
+	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
 	assert.Equal(t, 0, updated.RetryCount)
 	assert.Equal(t, int32(1), calls.Load())
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
-	assert.Nil(t, claimed)
-	assert.Contains(t, updated.Error, agent.ErrCursorCloudNonRetryable.Error())
+	require.NotNil(t, claimed)
+	assert.Equal(t, synth.ID, claimed.ID)
 }
 
 // TestFailOrRetryExecutionContextKeepsCursorCloudSentinel pins the check
@@ -141,12 +142,13 @@ func TestFailOrRetryExecutionContextKeepsCursorCloudSentinel(t *testing.T) {
 		fmt.Errorf("create agent: %w", agent.ErrCursorCloudNonRetryable),
 	)
 
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, "test", updated.Agent)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "codex", updated.Agent)
 	assert.Equal(t, 0, updated.RetryCount)
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
-	assert.Nil(t, claimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "codex", claimed.Agent)
 }
 
 // TestProcessJobCursorCloudDeadlineCheckStandsAlone pins the processJob
@@ -172,12 +174,13 @@ func TestProcessJobCursorCloudDeadlineCheckStandsAlone(t *testing.T) {
 
 	tc.Pool.processJob(testWorkerID, job)
 
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Equal(t, agent.CursorCloudHost, updated.Agent)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
 	assert.Equal(t, 0, updated.RetryCount)
 	claimed, claimErr := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, claimErr)
-	assert.Nil(t, claimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "test", claimed.Agent)
 }
 
 func TestCursorCloudPreLaunchValidationCanFailOver(t *testing.T) {

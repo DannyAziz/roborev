@@ -226,8 +226,8 @@ func TestSynthesisNonHostErrorIsStillRetried(t *testing.T) {
 	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
 
 	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusQueued)
-	assert.Equal(t, synthAgent, updated.Agent, "retried on the same agent, not failed over")
-	assert.Equal(t, 1, updated.RetryCount)
+	assert.Equal(t, "test", updated.Agent, "unavailable synthesis fails over instead of stringifying the mark")
+	assert.Equal(t, 0, updated.RetryCount)
 }
 
 // A stored host backup is only resolved when host is allowed, so a job never

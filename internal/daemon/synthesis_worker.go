@@ -444,7 +444,7 @@ func (wp *WorkerPool) runSynthesisAgent(
 			)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}
-		if agent.CanonicalName(agentName) == "host" || errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+		if agent.CanonicalName(agentName) == "host" || errors.Is(err, agent.ErrCursorCloudNonRetryable) || agent.IsUnavailable(err) {
 			// Host handoff timeouts and a cursor-cloud launch that may
 			// already have been sent must keep their typed error. Formatting
 			// the error as text drops ErrCursorCloudNonRetryable, and the
