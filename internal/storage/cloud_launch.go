@@ -2,8 +2,12 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
+
+// CloudLaunchPendingNote is stored on the launch row before POST /v0/agents.
+const CloudLaunchPendingNote = "cursor-cloud orphan risk: launch pending cleanup"
 
 const CloudLaunchInterruptedError = "cursor-cloud launch interrupted by daemon restart; not relaunched"
 
@@ -36,9 +40,18 @@ func (db *DB) execLaunch(query string, args ...any) error {
 }
 
 func (db *DB) BeginCloudLaunch(jobID int64, workerID, token, repoURL string) error {
-	return db.execLaunch(`INSERT INTO review_job_cloud_launches (job_id, launch_token, repo_identity, created_at)
+	if err := db.execLaunch(`INSERT INTO review_job_cloud_launches (job_id, launch_token, repo_identity, created_at)
 		SELECT id, ?, ?, datetime('now') FROM review_jobs WHERE id = ? AND status = 'running' AND worker_id = ?`,
-		token, repoURL, jobID, workerID)
+		token, repoURL, jobID, workerID); err != nil {
+		return err
+	}
+	// The note is written before the caller may POST. A failed write removes the
+	// new row and returns, so the POST does not run.
+	if err := db.NoteLaunchOrphanRisk(token, CloudLaunchPendingNote); err != nil {
+		_, _ = db.Exec(`DELETE FROM review_job_cloud_launches WHERE job_id = ? AND launch_token = ? AND orphan_note = ''`, jobID, token)
+		return err
+	}
+	return nil
 }
 
 func (db *DB) AttachCloudAgent(jobID int64, token, agentID string) error {
@@ -46,9 +59,38 @@ func (db *DB) AttachCloudAgent(jobID int64, token, agentID string) error {
 		WHERE job_id = ? AND launch_token = ? AND agent_id = ''`, agentID, jobID, token)
 }
 
+// MarkCloudLaunchCleaned is the only statement that clears orphan_note.
 func (db *DB) MarkCloudLaunchCleaned(launchID int64) error {
-	_, err := db.Exec(`UPDATE review_job_cloud_launches SET cleaned = 1 WHERE id = ?`, launchID)
+	_, err := db.Exec(`UPDATE review_job_cloud_launches SET cleaned = 1, orphan_note = '' WHERE id = ?`, launchID)
 	return err
+}
+
+// MarkCloudLaunchCleanedByToken clears every uncleaned row for token.
+// It changes orphan_note only by calling MarkCloudLaunchCleaned.
+func (db *DB) MarkCloudLaunchCleanedByToken(token string) error {
+	rows, err := db.Query(`SELECT id FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 0 ORDER BY id`, token)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if err := db.MarkCloudLaunchCleaned(id); err != nil {
+			return err
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("cursor-cloud: launch was not cleaned")
+	}
+	return nil
 }
 
 func (db *DB) ListUncleanedCloudLaunches() ([]CloudLaunch, error) {
@@ -105,4 +147,80 @@ func (db *DB) CountUncleanedCloudLaunches(jobID int64) (int, error) {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ? AND cleaned = 0`, jobID).Scan(&n)
 	return n, err
+}
+
+// NoteLaunchOrphanRisk fills an empty orphan_note. It does not change a note
+// that is already set, and it returns an error when no uncleaned row matches.
+func (db *DB) NoteLaunchOrphanRisk(token, msg string) error {
+	token = strings.TrimSpace(token)
+	msg = strings.TrimSpace(msg)
+	if token == "" || msg == "" {
+		return fmt.Errorf("cursor-cloud: launch note was not recorded")
+	}
+	res, err := db.Exec(`UPDATE review_job_cloud_launches SET orphan_note = ?
+		WHERE launch_token = ? AND cleaned = 0 AND orphan_note = ''`, msg, token)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	var existing int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches
+		WHERE launch_token = ? AND cleaned = 0`, token).Scan(&existing); err != nil {
+		return err
+	}
+	if existing == 0 {
+		return fmt.Errorf("cursor-cloud: launch note was not recorded")
+	}
+	return nil
+}
+
+// LaunchOrphanWarning reads uncleaned notes without requiring the job row.
+func (db *DB) LaunchOrphanWarning(jobID int64) (string, error) {
+	rows, err := db.Query(`SELECT l.orphan_note
+		FROM review_job_cloud_launches l
+		LEFT JOIN review_jobs j ON j.id = l.job_id
+		WHERE l.job_id = ? AND l.cleaned = 0 AND l.orphan_note != ''
+		ORDER BY l.id`, jobID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var notes []string
+	for rows.Next() {
+		var note string
+		if err := rows.Scan(&note); err != nil {
+			return "", err
+		}
+		notes = append(notes, note)
+	}
+	return strings.Join(notes, " "), rows.Err()
+}
+
+// ApplyLaunchOrphanWarning copies the launch note onto the API job status.
+func ApplyLaunchOrphanWarning(job *ReviewJob, warning string) {
+	warning = strings.TrimSpace(warning)
+	if job == nil || warning == "" {
+		return
+	}
+	job.OrphanWarning = warning
+	if !strings.Contains(job.Error, warning) {
+		job.Error = strings.TrimSpace(strings.TrimSpace(job.Error) + " " + warning)
+	}
+}
+
+// AttachLaunchOrphanWarnings fills OrphanWarning for an API job listing.
+func (db *DB) AttachLaunchOrphanWarnings(jobs []ReviewJob) {
+	for i := range jobs {
+		warning, err := db.LaunchOrphanWarning(jobs[i].ID)
+		if err != nil {
+			continue
+		}
+		ApplyLaunchOrphanWarning(&jobs[i], warning)
+	}
 }

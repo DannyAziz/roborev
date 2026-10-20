@@ -185,6 +185,8 @@ type CursorCloudAgent struct {
 	// NoteCleanupFailure records a stop or delete that did not finish.
 	// The launch row stays uncleaned.
 	NoteCleanupFailure func(msg string) error
+	// ClearLaunch marks the launch cleaned after a nil or 404 delete.
+	ClearLaunch func(token string) error
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -313,6 +315,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	defer func() {
 		delErr := deleteCursorCloudAgent(client, created.ID, output)
 		if delErr == nil {
+			if a.ClearLaunch != nil {
+				if clearErr := a.ClearLaunch(token); clearErr != nil && err == nil {
+					err = clearErr
+				}
+			}
 			return
 		}
 		// The VM is still there. Say so now; the row stays uncleaned for the

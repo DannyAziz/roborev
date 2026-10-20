@@ -1622,6 +1622,7 @@ func (db *DB) ensureCloudLaunchTable() error {
 	for _, stmt := range []string{
 		`ALTER TABLE review_job_cloud_launches ADD COLUMN repo_identity TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE review_job_cloud_launches ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE review_job_cloud_launches ADD COLUMN orphan_note TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("cloud launch column: %w", err)
