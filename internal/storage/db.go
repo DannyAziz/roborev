@@ -1645,7 +1645,17 @@ func (db *DB) ensureCloudLaunchTable() error {
 		WHERE cleaned = 0 AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
 		return fmt.Errorf("cloud launch orphan note: %w", err)
 	}
-	return db.keepCloudLaunchAfterJobDelete()
+	if err := db.keepCloudLaunchAfterJobDelete(); err != nil {
+		return err
+	}
+	// Blank tokens are the NULL backfill, not launch tokens. More than one
+	// uncleaned blank can exist, and restart leaves those rows uncleaned.
+	// A real token names one launch row.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_review_job_cloud_launches_token
+		ON review_job_cloud_launches(launch_token) WHERE launch_token != ''`); err != nil {
+		return fmt.Errorf("cloud launch token index: %w", err)
+	}
+	return nil
 }
 
 // drainAndDropOldCIBatchTables retires the legacy CI batch tracking

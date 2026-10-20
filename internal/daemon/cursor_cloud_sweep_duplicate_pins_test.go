@@ -96,6 +96,8 @@ func TestCursorCloudSweepDuplicateCleansEveryTokenRow(t *testing.T) {
 		`SELECT id FROM review_job_cloud_launches WHERE job_id = ? AND launch_token = ?`,
 		job.ID, token,
 	).Scan(&sweptID))
+	_, err := tc.DB.Exec(`DROP INDEX IF EXISTS idx_review_job_cloud_launches_token`)
+	require.NoError(t, err)
 	res, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
 		(job_id, launch_token, agent_id, repo_identity, created_at, orphan_note)
 		VALUES (?, ?, '', ?, datetime('now'), ?)`,

@@ -1757,6 +1757,12 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 		log.Printf("cursor-cloud: orphan note backfill: %v", err)
 	}
 	p.dropCloudLaunchJobFK(ctx)
+	// Blank tokens are the NULL backfill, not launch tokens. A real token
+	// names one launch row. Schema version stays at 23; this table is local.
+	if _, err := p.pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_review_job_cloud_launches_token
+		ON review_job_cloud_launches (launch_token) WHERE launch_token <> ''`); err != nil {
+		log.Printf("cursor-cloud: launch token index: %v", err)
+	}
 }
 
 // dropCloudLaunchJobFK removes a job foreign key left by an older

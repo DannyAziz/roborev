@@ -31,7 +31,7 @@ func TestMarkCloudLaunchCleanedLeavesOtherRows(t *testing.T) {
 	idB := insertLaunch(jobA.ID, "tok-b", "note-b")
 	idC := insertLaunch(jobB.ID, "tok-c", "note-c")
 
-	require.NoError(t, db.MarkCloudLaunchCleanedByToken("tok-a"))
+	require.NoError(t, db.MarkCloudLaunchCleanedByToken(jobA.ID, jobA.RepoID, "tok-a"))
 
 	type row struct {
 		id    int64

@@ -196,7 +196,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		require.True(t, updated)
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
 		assert.NotContains(t, cursorCloudStoredError(t, tc.DB, job.ID), "orphan risk")
-		cursorCloudCleanToken(t, tc.DB, "fail-tok")
+		cursorCloudCleanToken(t, tc.DB, job, "fail-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
 	t.Run("failover", func(t *testing.T) {
@@ -210,7 +210,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, cursorCloudStoredError(t, tc.DB, job.ID))
 		assert.Equal(t, storage.JobStatusQueued, stored.Status)
-		cursorCloudCleanToken(t, tc.DB, "fail-over-tok")
+		cursorCloudCleanToken(t, tc.DB, job, "fail-over-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 		_, err = tc.DB.Exec(`UPDATE review_jobs SET status = 'failed' WHERE id = ?`, job.ID)
 		require.NoError(t, err)
@@ -221,7 +221,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		require.NoError(t, tc.DB.CancelJobWithError(job.ID, "timeout cancel"))
 		cursorCloudAssertAPIWarning(t, srv, job.ID, true)
 		assert.Equal(t, "timeout cancel", cursorCloudStoredError(t, tc.DB, job.ID))
-		cursorCloudCleanToken(t, tc.DB, "cancel-tok")
+		cursorCloudCleanToken(t, tc.DB, job, "cancel-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
 	t.Run("sync replay", func(t *testing.T) {
@@ -242,7 +242,7 @@ func TestAPIJobStatusKeepsLaunchOrphanNote(t *testing.T) {
 		storedErr := cursorCloudStoredError(t, tc.DB, job.ID)
 		assert.Equal(t, "origin replay", storedErr)
 		assert.NotContains(t, storedErr, "orphan risk")
-		cursorCloudCleanToken(t, tc.DB, "sync-tok")
+		cursorCloudCleanToken(t, tc.DB, job, "sync-tok")
 		cursorCloudAssertAPIWarning(t, srv, job.ID, false)
 	})
 }
@@ -306,9 +306,9 @@ func cursorCloudLaunchAgentID(t *testing.T, db *storage.DB, jobID int64) string 
 	return id
 }
 
-func cursorCloudCleanToken(t *testing.T, db *storage.DB, token string) {
+func cursorCloudCleanToken(t *testing.T, db *storage.DB, job *storage.ReviewJob, token string) {
 	t.Helper()
-	require.NoError(t, db.MarkCloudLaunchCleanedByToken(token))
+	require.NoError(t, db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, token))
 }
 
 func TestBatchJobStatusShowsLaunchOrphanWarning(t *testing.T) {

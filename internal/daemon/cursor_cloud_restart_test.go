@@ -991,6 +991,11 @@ func TestCursorCloudRestartByTokenCleansSharedToken(t *testing.T) {
 	machineID, err := tc.DB.GetMachineID()
 	require.NoError(t, err)
 	created := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
+	// c10n's unique token index rejects a second row. The clean-both-rows
+	// pin needs that pair, so this test drops the index the way the storage
+	// shared-token pin does. The index itself is pinned separately.
+	_, err = tc.DB.Exec(`DROP INDEX IF EXISTS idx_review_job_cloud_launches_token`)
+	require.NoError(t, err)
 	_, err = tc.DB.Exec(`INSERT INTO review_job_cloud_launches
 		(job_id, launch_token, agent_id, repo_identity, orphan_note, cleaned, created_at)
 		VALUES

@@ -92,7 +92,7 @@ func TestMarkCloudLaunchCleanedByTokenZeroRowsErrors(t *testing.T) {
 		(job_id, launch_token, orphan_note) VALUES (?, 'keep-tok', ?)`, job.ID, CloudLaunchPendingNote)
 	require.NoError(t, err)
 
-	err = db.MarkCloudLaunchCleanedByToken("missing-tok")
+	err = db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, "missing-tok")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not cleaned")
 

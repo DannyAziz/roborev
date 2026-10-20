@@ -69,7 +69,7 @@ func TestSQLiteJobIDIsNotReusedAfterDelete(t *testing.T) {
 	require.NoError(t, db.BeginCloudLaunch(next.ID, "w2", "new-tok", "https://example.com/acme/new.git"))
 	_, err = db.Exec(`INSERT INTO review_jobs (id, repo_id, git_ref, agent, status) VALUES (?, ?, 'forced', 'test', 'failed')`, oldJob.ID, newRepo.ID)
 	require.NoError(t, err)
-	require.NoError(t, db.MarkCloudLaunchCleanedByToken("new-tok"))
+	require.NoError(t, db.MarkCloudLaunchCleanedByToken(next.ID, newRepo.ID, "new-tok"))
 
 	var oldCleaned, liveCleaned int
 	require.NoError(t, db.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = 'old-tok'`).Scan(&oldCleaned))
