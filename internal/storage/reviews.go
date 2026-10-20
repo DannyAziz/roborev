@@ -61,6 +61,11 @@ func (db *DB) getReviewByJobID(jobID int64, includeFindingCounts bool) (*Review,
 	if includeFindingCounts {
 		applyJobFindingCounts(&job, reviewFields.StructuredOutput)
 	}
+	jobs := []ReviewJob{job}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, fmt.Errorf("launch orphan warning: %w", err)
+	}
+	job = jobs[0]
 
 	r.Job = &job
 

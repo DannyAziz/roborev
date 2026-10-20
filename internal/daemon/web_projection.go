@@ -37,6 +37,8 @@ type ReviewProjectionJob struct {
 	EnqueuedAt      time.Time             `json:"enqueued_at"`
 	StartedAt       *time.Time            `json:"started_at,omitempty"`
 	FinishedAt      *time.Time            `json:"finished_at,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	OrphanWarning   string                `json:"orphan_warning,omitempty"`
 	PanelRole       string                `json:"panel_role,omitempty"`
 	PanelName       string                `json:"panel_name,omitempty"`
 	PanelMemberName string                `json:"panel_member_name,omitempty"`
@@ -145,6 +147,7 @@ func projectReviewJob(job storage.ReviewJob) ReviewProjectionJob {
 		Agent: job.Agent, Model: job.Model, Status: job.Status, Verdict: verdict,
 		ReviewType: job.ReviewType, Source: job.Source, EnqueuedAt: job.EnqueuedAt,
 		StartedAt: job.StartedAt, FinishedAt: job.FinishedAt,
+		Error: job.Error, OrphanWarning: job.OrphanWarning,
 		PanelRole: job.PanelRole, PanelName: job.PanelName,
 		PanelMemberName: job.PanelMemberName, NonVoting: job.NonVoting, PanelSummary: job.PanelSummary,
 	}

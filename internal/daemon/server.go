@@ -1832,9 +1832,11 @@ func (s *Server) humaGetReview(
 	if errors.Is(err, storage.ErrLegacyReviewMigration) {
 		return nil, huma.Error409Conflict(storage.LegacyReviewMigrationNotice)
 	}
-
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, huma.Error404NotFound("review not found")
+	}
+	if err != nil {
+		return nil, huma.Error500InternalServerError(fmt.Sprintf("get review: %v", err))
 	}
 
 	if !remoteAllowsJob(ctx, review.Job) {

@@ -2875,6 +2875,9 @@ func (db *DB) GetPanelMembers(panelRunUUID uuid.UUID) ([]ReviewJob, error) {
 	if err := db.attachExperimentAssignmentsToJobs(jobs); err != nil {
 		return nil, err
 	}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, fmt.Errorf("launch orphan warning: %w", err)
+	}
 	return jobs, nil
 }
 
@@ -2908,6 +2911,11 @@ func (db *DB) GetSynthesisJob(panelRunUUID uuid.UUID) (*ReviewJob, error) {
 	if err := db.attachExperimentAssignments(&j); err != nil {
 		return nil, err
 	}
+	jobs := []ReviewJob{j}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, fmt.Errorf("launch orphan warning: %w", err)
+	}
+	j = jobs[0]
 	return &j, nil
 }
 
