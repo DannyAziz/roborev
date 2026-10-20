@@ -326,6 +326,9 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
+		var jobErr string
+		require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+		assert.Contains(t, jobErr, "orphan risk")
 	})
 
 	t.Run("saved id delete refused", func(t *testing.T) {
