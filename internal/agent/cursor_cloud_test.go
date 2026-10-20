@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log"
 	"net"
@@ -14,6 +17,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -835,73 +840,212 @@ func TestCursorCloudCredentialFormsStayOutOfLaunch(t *testing.T) {
 	}
 }
 
-// TestCursorCloudBindRefusesUnusableRepo is the pin for the bind gate.
-// Each shape RemoteIdentity rejects is a token-only launch that must not
-// POST. Each shape it accepts still creates one agent. Removing the
-// refusal makes the rejected rows POST and this test fails.
+// cloudLaunchShape is one input built from a branch of stripURLCredentials
+// or RemoteIdentity. producer is true when repoURL would store the stripped
+// value. identity is true when RemoteIdentity names a repository.
+type cloudLaunchShape struct {
+	raw       string
+	stored    string
+	producer  bool
+	identity  bool
+	identityS string
+}
+
+// TestCursorCloudBindRefusesUnusableRepo launches every class the producer
+// and RemoteIdentity distinguish. A stored URL RemoteIdentity rejects must
+// not POST. A URL both accept must POST once. Removing the bind refusal
+// makes each mismatch POST.
 func TestCursorCloudBindRefusesUnusableRepo(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
-	cases := []struct {
-		name    string
-		raw     string
-		creates int
-		leak    string
-	}{
-		{name: "file url empty host", raw: "file:///tmp/repo.git"},
-		{name: "file scheme only", raw: "file://"},
-		{name: "file host without path", raw: "file://hostname"},
-		{name: "https host without path", raw: "https://github.com"},
-		{name: "https host slash only", raw: "https://github.com/"},
-		{name: "http host without path", raw: "http://example.com"},
-		{name: "ssh host without path", raw: "ssh://github.com"},
-		{name: "git host slash only", raw: "git://github.com/"},
-		{name: "credentialed host without path", raw: "https://user:tok@github.com", leak: "tok"},
-		{name: "protocol relative host", raw: "//github.com"},
-		{name: "protocol relative host slash", raw: "//host/"},
-		{name: "relative path", raw: "acme/repo"},
-		{name: "absolute path", raw: "/tmp/repo.git"},
-		{name: "schemeless host path", raw: "github.com/acme/repo"},
-		{name: "single path segment", raw: "repo.git"},
-		{name: "dot path", raw: "."},
-		{name: "dot git segment", raw: ".git"},
-		{name: "host path only dot git", raw: "https://github.com/.git"},
-		{name: "bare name", raw: "nocolon"},
-		{name: "https repository", raw: "https://github.com/acme/repo.git", creates: 1},
-		{name: "scp", raw: "git@github.com:acme/repo.git", creates: 1},
-		{name: "ssh with user", raw: "ssh://git@github.com/acme/repo.git", creates: 1},
-		{name: "git scheme", raw: "git://github.com/acme/repo.git", creates: 1},
-		{name: "http repository", raw: "http://example.com/acme/repo.git", creates: 1},
-		{name: "protocol relative repository", raw: "//github.com/acme/repo.git", creates: 1},
-		{name: "file url with host and path", raw: "file://localhost/tmp/repo.git", creates: 1},
-		{name: "ipv6 repository", raw: "https://[::1]/acme/repo.git", creates: 1},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, shape := range cloudLaunchShapes(t) {
+		t.Run(shape.raw, func(t *testing.T) {
 			fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
 			var binds int
 			a := &CursorCloudAgent{
 				Client:  fake,
-				RepoURL: tc.raw,
+				RepoURL: shape.raw,
 				BindLaunch: func(string, string) error {
 					binds++
 					return nil
 				},
 			}
 			_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
-			assert := assert.New(t)
-			assert.Equal(tc.creates, createCount(fake))
-			assert.Equal(tc.creates, binds)
-			if tc.creates == 0 {
+			creates := createCount(fake)
+			if !shape.producer || !shape.identity {
 				require.Error(t, err)
-				assert.Contains(err.Error(), "refusing to bind launch")
-				if tc.leak != "" {
-					assert.NotContains(err.Error(), tc.leak)
+				assert.Equal(t, 0, creates)
+				assert.Equal(t, 0, binds)
+				if shape.producer {
+					assert.Contains(t, err.Error(), "refusing to bind launch")
 				}
 				return
 			}
 			require.NoError(t, err)
+			assert.Equal(t, 1, creates)
+			assert.Equal(t, 1, binds)
 		})
 	}
+}
+
+// TestCursorCloudBindRefusalRefundsHourlySlot uses the first derived
+// mismatch. The refusal is after the hourly gate acquires, and refund
+// drops that charge. A following accepted launch still creates one agent.
+func TestCursorCloudBindRefusalRefundsHourlySlot(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	var rejected, accepted string
+	for _, shape := range cloudLaunchShapes(t) {
+		if shape.producer && !shape.identity && rejected == "" {
+			rejected = shape.raw
+		}
+		if shape.producer && shape.identity && accepted == "" {
+			accepted = shape.raw
+		}
+	}
+	require.NotEmpty(t, rejected)
+	require.NotEmpty(t, accepted)
+
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	a := &CursorCloudAgent{Client: fake, RepoURL: rejected}
+	a.SetLaunchLimitsForTest(2, 1)
+	_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.Error(t, err)
+	assert.Equal(t, 0, createCount(fake))
+
+	a.RepoURL = accepted
+	_, err = a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, createCount(fake))
+}
+
+// cloudLaunchShapes builds one raw URL for each branch of the producer
+// (stripURLCredentials, then repoURL's redacted refusal) and of
+// RemoteIdentity (transport schemes read from that function, empty host,
+// empty path, SCP, protocol-relative, scheme-less path). Duplicate stored
+// values collapse to one row.
+func cloudLaunchShapes(t *testing.T) []cloudLaunchShape {
+	t.Helper()
+	schemes := transportSchemesFromSource(t)
+	var raws []string
+	raws = append(raws, "", " ", "redacted-url")
+	raws = append(raws,
+		"git@github.com:acme/repo.git",
+		"git@github.com:acme/repo.git?foo=1",
+		"git@localhost:tmp/repo.git",
+		"deploy@github.com:acme/repo.git",
+		"https://user:tok@host/r%zz.git",
+		"ghp_x@github.com:o/r.git",
+		"user:tok@host:o/r",
+	)
+	raws = append(raws,
+		"//",
+		"//github.com",
+		"//github.com/",
+		"//github.com/acme/repo.git",
+		"//localhost/tmp/repo.git",
+		"//user:tok@localhost/tmp/repo.git",
+	)
+	raws = append(raws,
+		"acme/repo",
+		"/tmp/repo.git",
+		"github.com/acme/repo",
+		"repo.git",
+		".",
+		".git",
+		"nocolon",
+		"user@host/path",
+	)
+	hosts := []string{"", "github.com", "localhost", "example.com"}
+	paths := []string{"", "/", "/acme/repo.git", "/.git", "/tmp/repo.git"}
+	users := []string{"", "git@", "user:tok@"}
+	for _, scheme := range append(append([]string{}, schemes...), "ftp") {
+		for _, host := range hosts {
+			for _, path := range paths {
+				for _, user := range users {
+					raws = append(raws, scheme+"://"+user+host+path)
+				}
+			}
+		}
+	}
+	raws = append(raws,
+		"https://github.com/acme/repo.git?access_token=sekret",
+		"https://github.com/acme/repo.git#access_token=sekret",
+		"https://[::1]/acme/repo.git",
+		"https://GitHub.com/Acme/Repo.git",
+	)
+
+	seen := map[string]bool{}
+	var out []cloudLaunchShape
+	for _, raw := range raws {
+		stored := config.StripURLCredentials(raw)
+		producer := stored != "" && stored != config.RedactedURL
+		identityS := ""
+		if producer {
+			identityS = config.RemoteIdentity(stored)
+		}
+		key := stored + "\x00" + identityS
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, cloudLaunchShape{
+			raw: raw, stored: stored, producer: producer,
+			identity: identityS != "", identityS: identityS,
+		})
+	}
+	var mismatches, accepted int
+	for _, shape := range out {
+		if shape.producer && !shape.identity {
+			mismatches++
+		}
+		if shape.producer && shape.identity {
+			accepted++
+		}
+	}
+	require.NotZero(t, mismatches)
+	require.NotZero(t, accepted)
+	return out
+}
+
+func transportSchemesFromSource(t *testing.T) []string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	root := filepath.Dir(filepath.Dir(filepath.Dir(file)))
+	src, err := os.ReadFile(filepath.Join(root, "internal", "config", "config.go"))
+	require.NoError(t, err)
+	parsed, err := parser.ParseFile(token.NewFileSet(), "config.go", src, 0)
+	require.NoError(t, err)
+	var schemes []string
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "transportScheme" || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			sw, ok := n.(*ast.SwitchStmt)
+			if !ok {
+				return true
+			}
+			for _, stmt := range sw.Body.List {
+				clause, ok := stmt.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				for _, expr := range clause.List {
+					lit, ok := expr.(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					s, err := strconv.Unquote(lit.Value)
+					require.NoError(t, err)
+					schemes = append(schemes, s)
+				}
+			}
+			return false
+		})
+	}
+	require.NotEmpty(t, schemes)
+	return schemes
 }
 
 func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
