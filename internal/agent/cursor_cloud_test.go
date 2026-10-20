@@ -1457,6 +1457,16 @@ func (panicOutput) Write(p []byte) (int, error) {
 	panic("status line exploded")
 }
 
+// notePanicOutput lets the status line through and panics at the stop note.
+type notePanicOutput struct{}
+
+func (notePanicOutput) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("stop agent")) {
+		panic("stop note exploded")
+	}
+	return len(p), nil
+}
+
 func TestCursorCloudStopErrorPanicStillDeletes(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
@@ -1467,8 +1477,8 @@ func TestCursorCloudStopErrorPanicStillDeletes(t *testing.T) {
 			cursorcloudtest.MethodStop: errors.New("stop exploded"),
 		},
 	}
-	require.PanicsWithValue(t, "status line exploded", func() {
-		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", panicOutput{})
+	require.PanicsWithValue(t, "stop note exploded", func() {
+		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", notePanicOutput{})
 	})
 	var ops []string
 	var createdID, deletedID string

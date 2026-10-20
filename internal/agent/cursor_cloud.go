@@ -455,12 +455,18 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
 	// Stop and each DELETE get a fresh timeout. Sharing one 60s context let
 	// a stalled stop starve the deletes.
+	var stopNotePanic any
+	defer func() {
+		if stopNotePanic != nil {
+			panic(stopNotePanic)
+		}
+	}()
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
 	stopErr := client.StopAgent(stopCtx, id)
 	stopCancel()
 	if stopErr != nil && !cursorCloudStopQuiet(stopErr) {
 		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, stopErr)
-		writeCursorCloudCleanupNote(output, note.Error())
+		stopNotePanic = cleanupNotePanic(output, note.Error())
 	}
 	var err error
 	for attempt := 1; attempt <= cursorCloudDeleteAttempts; attempt++ {
@@ -487,14 +493,23 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 // writer must not skip DeleteAgent or replace the panic that entered
 // cleanup; that original panic still leaves Review.
 func writeCursorCloudCleanupNote(output io.Writer, note string) {
-	if note == "" {
-		return
+	if p := cleanupNotePanic(output, note); p != nil {
+		panic(p)
 	}
-	defer func() { _ = recover() }()
+}
+
+// cleanupNotePanic writes note and returns a writer panic instead of
+// letting it skip the rest of cleanup. The caller panics after delete.
+func cleanupNotePanic(output io.Writer, note string) (panicked any) {
+	if note == "" {
+		return nil
+	}
+	defer func() { panicked = recover() }()
 	log.Printf("%s", note)
 	if output != nil {
 		fmt.Fprintln(output, note)
 	}
+	return nil
 }
 
 // cursorCloudDeleteFinal reports a DELETE that must not be retried.

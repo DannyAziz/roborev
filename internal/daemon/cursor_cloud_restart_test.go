@@ -382,7 +382,7 @@ func (cursorCloudStopPanicWriter) Write(p []byte) (int, error) {
 }
 
 // TestCursorCloudStopErrorWritePanicStillDeletes panics at the stop-error
-// note. Delete still runs. A writer panic must not skip it.
+// note, after delete. The status line is written and does not panic.
 func TestCursorCloudStopErrorWritePanicStillDeletes(t *testing.T) {
 	fake := &cursorcloudtest.Fake{
 		CreateStatus: cursorcloud.StatusFinished,
@@ -393,13 +393,11 @@ func TestCursorCloudStopErrorWritePanicStillDeletes(t *testing.T) {
 	cloud.SetLaunchLimitsForTest(4, 20)
 	sha := "0123456789abcdef0123456789abcdef01234567"
 	var panicked any
-	var err error
 	func() {
 		defer func() { panicked = recover() }()
-		_, err = cloud.Review(context.Background(), t.TempDir(), sha, "prompt", cursorCloudStopPanicWriter{})
+		_, _ = cloud.Review(context.Background(), t.TempDir(), sha, "prompt", cursorCloudStopPanicWriter{})
 	}()
-	assert.Nil(t, panicked)
-	require.NoError(t, err)
+	assert.Equal(t, "output exploded", panicked)
 	assert.Equal(t, 1, cursorCloudCallCount(fake, cursorcloudtest.MethodDelete))
 }
 
