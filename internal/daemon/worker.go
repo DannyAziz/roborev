@@ -723,7 +723,9 @@ func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.Review
 	}
 	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
 	copied.NoteCleanupFailure = func(msg string) error { return wp.db.NoteCloudLaunchRisk(job.ID, msg) }
-	copied.ClearLaunch = func(token string) error { return wp.db.MarkCloudLaunchCleanedByToken(token) }
+	copied.MarkLaunchCleaned = func(token string) error {
+		return wp.db.MarkCloudLaunchCleanedByToken(token)
+	}
 	return &copied
 }
 
@@ -1483,6 +1485,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 	if wp.handleUpdateInterruption(ctx, workerID, job) {
+		log.Printf("[%s] discarded successful result for update-interrupted job %d", workerID, job.ID)
 		return
 	}
 

@@ -93,9 +93,8 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		repoURL = config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
 	}
 	if !agent.CursorCloudRepoUsable(repoURL) {
-		if row.AgentID != "" {
-			return db.MarkCloudLaunchCleaned(row.ID)
-		}
+		// The saved id was deleted above when it was set. Another VM from
+		// the same token is only visible to the marker sweep.
 		return fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID)
 	}
 	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)

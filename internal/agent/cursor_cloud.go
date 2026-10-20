@@ -185,8 +185,10 @@ type CursorCloudAgent struct {
 	// NoteCleanupFailure records a stop or delete that did not finish.
 	// The launch row stays uncleaned.
 	NoteCleanupFailure func(msg string) error
-	// ClearLaunch marks the launch cleaned after a nil or 404 delete.
-	ClearLaunch func(token string) error
+	// MarkLaunchCleaned runs after a nil or 404 delete of every VM this
+	// token could own. A partial delete, or a list that did not run, must
+	// not call it. The storage callback clears orphan_note.
+	MarkLaunchCleaned func(token string) error
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -308,12 +310,9 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			refund()
 			return "", err
 		}
-		// A 429 rejects the create. Nothing was launched, so do not spend
-		// the reconcile window looking for a VM.
-		if cursorCloudRateLimited(err) {
-			return "", cursorCloudNonRetryable(err)
-		}
-		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output); recErr != nil {
+		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output, func() error {
+			return a.markLaunchCleaned(token)
+		}); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
 		return "", cursorCloudNonRetryable(err)
@@ -323,10 +322,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	defer func() {
 		delErr := deleteCursorCloudAgent(client, created.ID, output)
 		if delErr == nil {
-			if a.ClearLaunch != nil {
-				if clearErr := a.ClearLaunch(token); clearErr != nil && err == nil {
-					err = clearErr
-				}
+			// The id from this response is gone. A provider-side duplicate
+			// shares the marker and is not that id, so the row is cleaned
+			// only after the sweep deletes every remaining match.
+			if cleanErr := a.markLaunchCleanedAfterDelete(client, repoURL, token, reconcileToken, output); cleanErr != nil {
+				log.Printf("cursor-cloud: launch row left uncleaned after delete: %v", cleanErr)
 			}
 			return
 		}
@@ -576,7 +576,7 @@ func cursorCloudStopQuiet(err error) bool {
 // https://cursor.com/docs/cloud-agent/api/v0#launch-an-agent
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents
 // https://cursor.com/docs/cloud-agent/api/v0#agent-conversation
-func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, repoURL, token string, output io.Writer) error {
+func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, repoURL, token string, output io.Writer, onCleaned ...func() error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -624,6 +624,12 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
+			} else if len(onCleaned) > 0 && onCleaned[0] != nil {
+				// found with no match error means every listed VM for this
+				// token was deleted with nil or 404.
+				if markErr := onCleaned[0](); markErr != nil {
+					errs = appendReconcileErr(errs, markErr)
+				}
 			}
 			if found {
 				foundLaunch = true
@@ -735,6 +741,38 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 
 func StopAndDeleteCursorCloudAgent(client cursorcloud.Client, id string) error {
 	return deleteCursorCloudAgent(client, id, nil)
+}
+
+func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
+	if a == nil || a.MarkLaunchCleaned == nil {
+		return nil
+	}
+	return a.MarkLaunchCleaned(token)
+}
+
+// markLaunchCleanedAfterDelete lists once more so a provider-side duplicate
+// of token is deleted before the row is cleaned. The id already removed is
+// not in that list. A list or delete error leaves the row uncleaned.
+func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Client, repoURL, token, reconcileToken string, output io.Writer) error {
+	if a == nil || a.MarkLaunchCleaned == nil {
+		return nil
+	}
+	if !CursorCloudRepoUsable(repoURL) {
+		return errors.New("cursor-cloud: launch has no repository to sweep")
+	}
+	listCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+	agents, err := client.ListAgents(listCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+	}
+	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
+	_, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
+	passCancel()
+	if sweepErr != nil {
+		return sweepErr
+	}
+	return a.markLaunchCleaned(token)
 }
 
 // CursorCloudRepoUsable is false for empty input and the redacted-url sentinel.
