@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,4 +95,33 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 			assert.Nil(t, claimed)
 		})
 	}
+}
+
+// TestSynthesisCursorCloudLaunchIsNotRetried pins the non-host synthesis
+// path. Formatting that error with %v drops ErrCursorCloudNonRetryable, and
+// the job is queued for another agent run.
+func TestSynthesisCursorCloudLaunchIsNotRetried(t *testing.T) {
+	noHostMarker(t)
+	var calls atomic.Int32
+	const synthAgent = "synth-cloud-once"
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: synthAgent,
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			calls.Add(1)
+			return "", fmt.Errorf("create agent: %w", agent.ErrCursorCloudNonRetryable)
+		},
+	})
+	tc := newWorkerTestContext(t, 1)
+	synth := claimSynthesis(t, tc, "synth-cloud-nr", synthAgent, "test")
+
+	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+
+	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
+	assert.Equal(t, synthAgent, updated.Agent)
+	assert.Equal(t, 0, updated.RetryCount)
+	assert.Equal(t, int32(1), calls.Load())
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
+	assert.Contains(t, updated.Error, agent.ErrCursorCloudNonRetryable.Error())
 }

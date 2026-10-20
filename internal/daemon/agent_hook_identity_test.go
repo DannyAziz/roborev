@@ -14,7 +14,10 @@ import (
 func TestAgentHookTracksHistoricalRepoIdentity(t *testing.T) {
 	db := testutil.OpenTestDB(t)
 	repo := testutil.NewTestRepo(t)
-	const historical = "https://github.com/User/Repo.git"
+	// The row is the identity ResolveRepoIdentity stored at bb99a09a:
+	// case and the .git suffix kept. It is not computed by the function
+	// under test.
+	const historical = "https://github.com/Acme/Widgets.git"
 	repo.AddRemote("origin", historical)
 	mainRoot, err := gitrepo.MainRoot(context.Background(), repo.Root)
 	require.NoError(t, err)

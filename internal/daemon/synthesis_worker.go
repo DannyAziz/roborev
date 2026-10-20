@@ -444,8 +444,11 @@ func (wp *WorkerPool) runSynthesisAgent(
 			)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}
-		if agent.CanonicalName(agentName) == "host" {
-			// A host handoff timeout is not retried on the same agent.
+		if agent.CanonicalName(agentName) == "host" || errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+			// Host handoff timeouts and a cursor-cloud launch that may
+			// already have been sent must keep their typed error. Formatting
+			// the error as text drops ErrCursorCloudNonRetryable, and the
+			// retry path would POST /v0/agents again.
 			wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}
