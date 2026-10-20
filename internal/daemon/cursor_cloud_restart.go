@@ -93,8 +93,13 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		repoURL = config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
 	}
 	if !agent.CursorCloudRepoUsable(repoURL) {
-		// The saved id was deleted above when it was set. Another VM from
-		// the same token is only visible to the marker sweep.
+		// A saved id was deleted above. Another VM from the same token is
+		// only visible to the marker sweep, so the row stays uncleaned.
+		// A token-only row has nothing to list. Once it is old enough, record
+		// the same orphan note as a missed list. The row stays uncleaned.
+		if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, time.Now().UTC()) {
+			return reportCloudLaunchOrphan(db, row)
+		}
 		return fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID)
 	}
 	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)

@@ -499,6 +499,37 @@ func TestCursorCloudRestartUsesStoredIdentityWithoutRemote(t *testing.T) {
 	assert.Equal(t, lists+1, cursorCloudCallCount(fake, cursorcloudtest.MethodList), "redacted-url must not start another sweep")
 }
 
+// TestCursorCloudRestartNotesLegacyGoneRemote is the pin for a token-only
+// row stored before repo_identity existed. The checkout remote is gone, so
+// recovery cannot list. A young row stays uncleaned with no orphan note.
+// Once created_at passes the sweep window, the job error and log name the
+// orphan risk and the row is still not deleted.
+func TestCursorCloudRestartNotesLegacyGoneRemote(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	cursorCloudLegacyToken(t, tc, job.ID, "launch-token-legacy-gone")
+	tc.GitRepo.Run("remote", "remove", "origin")
+	logs := cursorCloudCaptureLog(t)
+
+	cursorCloudAssertLegacySweepOrphan(t, tc, fake, job.ID, logs)
+}
+
+// TestCursorCloudRestartNotesLegacyUnusableRepo is the same pin when the
+// stored checkout itself cannot be read. repo_identity is empty and the
+// repo path is not a git checkout, so there is still nothing to list.
+func TestCursorCloudRestartNotesLegacyUnusableRepo(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	cursorCloudLegacyToken(t, tc, job.ID, "launch-token-legacy-unusable")
+	_, err := tc.DB.Exec(`UPDATE repos SET root_path = ? WHERE id = ?`, t.TempDir(), job.RepoID)
+	require.NoError(t, err)
+	logs := cursorCloudCaptureLog(t)
+
+	cursorCloudAssertLegacySweepOrphan(t, tc, fake, job.ID, logs)
+}
+
 func TestCursorCloudUpdateInterruptDoesNotRelaunch(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -720,6 +751,43 @@ func cursorCloudCallCount(fake *cursorcloudtest.Fake, method string) int {
 		}
 	}
 	return n
+}
+
+func cursorCloudLegacyToken(t *testing.T, tc *workerTestContext, jobID int64, token string) {
+	t.Helper()
+	cursorCloudBeginToken(t, tc, jobID, token)
+	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = '' WHERE job_id = ?`, jobID)
+	require.NoError(t, err)
+}
+
+func cursorCloudAssertLegacySweepOrphan(t *testing.T, tc *workerTestContext, fake *cursorcloudtest.Fake, jobID int64, logs *bytes.Buffer) {
+	t.Helper()
+	err := recoverStaleJobs(context.Background(), tc.DB, fake)
+	require.Error(t, err)
+	assert := assert.New(t)
+	assert.Contains(err.Error(), "has no repository to sweep")
+	n, err := tc.DB.CountUncleanedCloudLaunches(jobID)
+	require.NoError(t, err)
+	assert.Equal(1, n)
+	assert.NotContains(logs.String(), "orphan risk")
+	updated, err := tc.DB.GetJobByID(jobID)
+	require.NoError(t, err)
+	assert.Equal(storage.JobStatusFailed, updated.Status)
+	assert.NotContains(updated.Error, "orphan risk")
+
+	cursorCloudAgeLaunch(t, tc.DB, jobID)
+	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	n, err = tc.DB.CountUncleanedCloudLaunches(jobID)
+	require.NoError(t, err)
+	assert.Equal(1, n)
+	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
+	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
+	assert.Contains(logs.String(), "orphan risk")
+	updated, err = tc.DB.GetJobByID(jobID)
+	require.NoError(t, err)
+	assert.Equal(storage.JobStatusFailed, updated.Status)
+	assert.Contains(updated.Error, "orphan risk")
+	assert.Contains(updated.Error, storage.CloudLaunchInterruptedError)
 }
 
 func cursorCloudBeginToken(t *testing.T, tc *workerTestContext, jobID int64, token string) {
