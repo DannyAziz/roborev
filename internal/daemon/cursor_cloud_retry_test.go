@@ -541,3 +541,49 @@ func TestCursorCloudPreLaunchValidationCanFailOver(t *testing.T) {
 	assert.Equal(t, "test", updated.Agent)
 	assert.Equal(t, 0, updated.RetryCount)
 }
+
+// A cloud fix job that returns without a usable patch must not launch again.
+// The cloud agent edits its own VM, so the local worktree has no changes, and
+// the ordinary retry of "no file changes" POSTs another agent.
+func TestProcessJobCursorCloudFixWithoutPatchDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	wtc, fake := cursorCloudRestartFixture(t)
+	wtc.Pool.retryBackoff = 0
+	fake.CreateStatus = cursorcloud.StatusFinished
+	fake.Final = "I made the change."
+	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
+	commit, err := wtc.DB.GetOrCreateCommit(wtc.Repo.ID, sha, "Author", "Subject", time.Now())
+	require.NoError(t, err)
+	parent, err := wtc.DB.EnqueueJob(storage.EnqueueOpts{RepoID: wtc.Repo.ID, CommitID: commit.ID, GitRef: sha, Agent: "test"})
+	require.NoError(t, err)
+	fix, err := wtc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: wtc.Repo.ID, CommitID: commit.ID, GitRef: sha, Agent: agent.CursorCloudHost,
+		JobType: storage.JobTypeFix, ParentJobID: parent.ID, Prompt: "fix it",
+	})
+	require.NoError(t, err)
+	_, err = wtc.DB.Exec(`UPDATE review_jobs SET status = 'done' WHERE id = ?`, parent.ID)
+	require.NoError(t, err)
+	job, err := wtc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Equal(t, fix.ID, job.ID)
+
+	for range maxRetries + 2 {
+		if job.Agent != agent.CursorCloudHost {
+			break
+		}
+		wtc.Pool.processJob(testWorkerID, job)
+		next, claimErr := wtc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, claimErr)
+		if next == nil {
+			break
+		}
+		job = next
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
+	stored, err := wtc.DB.GetJobByID(fix.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, stored.RetryCount)
+	assert.Equal(t, storage.JobStatusFailed, stored.Status)
+	assert.Contains(t, stored.Error, "agent produced no file changes")
+}

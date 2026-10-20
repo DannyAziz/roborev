@@ -1501,12 +1501,12 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		fixPatch, patchErr = fixWorktree.CapturePatch(ctx)
 		if patchErr != nil {
 			log.Printf("[%s] Fix job %d: patch capture failed: %v", workerID, job.ID, patchErr)
-			wp.failOrRetryContext(ctx, workerID, job, agentName, fmt.Sprintf("patch capture: %v", patchErr))
+			wp.failFixAfterRunContext(ctx, workerID, job, agentName, fmt.Sprintf("patch capture: %v", patchErr))
 			return
 		}
 		if fixPatch == "" {
 			log.Printf("[%s] Fix job %d: agent produced no file changes", workerID, job.ID)
-			wp.failOrRetryContext(ctx, workerID, job, agentName, "agent produced no file changes")
+			wp.failFixAfterRunContext(ctx, workerID, job, agentName, "agent produced no file changes")
 			return
 		}
 		log.Printf("[%s] Fix job %d: captured patch (%d bytes)", workerID, job.ID, len(fixPatch))
@@ -1914,6 +1914,16 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
 		}
 	}
+}
+
+// failFixAfterRunContext fails a fix whose agent already returned. A
+// cursor-cloud create was sent, so the fix is not retried on cursor-cloud.
+func (wp *WorkerPool) failFixAfterRunContext(ctx context.Context, workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
+	if agent.CanonicalName(agentName) == agent.CursorCloudHost {
+		wp.failSentCursorCloud(workerID, job, agentName, errorMsg)
+		return
+	}
+	wp.failOrRetryContext(ctx, workerID, job, agentName, errorMsg)
 }
 
 // failCursorCloudWithoutRetry stops another cursor-cloud launch. A backup
