@@ -1775,7 +1775,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo.git" {
+		if id != "https://github.com/user/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL, got: %q", id)
@@ -1807,10 +1807,10 @@ func TestResolveRepoIdentity(t *testing.T) {
 
 		// With nil getRemoteURL, should use git.GetRemoteURL and find the remote
 		id := ResolveRepoIdentity(tmpDir, nil)
-		if id != "https://github.com/test/repo.git" {
+		if id != "https://github.com/test/repo" {
 			assert.Condition(t, func() bool {
 				return false
-			}, "Expected 'https://github.com/test/repo.git', got: %q", id)
+			}, "Expected 'https://github.com/test/repo', got: %q", id)
 		}
 	})
 
@@ -1841,7 +1841,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/user/repo.git" {
+		if id != "https://github.com/user/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected git remote URL when roborev-id is invalid, got: %q", id)
@@ -1856,7 +1856,7 @@ func TestResolveRepoIdentity(t *testing.T) {
 		}
 
 		id := ResolveRepoIdentity(tmpDir, mockRemote)
-		if id != "https://github.com/org/repo.git" {
+		if id != "https://github.com/org/repo" {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Expected credentials stripped from URL, got: %q", id)
@@ -1884,7 +1884,11 @@ func TestResolveRepoIdentity(t *testing.T) {
 		gitID := ResolveRepoIdentity(dir, func(string, string) string {
 			return "git@github.com:acme/one.git"
 		})
-		assert.Equal(t, "git@github.com:acme/one.git", gitID)
+		httpsID := ResolveRepoIdentity(dir, func(string, string) string {
+			return "https://GitHub.com/Acme/One.git"
+		})
+		assert.Equal(t, "https://github.com/acme/one", gitID)
+		assert.Equal(t, gitID, httpsID)
 	})
 }
 
@@ -3543,9 +3547,24 @@ func TestStripURLCredentials(t *testing.T) {
 			expected: "https://github.com/o/r.git",
 		},
 		{
-			name:     "token query keeps other params",
+			name:     "token query drops every query field",
 			input:    "https://github.com/o/r.git?x=1&token=sekret",
-			expected: "https://github.com/o/r.git?x=1",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "oauth_token query is removed",
+			input:    "https://github.com/o/r.git?oauth_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "ACCESS_TOKEN query is removed regardless of case",
+			input:    "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "schemeless userinfo is removed",
+			input:    "//user:tok@host/x",
+			expected: "//host/x",
 		},
 		{
 			name:     "ssh userinfo is removed",

@@ -32,25 +32,26 @@ const (
 
 	cursorCloudAgentName = CursorCloudHost
 	cursorCloudMaxPoll   = 5 * time.Second
-	// cursorCloudDeleteTimeout bounds the post-review DELETE. It matches the
-	// cursorcloud client's 60s response-header timeout so a stalled delete is
-	// not abandoned before that client gives up on the socket.
-	cursorCloudDeleteTimeout = 60 * time.Second
 	// cursorCloudDeleteAttempts bounds retries of one failed DELETE.
+	// A 4xx is not retried; it will not succeed on the next attempt.
 	cursorCloudDeleteAttempts = 3
-	// cursorCloudDeleteBackoff is the pause between those DELETE attempts.
-	// Each attempt has its own cursorCloudDeleteTimeout, so a stalled first
-	// call cannot consume the budget of the next. The gap is short so a
-	// transient failure is retried without holding cleanup for another minute.
+	// cursorCloudDeleteBackoff is the pause between transient DELETE attempts.
 	cursorCloudDeleteBackoff = 100 * time.Millisecond
-	// cursorCloudReconcileAttempts is how many times a lost create is listed
-	// before the VM is left for the operator. One immediate list misses an
-	// agent that becomes visible slightly after the response is dropped.
-	cursorCloudReconcileAttempts = 3
-	// cursorCloudReconcileBackoff is the pause between those lists. It stays
-	// inside the reconcile context so a cancelled cleanup does not sleep out
-	// the full cursorCloudDeleteTimeout between attempts.
-	cursorCloudReconcileBackoff = 100 * time.Millisecond
+	// cursorCloudReconcileWindow is how long a lost create is re-listed.
+	// A server can publish the agent after the HTTP client has already given
+	// up: the pin is a 300ms create against a 50ms client timeout. One
+	// immediate list then leaves stops=0 and deletes=0. This window is longer
+	// than that client timeout and longer than the 300ms publish lag.
+	cursorCloudReconcileWindow = 500 * time.Millisecond
+	// cursorCloudReconcileBackoff is the pause between those lists.
+	cursorCloudReconcileBackoff = 50 * time.Millisecond
+)
+
+// cursorCloudDeleteTimeout bounds one stop or one DELETE. Each call gets its
+// own context so a stop that never answers cannot cancel the deletes.
+var cursorCloudDeleteTimeout = 60 * time.Second
+
+const (
 	// cursorCloudLaunchMarker prefixes the unique token embedded in the
 	// prompt. v0 launch has no idempotency key, so a create that fails after
 	// send is found again by this token.
@@ -231,7 +232,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	})
 	if err != nil {
 		if !cursorCloudPreSend(err) {
-			if recErr := reconcileCursorCloudLaunch(client, token, output); recErr != nil {
+			if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
 				err = errors.Join(err, recErr)
 			}
 		}
@@ -241,9 +242,16 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// panic or error there still removes the VM.
 	defer func() {
 		delErr := deleteCursorCloudAgent(client, created.ID, output)
-		if delErr != nil && err != nil {
-			err = errors.Join(err, delErr)
+		if delErr == nil {
+			return
 		}
+		// A review whose VM was not deleted is not success. The sentinel
+		// keeps the worker from POSTing /agents again to clean it up.
+		if err != nil {
+			err = errors.Join(err, delErr)
+			return
+		}
+		err = cursorCloudNonRetryable(delErr)
 	}()
 	if output != nil {
 		fmt.Fprintf(output, "cursor-cloud: created agent %s at %s\n", created.ID, sha)
@@ -388,8 +396,11 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 		delCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
 		err = client.DeleteAgent(delCtx, id)
 		cancel()
-		if err == nil {
-			return nil
+		if err == nil || cursorCloudDeleteFinal(err) {
+			if err == nil {
+				return nil
+			}
+			break
 		}
 	}
 	surfaced := fmt.Errorf("cursor-cloud: delete agent %s: %w", id, err)
@@ -403,6 +414,13 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 // cursorCloudStopQuiet reports a stop that failed because the agent was
 // already finished or stopped. That response is expected after a successful
 // review and is not written to the review output.
+// cursorCloudDeleteFinal reports a DELETE that must not be retried.
+// 4xx is the client's request, not a transient server failure.
+func cursorCloudDeleteFinal(err error) bool {
+	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
+	return ok && apiErr != nil && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
+}
+
 func cursorCloudStopQuiet(err error) bool {
 	if err == nil {
 		return false
@@ -427,52 +445,69 @@ func cursorCloudStopQuiet(err error) bool {
 // response never yielded an id, then stops and deletes it. v0 POST /v0/agents
 // has no idempotency key (Launch an Agent request body: prompt, model,
 // source, target, webhook). List Agents returns source.repository and
-// source.ref but not the prompt. Those fields are not compared: the service
-// may normalize them, so the match is only the launch token in the
-// conversation user_message.
+// source.ref but not the prompt. Repository equality uses config.RemoteIdentity
+// so .git, scp versus https, and case still match. The launch token in the
+// user_message confirms it is this launch. A cleanup error names the orphan id.
 // https://cursor.com/docs/cloud-agent/api/v0#launch-an-agent
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents
 // https://cursor.com/docs/cloud-agent/api/v0#agent-conversation
-func reconcileCursorCloudLaunch(client cursorcloud.Client, token string, output io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string, output io.Writer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cursorCloudReconcileWindow)
 	defer cancel()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
-	for attempt := 1; attempt <= cursorCloudReconcileAttempts; attempt++ {
-		if attempt > 1 {
-			if err := waitCursorCloud(ctx, cursorCloudReconcileBackoff); err != nil {
-				errs = append(errs, err)
-				break
-			}
-		}
+	for {
 		agents, err := client.ListAgents(ctx)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
-			if ctx.Err() != nil {
+		} else if found, matchErr := deleteMatchingCursorCloudLaunch(ctx, client, agents, repoURL, marker, output); found || matchErr != nil {
+			if matchErr != nil {
+				errs = append(errs, matchErr)
+			}
+			if found {
 				break
 			}
-			continue
 		}
-		matched := false
-		for _, ag := range agents {
-			text, promptErr := client.UserPrompt(ctx, ag.ID)
-			if promptErr != nil {
-				errs = append(errs, fmt.Errorf("cursor-cloud: reconcile %s: %w", ag.ID, promptErr))
-				continue
-			}
-			if !strings.Contains(text, marker) {
-				continue
-			}
-			matched = true
-			if delErr := deleteCursorCloudAgent(client, ag.ID, output); delErr != nil {
-				errs = append(errs, delErr)
-			}
-		}
-		if matched || ctx.Err() != nil {
+		if waitCursorCloud(ctx, cursorCloudReconcileBackoff) != nil {
 			break
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
+	var errs []error
+	found := false
+	for _, ag := range agents {
+		if !sameCursorCloudRepo(repoURL, ag.SourceRepository) {
+			continue
+		}
+		text, promptErr := client.UserPrompt(ctx, ag.ID)
+		if promptErr != nil {
+			errs = append(errs, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, promptErr))
+			continue
+		}
+		if !strings.Contains(text, marker) {
+			continue
+		}
+		found = true
+		if delErr := deleteCursorCloudAgent(client, ag.ID, output); delErr != nil {
+			return true, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
+		}
+	}
+	return found, errors.Join(errs...)
+}
+
+func sameCursorCloudRepo(want, got string) bool {
+	if strings.TrimSpace(got) == "" {
+		return true
+	}
+	wantID := config.RemoteIdentity(want)
+	gotID := config.RemoteIdentity(got)
+	if wantID == "" || gotID == "" {
+		return false
+	}
+	return wantID == gotID
 }
 
 func waitCursorCloud(ctx context.Context, d time.Duration) error {
