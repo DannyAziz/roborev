@@ -752,12 +752,23 @@ func (p *PgPool) GetOrCreateRepo(ctx context.Context, identity string) (int64, e
 	return id, nil
 }
 
+// repoIdentityDB is the slice of a pool adoptCanonicalRepoIdentity needs.
+// Tests drive the zero-row update race without PostgreSQL.
+type repoIdentityDB interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
 // adoptCanonicalRepoIdentity rewrites one stack-built canonical row to the
 // stored form when RemoteIdentity says they are the same remote. An exact
 // row is returned unchanged.
 func (p *PgPool) adoptCanonicalRepoIdentity(ctx context.Context, identity string) (int64, bool, error) {
+	return adoptCanonicalRepoIdentity(ctx, p.pool, identity)
+}
+
+func adoptCanonicalRepoIdentity(ctx context.Context, q repoIdentityDB, identity string) (int64, bool, error) {
 	var id int64
-	err := p.pool.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, identity).Scan(&id)
+	err := q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, identity).Scan(&id)
 	if err == nil {
 		return id, true, nil
 	}
@@ -768,15 +779,28 @@ func (p *PgPool) adoptCanonicalRepoIdentity(ctx context.Context, identity string
 	if canonical == "" || canonical == identity {
 		return 0, false, nil
 	}
-	err = p.pool.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
+	err = q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("lookup canonical repo identity: %w", err)
 	}
-	if _, err := p.pool.Exec(ctx, `UPDATE repos SET identity = $1 WHERE id = $2 AND identity = $3`, identity, id, canonical); err != nil {
+	tag, err := q.Exec(ctx, `UPDATE repos SET identity = $1 WHERE id = $2 AND identity = $3`, identity, id, canonical)
+	if err != nil {
 		return 0, false, fmt.Errorf("rewrite canonical repo identity: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return id, true, nil
+	}
+	// The row we read was rewritten by someone else. Returning that id
+	// would point at a row that no longer has the canonical identity.
+	err = q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup canonical repo identity: %w", err)
 	}
 	return id, true, nil
 }
