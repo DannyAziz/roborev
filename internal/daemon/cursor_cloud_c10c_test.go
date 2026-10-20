@@ -43,9 +43,7 @@ func TestProcessJobBindsCursorCloudLaunch(t *testing.T) {
 
 	tc.Pool.processJob(testWorkerID, job)
 
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, 1, countCloudLaunchRows(t, tc.DB, job.ID))
 }
 
 func TestGoalReviewBindsCursorCloudLaunch(t *testing.T) {
@@ -71,9 +69,7 @@ func TestGoalReviewBindsCursorCloudLaunch(t *testing.T) {
 
 	tc.Pool.processGoalReview(context.Background(), testWorkerID, claimed, tc.Pool.cfgGetter.Config())
 
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, 1, countCloudLaunchRows(t, tc.DB, job.ID))
 }
 
 func TestSynthesisBindsCursorCloudLaunch(t *testing.T) {
@@ -94,9 +90,14 @@ func TestSynthesisBindsCursorCloudLaunch(t *testing.T) {
 
 	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, claimed)
 
-	n, err := tc.DB.CountUncleanedCloudLaunches(synth.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, 1, countCloudLaunchRows(t, tc.DB, synth.ID))
+}
+
+func countCloudLaunchRows(t *testing.T, db *storage.DB, jobID int64) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ?`, jobID).Scan(&n))
+	return n
 }
 
 func TestSynthesisRunKeepsPriorLog(t *testing.T) {

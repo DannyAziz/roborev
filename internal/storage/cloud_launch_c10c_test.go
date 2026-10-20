@@ -19,7 +19,8 @@ func TestBeginCloudLaunchCreatedAtIsInsertTime(t *testing.T) {
 	_, err = db.Exec(`CREATE TABLE review_job_cloud_launches (
 		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT NOT NULL,
 		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
-		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '')`)
+		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
+		orphan_note TEXT NOT NULL DEFAULT '')`)
 	require.NoError(t, err)
 	job := runningCloudJob(t, db)
 	require.NoError(t, db.BeginCloudLaunch(job.ID, "w", "tok", "https://example.com/acme/repo.git"))

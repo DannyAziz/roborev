@@ -652,10 +652,10 @@ func TestDoneContextPersistsNoCloudLaunch(t *testing.T) {
 }
 
 // TestCursorCloudRestartReaps429Create is a create that stores an agent and
-// then returns 429. Create does not list on a 429, so that response does
-// not consume a list 429. The startup sweep does: a list 429 leaves the
-// token row uncleaned. A later miss keeps the row. The next list deletes
-// the agent and does not create another.
+// then returns 429. The in-process reconcile lists once and stops on that
+// 429, so the agent is still there. The startup sweep lists again: a list
+// 429 leaves the token row uncleaned. A later miss keeps the row. The next
+// list deletes the agent and does not create another.
 func TestCursorCloudRestartReaps429Create(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
 	tc, fake := cursorCloudRestartFixture(t)
@@ -686,7 +686,7 @@ func TestCursorCloudRestartReaps429Create(t *testing.T) {
 	err = recoverStaleJobs(context.Background(), tc.DB, provider)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "too many requests")
-	assert.Equal(t, 1, provider.listCalls(), "the startup list must consume the 429")
+	assert.Equal(t, 2, provider.listCalls(), "create reconcile and the startup sweep each consume one list 429")
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)

@@ -452,7 +452,9 @@ func TestProcessJobCursorCloudCreate429SkipsReconcile(t *testing.T) {
 		tc.Pool.processJob(testWorkerID, job)
 
 		assert.Equal(t, 1, createCountFromFake(fake))
-		assert.Equal(t, 0, methodCountFromFake(fake, cursorcloudtest.MethodList))
+		// The 429 was sent, so reconcile lists. The job still failovers
+		// without a local retry.
+		assert.Positive(t, methodCountFromFake(fake, cursorcloudtest.MethodList))
 		updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
 		assert.Equal(t, "test", updated.Agent)
 		assert.Equal(t, 0, updated.RetryCount)
