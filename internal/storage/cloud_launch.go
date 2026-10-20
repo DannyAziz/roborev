@@ -74,8 +74,8 @@ func (db *DB) MarkCloudLaunchCleaned(launchID int64) error {
 // The token is unique per launch row and the row can outlive its job, so
 // the job id is not part of the key. orphan_note changes only inside
 // MarkCloudLaunchCleaned. Callers mark cleaned only after SweepAllowsClean:
-// every VM found so far was deleted by id, and a later marker sweep was
-// empty at or after the listing-lag window.
+// a later independent empty sweep, after the documented minimum age, and
+// only once every VM found so far was deleted by id.
 func (db *DB) MarkCloudLaunchCleanedByToken(token string) error {
 	rows, err := db.Query(`SELECT id FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 0 ORDER BY id`, token)
 	if err != nil {

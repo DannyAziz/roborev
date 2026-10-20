@@ -58,14 +58,14 @@ func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorclou
 	return errors.Join(errs...)
 }
 
-// cloudLaunchMaxAge is how long a token-only row may miss List Agents before
-// that miss is an orphan risk. The list can lag the create, so a young miss
-// is not a delete and not a 404: the row stays uncleaned and the next start
-// sweeps it again. A crash before the POST saved a token and no VM; 24h is
-// long enough that a same-day restart still retries a lagging list, and short
-// enough that a no-POST row cannot sit pending forever. Past that age the row
-// is still not cleaned. The risk is written to the log and the job error.
-const cloudLaunchMaxAge = 24 * time.Hour
+// cloudLaunchMaxAge is how long a launch stays uncleaned before a later
+// independent empty sweep may mark it cleaned, and before a token-only or
+// empty-token miss is an orphan risk. A same-day restart still has to be
+// able to see a VM an earlier list missed, so 24h is long enough for that
+// retry and short enough that a no-POST row cannot sit pending forever.
+// It is the existing documented bound, not a measured listing lag. Tests
+// set the variable. An empty sweep inside the same call does not use it.
+var cloudLaunchMaxAge = 24 * time.Hour
 
 func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorcloud.Client, daemonID string, row storage.CloudLaunch) error {
 	if row.AgentID != "" {
@@ -76,17 +76,9 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 	}
 	if row.TokenNull || row.Token == "" {
-		// No marker can find a VM for this row. An empty list deletes
-		// nothing, and there is no saved id to delete, so this is not a
-		// by-id delete. SweepAllowsClean refuses the clean. The orphan
-		// note stays, and a later start still sweeps the row.
-		if row.AgentID == "" {
-			now := agent.CursorCloudNow()
-			since, _ := parseCloudLaunchCreated(row.CreatedAt)
-			if agent.SweepAllowsClean(false, false, since, now) {
-				return db.MarkCloudLaunchCleanedByToken(row.Token)
-			}
-		}
+		// No marker can name a VM. One empty list deletes nothing, so it
+		// does not clean. The orphan note is written now, and again after
+		// the documented age even if a later start sees other agents.
 		return reportCloudLaunchOrphan(db, row)
 	}
 	repoURL := row.RepoIdentity
@@ -113,21 +105,25 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	if err != nil {
 		return err
 	}
-	// Clean only after a by-id delete of every VM found so far and a later
-	// empty sweep at or after the listing-lag window. found means this
-	// sweep deleted a VM, so it is not that confirming empty sweep. A
-	// delete failure and an unusable repo already returned above with the
-	// orphan note still on the job. Leaving the row uncleaned keeps it.
+	// This restart is its own call. It cleans only when the sweep deleted
+	// nothing, the saved id was already removed by id, and the launch is
+	// at least cloudLaunchMaxAge old. One list, or a list that deleted a
+	// VM, leaves the row uncleaned with the orphan note.
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
-	if agent.SweepAllowsClean(found, row.AgentID != "", since, now) {
+	if agent.SweepAllowsClean(found, row.AgentID != "", true, since, now, cloudLaunchMaxAge) {
 		return db.MarkCloudLaunchCleanedByToken(row.Token)
+	}
+	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now) {
+		// Aged out with or without listed agents. The note is not limited
+		// to an empty list.
+		return reportCloudLaunchOrphan(db, row)
+	}
+	if err := db.NoteCloudLaunchRisk(row.JobID, agent.CursorCloudPendingOrphanNote()); err != nil {
+		return err
 	}
 	if found {
 		return nil
-	}
-	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now) {
-		return reportCloudLaunchOrphan(db, row)
 	}
 	return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
 }

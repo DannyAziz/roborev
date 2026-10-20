@@ -72,6 +72,9 @@ func TestCursorCloudDelayedDuplicateStaysUncleanedUntilLaterEmptySweep(t *testin
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 	assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
+	var jobErr string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+	assert.Contains(t, jobErr, "orphan risk")
 
 	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, client))
@@ -177,4 +180,28 @@ func TestRestartSavedIDEmptyListRespectsLag(t *testing.T) {
 		assert.Equal(t, 1, n)
 		assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
 	})
+}
+
+// TestEmptyAgentIDAgedNonEmptyListNotesOrphan is the empty-AgentID age-out.
+// The list contains this token's VM. The note is still written, and the row
+// is not cleaned. Skipping the note because the list was non-empty fails.
+func TestEmptyAgentIDAgedNonEmptyListNotesOrphan(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	const token = "launch-token-aged-listed"
+	machineID, err := tc.DB.GetMachineID()
+	require.NoError(t, err)
+	marker := agent.CursorCloudLaunchMarker(machineID.String(), token) //nolint:forbidigo // launch marker is prompt text
+	cursorCloudSeedAgent(t, fake, sha, marker)
+	cursorCloudBeginToken(t, tc, job.ID, token)
+	cursorCloudAgeLaunch(t, tc.DB, job.ID)
+
+	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	var jobErr string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+	assert.Contains(t, jobErr, "was not listed within")
 }

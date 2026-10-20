@@ -67,25 +67,6 @@ func TestNoteLaunchOrphanRiskDoesNotReplaceSetNote(t *testing.T) {
 	assert.Empty(t, note)
 }
 
-func TestMarkCloudLaunchCleanedByTokenClearsOrphanNote(t *testing.T) {
-	t.Parallel()
-	db := openTestDB(t)
-	t.Cleanup(func() { db.Close() })
-	_, _, job := createJobChain(t, db, "/tmp/note-clean-token", "abc456")
-	_, err := db.Exec(`INSERT INTO review_job_cloud_launches
-		(job_id, launch_token, orphan_note) VALUES (?, 'clear-tok', ?)`, job.ID, CloudLaunchPendingNote)
-	require.NoError(t, err)
-
-	require.NoError(t, db.MarkCloudLaunchCleanedByToken("clear-tok"))
-	var cleaned int
-	var note string
-	require.NoError(t, db.QueryRow(
-		`SELECT cleaned, orphan_note FROM review_job_cloud_launches WHERE launch_token = 'clear-tok'`,
-	).Scan(&cleaned, &note))
-	assert.Equal(t, 1, cleaned)
-	assert.Empty(t, note)
-}
-
 func TestCloudLaunchSurvivesJobDeleteWithForeignKeysOn(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)

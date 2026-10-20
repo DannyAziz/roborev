@@ -59,28 +59,32 @@ const (
 // fixture and is not used.
 var cursorCloudReconcileWindow = 60 * time.Second
 
-// cursorCloudNow is the clock for the listing-lag window. Tests replace it.
+// cursorCloudNow is the clock for the independent-sweep delay. Tests replace it.
 var cursorCloudNow = time.Now
 
-// ListingLagElapsed reports whether now is at or after the listing-lag
-// window from since. The window is cursorCloudReconcileWindow: an empty
-// marker list before that age can still omit a VM, so it does not clean.
-func ListingLagElapsed(since, now time.Time) bool {
-	if since.IsZero() {
-		return false
-	}
-	return !now.Before(since.Add(cursorCloudReconcileWindow))
-}
+// cursorCloudPendingOrphanNote is written on the job while a launch stays
+// uncleaned. MarkCloudLaunchCleaned clears the copy stored on the launch row.
+const cursorCloudPendingOrphanNote = "cursor-cloud orphan risk: launch pending cleanup"
+
+// CursorCloudPendingOrphanNote is the job error text stored while a launch
+// stays uncleaned.
+func CursorCloudPendingOrphanNote() string { return cursorCloudPendingOrphanNote }
 
 // SweepAllowsClean is the only gate for marking a launch cleaned.
-// found means this sweep deleted at least one VM, so a later empty sweep
-// is still required. byIDDeleted means every VM found so far was removed
-// by id. The empty sweep counts only once the listing-lag window has passed.
-func SweepAllowsClean(found, byIDDeleted bool, since, now time.Time) bool {
-	if found || !byIDDeleted {
+// found means this sweep deleted a VM, so it is not an empty sweep.
+// byIDDeleted means every VM found so far was removed by id.
+// independent means this sweep is a later call (a new restart or a separate
+// reconcile), not a retry or a second list inside the same call.
+// minDelay is the documented minimum age of the launch. The daemon passes
+// cloudLaunchMaxAge (24h): a same-day restart still has to be able to see a
+// VM an earlier list missed, so an empty sweep before that age does not
+// clean. That duration is the existing documented bound, not a measured
+// listing lag, and tests can set the variable.
+func SweepAllowsClean(found, byIDDeleted, independent bool, since, now time.Time, minDelay time.Duration) bool {
+	if found || !byIDDeleted || !independent || minDelay <= 0 || since.IsZero() {
 		return false
 	}
-	return ListingLagElapsed(since, now)
+	return !now.Before(since.Add(minDelay))
 }
 
 // SetCursorCloudClockForTest replaces the listing-lag clock. The returned
@@ -227,13 +231,12 @@ type CursorCloudAgent struct {
 	// NoteCleanupFailure records a stop or delete that did not finish.
 	// The launch row stays uncleaned.
 	NoteCleanupFailure func(msg string) error
-	// MarkLaunchCleaned runs only after SweepAllowsClean: every VM found
-	// for the token was deleted by id, and a later marker sweep was empty
-	// at or after the listing-lag window. The storage callback clears
-	// orphan_note.
+	// MarkLaunchCleaned runs only after SweepAllowsClean. The storage
+	// callback clears orphan_note. An in-process sweep is not independent,
+	// so it does not call this.
 	MarkLaunchCleaned func(token string) error
-	// launchedAt is the listing-lag start. An empty sweep before
-	// launchedAt plus the lag window does not clean.
+	// launchedAt is when this call created the VM. A later independent
+	// sweep uses it as the start of the minimum delay.
 	launchedAt time.Time
 }
 
@@ -373,6 +376,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 				}
 			}
 			err = errors.Join(err, recErr)
+		}
+		// The reconcile list is part of this create. It does not clean.
+		// The job keeps the orphan note until a later restart.
+		if noteErr := a.noteLaunchPending(); noteErr != nil {
+			err = errors.Join(err, noteErr)
 		}
 		return "", cursorCloudNonRetryable(err)
 	}
@@ -702,9 +710,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
-			} else if len(onCleaned) > 0 && onCleaned[0] != nil && SweepAllowsClean(found, true, started, cursorCloudNow()) {
-				// found is true here, so this sweep deleted VMs and does
-				// not clean. A later empty sweep past the lag window does.
+			} else if len(onCleaned) > 0 && onCleaned[0] != nil && SweepAllowsClean(found, true, false, started, cursorCloudNow(), 0) {
+				// This list is inside the create call. A later restart is
+				// the independent empty sweep. This one does not clean.
 				if markErr := onCleaned[0](); markErr != nil {
 					errs = appendReconcileErr(errs, markErr)
 				}
@@ -920,9 +928,9 @@ func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
 // markLaunchCleanedAfterDelete lists once more so a provider-side duplicate
 // of token is deleted before the row is cleaned. That list retries a
 // transient 429, 5xx, or timeout. The id already removed is not in that
-// list. A list or delete error leaves the row uncleaned. SweepAllowsClean
-// then requires this sweep to be empty and the listing-lag window to have
-// passed. A sweep that deletes a VM does not clean.
+// list. A list or delete error leaves the row uncleaned. This list is part
+// of the same call as the delete, so it is not an independent sweep and
+// does not clean. The job keeps the orphan note until a later restart.
 func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Client, repoURL, token, reconcileToken string, output io.Writer) error {
 	if a == nil || a.MarkLaunchCleaned == nil {
 		return nil
@@ -940,12 +948,19 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 	if sweepErr != nil {
 		return sweepErr
 	}
-	// The id delete already returned nil or 404. This sweep cleans only
-	// when it found nothing and the listing-lag window has passed.
-	if !SweepAllowsClean(found, true, a.launchedAt, cursorCloudNow()) {
-		return nil
+	// Same call as the id delete. SweepAllowsClean refuses it. The orphan
+	// note stays on the job until a later independent empty sweep.
+	if !SweepAllowsClean(found, true, false, a.launchedAt, cursorCloudNow(), 0) {
+		return a.noteLaunchPending()
 	}
 	return a.markLaunchCleaned(token)
+}
+
+func (a *CursorCloudAgent) noteLaunchPending() error {
+	if a == nil || a.NoteCleanupFailure == nil {
+		return nil
+	}
+	return a.NoteCleanupFailure(cursorCloudPendingOrphanNote)
 }
 
 // CursorCloudRepoUsable is false for empty input and the redacted-url sentinel.

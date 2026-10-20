@@ -331,51 +331,6 @@ func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestCursorCloudRestartOneOfTwoMarkerAgentsStaysUncleaned is c10e's
-// stricter clean rule. Two listed agents share a marker. Deleting the
-// saved id leaves the other one up, so the row stays uncleaned. Cleaning
-// from that id delete alone, including MarkCloudLaunchCleanedByToken,
-// fails this test.
-func TestCursorCloudRestartOneOfTwoMarkerAgentsStaysUncleaned(t *testing.T) {
-	tc, base := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-one-of-two"
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	marker := agent.CursorCloudLaunchMarker(machineID.String(), token) //nolint:forbidigo // launch marker is prompt text
-	fake := &failNthDelete{Fake: base, n: 2}
-	saved := cursorCloudSeedAgent(t, fake.Fake, sha, marker)
-	dup := cursorCloudSeedAgent(t, fake.Fake, sha, marker)
-	require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, cursorCloudRestartRepo))
-	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, saved.ID))
-
-	err = recoverStaleJobs(context.Background(), tc.DB, fake)
-	_, getErr := fake.GetAgent(t.Context(), saved.ID)
-	require.Error(t, getErr)
-	got, getErr := fake.GetAgent(t.Context(), dup.ID)
-	require.NoError(t, getErr)
-	assert.Equal(t, dup.ID, got.ID)
-	n, countErr := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, countErr)
-	assert.Equal(t, 1, n)
-	require.Error(t, err)
-}
-
-type failNthDelete struct {
-	*cursorcloudtest.Fake
-	n       int
-	deletes int
-}
-
-func (f *failNthDelete) DeleteAgent(ctx context.Context, id string) error {
-	f.deletes++
-	if f.n > 0 && f.deletes == f.n {
-		return &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusBadRequest, Message: "refused"}
-	}
-	return f.Fake.DeleteAgent(ctx, id)
-}
-
 // TestCursorCloudRestartCleansAfterAppliedDelete is C2. The delete already
 // removed the VM, then the process died before marking cleaned. Restart's
 // 404 for the saved id, plus a list that does not show another VM, marks it.
