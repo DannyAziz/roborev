@@ -1,17 +1,20 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +23,7 @@ import (
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/cursorcloud/cursorcloudtest"
+	"go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
@@ -30,7 +34,7 @@ import (
 // The deadline still lists that launch and deletes it.
 func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
-	for _, mode := range []string{"429", "deadline", "wait"} {
+	for _, mode := range []string{"deadline", "wait"} {
 		t.Run(mode, func(t *testing.T) {
 			var posts, lists, deletes atomic.Int32
 			var mu sync.Mutex
@@ -50,10 +54,6 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 					prompt = payload.Prompt.Text
 					mu.Unlock()
 					switch mode {
-					case "429":
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusTooManyRequests)
-						_, _ = io.WriteString(w, `{"message":"too many requests"}`)
 					case "deadline":
 						<-r.Context().Done()
 					default:
@@ -110,10 +110,7 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			timeout := time.Duration(0)
-			if mode != "429" {
-				timeout = 400 * time.Millisecond
-			}
+			timeout := 400 * time.Millisecond
 			prev, err := agent.Get(agent.CursorCloudHost)
 			require.NoError(t, err)
 			agent.Register(&agent.CursorCloudAgent{
@@ -234,15 +231,57 @@ func TestProcessJobCursorCloudDeadlineCheckStandsAlone(t *testing.T) {
 	assert.Equal(t, "test", claimed.Agent)
 }
 
-// A finished cloud review whose text is not a structured document must
-// not launch again. One job, one CreateAgent.
+// A finished cloud review whose text is not a usable document must not
+// launch again. One create for invalid text, and one for a document
+// validateLiveDocument rejects.
 func TestProcessJobCursorCloudDecodeDoesNotRelaunch(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
 	const repo = "https://example.com/acme/repo.git"
-	fake := &cursorcloudtest.Fake{
-		CreateStatus: cursorcloud.StatusFinished,
-		Final:        `{"not_a_review":true}`,
+	for _, tc := range []struct {
+		name  string
+		final string
+	}{
+		{name: "invalid-text", final: `{"not_a_review":true}`},
+		{name: "live-document", final: `{"schema_version":2,"summary":"blocked","verdict":"unable_to_review","findings":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: tc.final}
+			prev, err := agent.Get(agent.CursorCloudHost)
+			require.NoError(t, err)
+			agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
+			t.Cleanup(func() { agent.Register(prev) })
+
+			wtc := newWorkerTestContext(t, 1)
+			sha := testutil.GetHeadSHA(t, wtc.TmpDir)
+			job := wtc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+			job.BackupAgent = "test"
+
+			for range maxRetries + 2 {
+				if job.Agent != agent.CursorCloudHost {
+					break
+				}
+				wtc.Pool.processJob(testWorkerID, job)
+				next, claimErr := wtc.DB.ClaimJob(testWorkerID)
+				require.NoError(t, claimErr)
+				if next == nil {
+					break
+				}
+				job = next
+			}
+			assert.Equal(t, 1, createCountFromFake(fake))
+			assert.NotEqual(t, agent.CursorCloudHost, job.Agent)
+		})
 	}
+}
+
+// A no-verdict cloud review keeps the no-verdict prefix and output, and a
+// restart does not launch another VM. The backup is cursor-cloud so a
+// result that is not marked sent failsover into another CreateAgent.
+func TestCursorCloudNoVerdictRestartDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	const repo = "https://example.com/acme/repo.git"
+	const prose = "I am unable to read the diff file because it is ignored by configured ignore patterns. PIN-OUTPUT-7f3a"
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: prose}
 	prev, err := agent.Get(agent.CursorCloudHost)
 	require.NoError(t, err)
 	agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
@@ -251,7 +290,12 @@ func TestProcessJobCursorCloudDecodeDoesNotRelaunch(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	job.BackupAgent = "test"
+	originalID := job.ID
+	job.BackupAgent = agent.CursorCloudHost
+	var logs bytes.Buffer
+	prevLog := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(prevLog)
 
 	for range maxRetries + 2 {
 		if job.Agent != agent.CursorCloudHost {
@@ -266,13 +310,78 @@ func TestProcessJobCursorCloudDecodeDoesNotRelaunch(t *testing.T) {
 		job = next
 	}
 	assert.Equal(t, 1, createCountFromFake(fake))
-	assert.NotEqual(t, agent.CursorCloudHost, job.Agent)
+	stored, err := tc.DB.GetJobByID(originalID)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(stored.Error, review.NoVerdictErrorPrefix), stored.Error)
+	assert.Contains(t, stored.Error, "PIN-OUTPUT-7f3a")
+	assert.Contains(t, logs.String(), "cursor-cloud launch will not be retried")
+
+	const runUUID = "panel-run-no-verdict"
+	const ghRepo = "acme/widgets"
+	const head = "head-no-verdict"
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = tc.DB.Exec(`UPDATE review_jobs SET panel_run_uuid = ?, panel_role = 'member', status = 'failed' WHERE id = ?`, runUUID, originalID)
+	require.NoError(t, err)
+	_, err = tc.DB.Exec(`INSERT INTO ci_pr_panels (github_repo, pr_number, head_sha, panel_run_uuid, outcome) VALUES (?, ?, ?, ?, ?)`,
+		ghRepo, 7, head, runUUID, storage.PanelOutcomeNoReviewPosted)
+	require.NoError(t, err)
+	_, err = tc.DB.Exec(`INSERT INTO ci_pr_review_attempts (
+		github_repo, pr_number, head_sha, attempt, first_attempt_at, last_error_class, state, updated_at
+	) VALUES (?, ?, ?, 1, ?, 'genuine', 'done', ?)`, ghRepo, 7, head, now, now)
+	require.NoError(t, err)
+	rearmed, err := tc.DB.RearmFailedReviewAttempts(time.Now())
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), rearmed)
+	next, claimErr := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, claimErr)
+	if next != nil && next.Agent == agent.CursorCloudHost {
+		tc.Pool.processJob(testWorkerID, next)
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
 }
 
 func createCountFromFake(fake *cursorcloudtest.Fake) int {
 	n := 0
 	for _, call := range fake.Calls() {
 		if call.Method == cursorcloudtest.MethodCreate {
+			n++
+		}
+	}
+	return n
+}
+
+func TestProcessJobCursorCloudCreate429SkipsReconcile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+		const repo = "https://example.com/acme/repo.git"
+		fake := &cursorcloudtest.Fake{
+			MethodErrors: map[string]error{
+				cursorcloudtest.MethodCreate: &cursorcloud.APIError{Op: "create agent", StatusCode: http.StatusTooManyRequests, Message: "slow down"},
+			},
+		}
+		prev, err := agent.Get(agent.CursorCloudHost)
+		require.NoError(t, err)
+		agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
+		t.Cleanup(func() { agent.Register(prev) })
+
+		tc := newWorkerTestContext(t, 1)
+		sha := testutil.GetHeadSHA(t, tc.TmpDir)
+		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+		job.BackupAgent = "test"
+		tc.Pool.processJob(testWorkerID, job)
+
+		assert.Equal(t, 1, createCountFromFake(fake))
+		assert.Equal(t, 0, methodCountFromFake(fake, cursorcloudtest.MethodList))
+		updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+		assert.Equal(t, "test", updated.Agent)
+		assert.Equal(t, 0, updated.RetryCount)
+	})
+}
+
+func methodCountFromFake(fake *cursorcloudtest.Fake, method string) int {
+	n := 0
+	for _, call := range fake.Calls() {
+		if call.Method == method {
 			n++
 		}
 	}

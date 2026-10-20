@@ -1732,6 +1732,76 @@ func TestReconcileJoinedRateLimitStopsInEitherOrder(t *testing.T) {
 	}
 }
 
+func TestReconcileErrorCapKeepsTerminalMiss(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		prev := cursorCloudReconcileWindow
+		cursorCloudReconcileWindow = time.Minute
+		defer func() { cursorCloudReconcileWindow = prev }()
+		client := &errListCloud{}
+		err := reconcileCursorCloudLaunch(context.Background(), client, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "did not find the launch")
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok)
+		assert.LessOrEqual(t, len(joined.Unwrap()), cursorCloudReconcileMaxErrs)
+		assert.Greater(t, client.lists, cursorCloudReconcileMaxErrs)
+	})
+}
+
+type errListCloud struct{ lists int }
+
+func (c *errListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *errListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *errListCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *errListCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *errListCloud) StopAgent(context.Context, string) error              { return nil }
+func (c *errListCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *errListCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	return nil, fmt.Errorf("list %d failed", c.lists)
+}
+
+func TestCursorCloudCreate429SkipsReconcile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const sha = "0123456789abcdef0123456789abcdef01234567"
+		const repo = "https://github.com/acme/widgets.git"
+		client := &create429Cloud{}
+		a := &CursorCloudAgent{Client: client, RepoURL: repo}
+		a.SetLaunchLimitsForTest(2, 5)
+		_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+		require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+		assert.Equal(t, 1, client.creates)
+		assert.Equal(t, 0, client.lists)
+	})
+}
+
+type create429Cloud struct {
+	creates int
+	lists   int
+}
+
+func (c *create429Cloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	c.creates++
+	return cursorcloud.Agent{}, &cursorcloud.APIError{Op: "create agent", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
+}
+
+func (c *create429Cloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *create429Cloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *create429Cloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *create429Cloud) StopAgent(context.Context, string) error              { return nil }
+func (c *create429Cloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *create429Cloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	return nil, nil
+}
+
 func TestReconcileConversationRateLimitStops(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		prev := cursorCloudReconcileWindow

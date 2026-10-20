@@ -298,6 +298,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			refund()
 			return "", err
 		}
+		// A 429 rejects the create. Nothing was launched, so do not spend
+		// the reconcile window looking for a VM.
+		if cursorCloudRateLimited(err) {
+			return "", cursorCloudNonRetryable(err)
+		}
 		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
@@ -615,7 +620,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		if windowExpired {
 			writeCursorCloudCleanupNote(output, "cursor-cloud: reconcile window expired before the launch was found")
 		}
-		errs = appendReconcileErr(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
+		// The cap still bounds the join. The terminal miss replaces the
+		// last slot when the list is already full, so it is never dropped.
+		errs = appendReconcileTerminal(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
 	}
 	return errors.Join(errs...)
 }
@@ -628,6 +635,16 @@ const (
 func appendReconcileErr(errs []error, err error) []error {
 	if err == nil || len(errs) >= cursorCloudReconcileMaxErrs {
 		return errs
+	}
+	return append(errs, err)
+}
+
+func appendReconcileTerminal(errs []error, err error) []error {
+	if err == nil {
+		return errs
+	}
+	if len(errs) >= cursorCloudReconcileMaxErrs {
+		errs = append([]error(nil), errs[:cursorCloudReconcileMaxErrs-1]...)
 	}
 	return append(errs, err)
 }

@@ -1452,6 +1452,14 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		// ErrCursorCloudNonRetryable. Pre-launch validation and the launch
 		// cap do not. Honor the sentinel before the deadline path below,
 		// which would otherwise drop it and requeue a second POST /agents.
+		if noVerdict, ok := errors.AsType[*review.NoVerdictError](err); ok && errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+			// The create was sent, so do not POST again. The stored error
+			// stays a no-verdict result: prefix, output, panel label, and
+			// the restart skip all key off that text.
+			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+			wp.failSentCursorCloud(workerID, job, agentName, review.NoVerdictMessage(noVerdict))
+			return
+		}
 		if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
 			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
 			wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)
@@ -1716,18 +1724,22 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	// Same sentinel as the processJob deadline branch. A 429 is classified
 	// as transient from its text and would reach RetryJob if this ran only
 	// when the classification is LimitKindNone.
-	if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
-		wp.failCursorCloudWithoutRetry(workerID, job, agentName, executionErr)
-		return
-	}
 	// A review that ran but produced no verdict (typically an unreadable
 	// diff) is deterministic for that agent: retrying it wastes runs. Fail
 	// over to the backup agent at once, or fail with the agent output kept
-	// in the stored error so the reason stays inspectable.
+	// in the stored error so the reason stays inspectable. A sent
+	// cursor-cloud create still must not be posted again.
 	if noVerdict, ok := errors.AsType[*review.NoVerdictError](executionErr); ok {
-		wp.failoverOrFailNonRetryableAgentContext(
-			ctx, workerID, job, agentName, review.NoVerdictMessage(noVerdict),
-		)
+		msg := review.NoVerdictMessage(noVerdict)
+		if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
+			wp.failSentCursorCloud(workerID, job, agentName, msg)
+			return
+		}
+		wp.failoverOrFailNonRetryableAgentContext(ctx, workerID, job, agentName, msg)
+		return
+	}
+	if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
+		wp.failCursorCloudWithoutRetry(workerID, job, agentName, executionErr)
 		return
 	}
 	errorMsg := fmt.Sprintf("agent: %v", executionErr)
@@ -1890,15 +1902,21 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 // failure is permanent: the cap and a sent create are not retried on
 // cursor-cloud.
 func (wp *WorkerPool) failCursorCloudWithoutRetry(workerID string, job *storage.ReviewJob, agentName string, err error) {
+	wp.failSentCursorCloud(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
+}
+
+// failSentCursorCloud records errorMsg and does not run cursor-cloud again.
+// A backup that is not cursor-cloud still receives the job.
+func (wp *WorkerPool) failSentCursorCloud(workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
 	backup := wp.resolveBackupAgent(job)
 	if backup != "" && agent.CanonicalName(backup) != agent.CursorCloudHost {
 		wp.failoverOrFailNonRetryableAgentContext(
-			context.Background(), workerID, job, agentName, fmt.Sprintf("agent: %v", err),
+			context.Background(), workerID, job, agentName, errorMsg,
 		)
 		return
 	}
 	wp.runAttemptTransition(workerID, job, func() {
-		wp.failWithoutRetryLocked(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
+		wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg)
 	})
 }
 

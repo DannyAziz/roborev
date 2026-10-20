@@ -90,6 +90,27 @@ func TestRunAgentReviewAcceptsJSONWithoutNativeSchema(t *testing.T) {
 	assert.Equal(t, storage.VerdictPass, got.Verdict)
 }
 
+func TestRunAgentReviewCursorCloudLiveDocumentStaysSent(t *testing.T) {
+	const raw = `{"schema_version":2,"summary":"blocked","verdict":"unable_to_review","findings":[]}`
+	a := &structuredBatchAgent{mockAgent{name: agent.CursorCloudHost}, jsontext.Value(raw)}
+	_, err := RunAgentReview(t.Context(), a, t.TempDir(), "HEAD", "prompt", "default", "", nil)
+	require.ErrorIs(t, err, agent.ErrCursorCloudNonRetryable)
+	require.ErrorContains(t, err, "could not review")
+	var noVerdict *NoVerdictError
+	require.NotErrorAs(t, err, &noVerdict)
+}
+
+func TestRunAgentReviewCursorCloudNoVerdictKeepsIdentity(t *testing.T) {
+	const prose = "I am unable to read the diff file because it is ignored by configured ignore patterns. PIN-OUTPUT-7f3a"
+	a := &structuredBatchAgent{mockAgent{name: agent.CursorCloudHost}, jsontext.Value(prose)}
+	_, err := RunAgentReview(t.Context(), a, t.TempDir(), "HEAD", "prompt", "default", "", nil)
+	require.ErrorIs(t, err, agent.ErrCursorCloudNonRetryable)
+	var noVerdict *NoVerdictError
+	require.ErrorAs(t, err, &noVerdict)
+	assert.Contains(t, noVerdict.Output, "PIN-OUTPUT-7f3a")
+	assert.True(t, strings.HasPrefix(NoVerdictMessage(noVerdict), NoVerdictErrorPrefix))
+}
+
 func TestNoVerdictMessage(t *testing.T) {
 	assert := assert.New(t)
 
