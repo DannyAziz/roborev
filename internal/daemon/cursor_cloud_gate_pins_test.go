@@ -286,9 +286,9 @@ func cursorCloudSeedMarkedPair(t *testing.T, tc *workerTestContext, fake *cursor
 }
 
 // TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete is the empty-token
-// gate. A list error, a non-empty list, or a refused delete of the saved id
-// leaves cleaned=0. An empty list, or a delete that succeeds, is the only
-// confirmation, and that row is cleaned.
+// gate. There is no marker, so the row stays uncleaned: a list error, a
+// non-empty list, an empty list, and a saved-id delete all leave cleaned=0.
+// A refused delete also leaves the VM in place.
 func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 	t.Run("list error", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
@@ -301,8 +301,9 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 			},
 		}
 
-		require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
+		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
 	})
 
 	t.Run("non-empty list", func(t *testing.T) {
@@ -312,9 +313,9 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 		cursorCloudSeedAgent(t, fake, sha, "foreign")
 		cursorCloudInsertBareLaunch(t, tc, job.ID, "", "")
 
-		require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
-		assert.NotEmpty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
+		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
 	})
 
 	t.Run("empty list", func(t *testing.T) {
@@ -324,7 +325,7 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 		cursorCloudInsertBareLaunch(t, tc, job.ID, "", "")
 
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		assert.Equal(t, 1, cursorCloudCleanedFlag(t, tc, job.ID))
+		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
 	})
 
 	t.Run("saved id delete refused", func(t *testing.T) {
@@ -356,6 +357,6 @@ func TestCursorCloudRestartEmptyTokenCleansOnlyConfirmedDelete(t *testing.T) {
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		_, err := fake.GetAgent(t.Context(), saved.ID)
 		require.Error(t, err)
-		assert.Equal(t, 1, cursorCloudCleanedFlag(t, tc, job.ID))
+		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
 	})
 }
