@@ -274,6 +274,47 @@ func TestProcessJobCursorCloudDecodeDoesNotRelaunch(t *testing.T) {
 	}
 }
 
+// A finished cloud review whose assistant text is not JSON must not launch
+// again. Cleanup already deleted the VM before RunAgentReview decoded the
+// text. Valid JSON of the wrong shape is TestProcessJobCursorCloudDecodeDoesNotRelaunch.
+// This fails when the decode error is returned without sentCloudLaunch:
+// RetryJob requeues cursor-cloud and the next claim POSTs a second agent.
+func TestProcessJobCursorCloudMalformedJSONDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	const repo = "https://example.com/acme/repo.git"
+	const malformed = `{"schema_version":2,`
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: malformed}
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
+	t.Cleanup(func() { agent.Register(prev) })
+
+	wtc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
+	job := wtc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	originalID := job.ID
+	job.BackupAgent = "test"
+
+	for range maxRetries + 2 {
+		if job.Agent != agent.CursorCloudHost {
+			break
+		}
+		wtc.Pool.processJob(testWorkerID, job)
+		next, claimErr := wtc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, claimErr)
+		if next == nil {
+			break
+		}
+		job = next
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
+	assert.NotEqual(t, agent.CursorCloudHost, job.Agent)
+	stored, err := wtc.DB.GetJobByID(originalID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, stored.RetryCount)
+	assert.NotEqual(t, agent.CursorCloudHost, stored.Agent)
+}
+
 // A no-verdict cloud review keeps the no-verdict prefix and output, and a
 // restart does not launch another VM. The backup is cursor-cloud so a
 // result that is not marked sent failsover into another CreateAgent.
