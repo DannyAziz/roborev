@@ -1420,6 +1420,93 @@ func TestCursorCloudOutputPanicStillDeletes(t *testing.T) {
 	assert.Equal(t, 1, deletes)
 }
 
+func TestCursorCloudDoneCreateStillListsAndDeletes(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://github.com/acme/widgets.git"
+	for _, mode := range []string{"deadline", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			var mu sync.Mutex
+			var prompt string
+			var lists, deletes int
+			var once sync.Once
+			sawPost := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/agents":
+					body, _ := io.ReadAll(r.Body)
+					var payload struct {
+						Prompt struct {
+							Text string `json:"text"`
+						} `json:"prompt"`
+					}
+					_ = json.Unmarshal(body, &payload)
+					mu.Lock()
+					prompt = payload.Prompt.Text
+					mu.Unlock()
+					once.Do(func() { close(sawPost) })
+					<-r.Context().Done()
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/agents":
+					mu.Lock()
+					lists++
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"agents": []map[string]any{{
+							"id":     "bc_orphan",
+							"status": "CREATING",
+							"source": map[string]string{"repository": repo, "ref": sha},
+						}},
+					})
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/conversation"):
+					mu.Lock()
+					text := prompt
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"messages": []map[string]string{{"type": "user_message", "text": text}},
+					})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"bc_orphan"}`)
+				case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "bc_orphan"):
+					mu.Lock()
+					deletes++
+					mu.Unlock()
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			ctx := context.Background()
+			timeout := 50 * time.Millisecond
+			if mode == "cancel" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				t.Cleanup(cancel)
+				timeout = time.Hour
+				go func() {
+					<-sawPost
+					cancel()
+				}()
+			}
+			_, err := (&CursorCloudAgent{
+				Client: cursorcloud.NewHTTPClient(cursorCloudTestSecret,
+					cursorcloud.WithBaseURL(srv.URL),
+					cursorcloud.WithHTTPClient(&http.Client{}),
+				),
+				RepoURL: repo,
+				Timeout: timeout,
+			}).Review(ctx, t.TempDir(), sha, "review the change", nil)
+			require.Error(t, err)
+			mu.Lock()
+			defer mu.Unlock()
+			assert.GreaterOrEqual(t, lists, 1, "GET /v0/agents")
+			assert.GreaterOrEqual(t, deletes, 1, "DELETE /v0/agents")
+		})
+	}
+}
+
 func TestCursorCloudReadErrorKeepsQuotaAndIsNotRetried(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"

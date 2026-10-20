@@ -2,11 +2,14 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,16 +26,28 @@ import (
 // TestProcessJobCursorCloudDoesNotRepost drives WorkerPool.processJob. A
 // create 429, a deadline after the POST body was sent, and a wait-loop
 // timeout must each leave exactly one POST /v0/agents and zero retries.
+// The deadline still lists that launch and deletes it.
 func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
 	for _, mode := range []string{"429", "deadline", "wait"} {
 		t.Run(mode, func(t *testing.T) {
-			var posts atomic.Int32
+			var posts, lists, deletes atomic.Int32
+			var mu sync.Mutex
+			var prompt string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.Path == "/v0/agents":
-					_, _ = io.Copy(io.Discard, r.Body)
+					body, _ := io.ReadAll(r.Body)
 					posts.Add(1)
+					var payload struct {
+						Prompt struct {
+							Text string `json:"text"`
+						} `json:"prompt"`
+					}
+					_ = json.Unmarshal(body, &payload)
+					mu.Lock()
+					prompt = payload.Prompt.Text
+					mu.Unlock()
 					switch mode {
 					case "429":
 						w.Header().Set("Content-Type", "application/json")
@@ -45,7 +60,24 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 						_, _ = io.WriteString(w, `{"id":"bc_wait","status":"CREATING"}`)
 					}
 				case r.Method == http.MethodGet && r.URL.Path == "/v0/agents":
+					lists.Add(1)
+					// A deadline whose create never returned an id is still
+					// listed here so the first reconcile pass can delete it.
+					// Other modes have nothing to clean up.
+					mu.Lock()
+					text := prompt
+					mu.Unlock()
 					w.Header().Set("Content-Type", "application/json")
+					if mode == "deadline" && text != "" {
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"agents": []map[string]any{{
+								"id":     "bc_deadline",
+								"status": "CREATING",
+								"source": map[string]string{"repository": "https://example.com/acme/repo.git"},
+							}},
+						})
+						return
+					}
 					_, _ = io.WriteString(w, `{"agents":[]}`)
 				case r.Method == http.MethodGet && r.URL.Path == "/v0/agents/bc_wait":
 					w.Header().Set("Content-Type", "application/json")
@@ -56,6 +88,20 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 				case r.Method == http.MethodPost && r.URL.Path == "/v0/agents/bc_wait/stop":
 					_, _ = io.WriteString(w, `{"id":"bc_wait"}`)
 				case r.Method == http.MethodDelete && r.URL.Path == "/v0/agents/bc_wait":
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/bc_deadline/conversation"):
+					mu.Lock()
+					text := prompt
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"messages": []map[string]string{{"type": "user_message", "text": text}},
+					})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/bc_deadline/stop"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"bc_deadline"}`)
+				case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/bc_deadline"):
+					deletes.Add(1)
 					w.WriteHeader(http.StatusNoContent)
 				default:
 					http.NotFound(w, r)
@@ -88,6 +134,10 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 			tc.Pool.processJob(testWorkerID, job)
 
 			assert.Equal(t, int32(1), posts.Load())
+			if mode == "deadline" {
+				assert.GreaterOrEqual(t, lists.Load(), int32(1))
+				assert.GreaterOrEqual(t, deletes.Load(), int32(1))
+			}
 			updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
 			assert.Equal(t, "test", updated.Agent)
 			assert.Equal(t, 0, updated.RetryCount)

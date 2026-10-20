@@ -45,8 +45,9 @@ const (
 )
 
 // cursorCloudReconcileWindow is how long a lost create keeps starting
-// another list. It does not cancel a list or conversation call that
-// has already started.
+// another list after the first. The first list still runs when the
+// review context is already done. The window does not cancel a list or
+// conversation call that has already started.
 //
 // 60s is an existing policy value nobody has checked against a measured
 // publish lag. It is the same length as cursorcloud's defaultRequestTimeout
@@ -62,9 +63,11 @@ var cursorCloudReconcileWindow = 60 * time.Second
 var cursorCloudReconcilePassTimeout = cursorCloudDeleteTimeout
 
 // cursorCloudDeleteTimeout bounds one stop, one DELETE, one reconcile list,
-// or one reconcile conversation read. Each call gets its own context. The
-// reconcile window must not cancel an in-flight call, and a stop that never
-// answers must not cancel the deletes. 60s matches the cursorcloud client's
+// or one reconcile conversation read. The first reconcile list and the
+// delete it triggers use this timeout on context.Background, so a review
+// context that is already done cannot skip them. Later attempts use the
+// review context and stop when it is done. A stop that never answers must
+// not cancel the deletes. 60s matches the cursorcloud client's
 // defaultRequestTimeout, its one deadline for a metadata call.
 var cursorCloudDeleteTimeout = 60 * time.Second
 
@@ -504,7 +507,12 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 	foundLaunch := false
 	backoff := cursorCloudReconcileBackoff
 	for attempt := 0; ; attempt++ {
-		if err := ctx.Err(); err != nil {
+		// The review context stops later attempts only. The first list
+		// runs even when that context is already canceled or expired.
+		base := ctx
+		if attempt == 0 {
+			base = context.Background()
+		} else if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
 		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
@@ -513,8 +521,8 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		// Start the 60s before ListAgents. One clock for the whole
 		// reconcile would already be spent by earlier passes, and starting
 		// it after the list returns would hide the list's duration.
-		passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
-		listCtx, listCancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
+		passCtx, passCancel := context.WithTimeout(base, cursorCloudReconcilePassTimeout)
+		listCtx, listCancel := context.WithTimeout(base, cursorCloudDeleteTimeout)
 		agents, err := client.ListAgents(listCtx)
 		listCancel()
 		var found bool
@@ -543,8 +551,8 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 				break
 			}
 		}
-		if waitCursorCloud(ctx, backoff) != nil {
-			break
+		if err := waitCursorCloud(ctx, backoff); err != nil {
+			return errors.Join(append(errs, err)...)
 		}
 		backoff *= 2
 		if backoff > cursorCloudReconcileBackoffMax {
