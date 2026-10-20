@@ -1704,6 +1704,9 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	if !attached {
 		classification = wp.classify(agent.CanonicalName(agentName), errorMsg)
 	}
+	// A cap refusal or other pre-launch unavailable error with no backup is
+	// permanent: failover has nowhere to go, and retrying cursor-cloud would
+	// only hit the same cap.
 	if classification.Kind == agent.LimitKindNone && agent.IsUnavailable(executionErr) {
 		wp.failoverOrFailNonRetryableAgentContext(
 			ctx, workerID, job, agentName, review.UnavailableError(errorMsg),

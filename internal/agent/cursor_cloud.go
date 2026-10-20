@@ -46,13 +46,20 @@ const (
 
 // cursorCloudReconcileWindow is how long a lost create keeps starting
 // another list. It does not cancel a list or conversation call that
-// has already started; those use cursorCloudDeleteTimeout.
+// has already started.
 //
-// The window is 60s, the bound reconcile used before it was shortened.
-// 500ms was only longer than this package's test fixture (a 300ms
-// handler sleep against a 50ms client timeout) and is not a measured
-// publish lag.
+// 60s is an existing policy value nobody has checked against a measured
+// publish lag. It is the same length as cursorcloud's defaultRequestTimeout
+// for one metadata call. 500ms was only longer than this package's test
+// fixture and is not used.
 var cursorCloudReconcileWindow = 60 * time.Second
+
+// cursorCloudReconcilePassTimeout is the one deadline shared by every
+// candidate conversation read in a reconcile pass. It is the existing
+// per-call cursorCloudDeleteTimeout reused as a budget for the whole
+// pass. Nobody has measured a multi-candidate conversation read; this is
+// not a new limit derived from that workload.
+var cursorCloudReconcilePassTimeout = cursorCloudDeleteTimeout
 
 // cursorCloudDeleteTimeout bounds one stop, one DELETE, one reconcile list,
 // or one reconcile conversation read. Each call gets its own context. The
@@ -253,7 +260,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			refund()
 			return "", err
 		}
-		if recErr := reconcileCursorCloudLaunch(client, repoURL, token, output); recErr != nil {
+		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, token, output); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
 		return "", cursorCloudNonRetryable(err)
@@ -476,55 +483,85 @@ func cursorCloudStopQuiet(err error) bool {
 // https://cursor.com/docs/cloud-agent/api/v0#launch-an-agent
 // https://cursor.com/docs/cloud-agent/api/v0#list-agents
 // https://cursor.com/docs/cloud-agent/api/v0#agent-conversation
-func reconcileCursorCloudLaunch(client cursorcloud.Client, repoURL, token string, output io.Writer) error {
-	// started gates the next list only. list and UserPrompt each get
-	// cursorCloudDeleteTimeout, so a slow page cannot be cancelled by
-	// this window.
+func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, repoURL, token string, output io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// started gates the next list only. A list already running keeps its
+	// own timeout. Conversation reads share one pass deadline.
 	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
 	foundLaunch := false
+	backoff := cursorCloudReconcileBackoff
+	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
+	defer passCancel()
 	for attempt := 0; ; attempt++ {
-		// The first list always starts. Later lists start only while the
-		// window is still open, and the check does not cancel the list
-		// already running.
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
 			break
 		}
-		listCtx, listCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
+		listCtx, listCancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 		agents, err := client.ListAgents(listCtx)
 		listCancel()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
-		} else if found, matchErr := deleteMatchingCursorCloudLaunch(client, agents, repoURL, marker, output); found || matchErr != nil {
+			errs = appendReconcileErr(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
+			if cursorCloudRateLimited(err) {
+				break
+			}
+		} else if found, matchErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output); found || matchErr != nil {
 			if matchErr != nil {
-				errs = append(errs, matchErr)
+				errs = appendReconcileErr(errs, matchErr)
 			}
 			if found {
 				foundLaunch = true
 				break
 			}
 		}
-		if waitCursorCloud(context.Background(), cursorCloudReconcileBackoff) != nil {
+		if waitCursorCloud(ctx, backoff) != nil {
 			break
+		}
+		if backoff < cursorCloudReconcileBackoffMax {
+			backoff *= 2
 		}
 	}
 	if !foundLaunch {
-		errs = append(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
+		errs = appendReconcileErr(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
 	}
 	return errors.Join(errs...)
 }
 
-func deleteMatchingCursorCloudLaunch(client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
+const (
+	cursorCloudReconcileBackoffMax = 2 * time.Second
+	cursorCloudReconcileMaxErrs    = 8
+)
+
+func appendReconcileErr(errs []error, err error) []error {
+	if err == nil || len(errs) >= cursorCloudReconcileMaxErrs {
+		return errs
+	}
+	return append(errs, err)
+}
+
+func cursorCloudRateLimited(err error) bool {
+	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
+	return ok && apiErr != nil && apiErr.StatusCode == http.StatusTooManyRequests
+}
+
+func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
 	var errs []error
 	found := false
 	for _, ag := range agents {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		if !sameCursorCloudRepo(repoURL, ag.SourceRepository) {
 			continue
 		}
-		promptCtx, promptCancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
-		text, promptErr := client.UserPrompt(promptCtx, ag.ID)
-		promptCancel()
+		text, promptErr := client.UserPrompt(ctx, ag.ID)
 		if promptErr != nil {
 			errs = append(errs, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, promptErr))
 			continue

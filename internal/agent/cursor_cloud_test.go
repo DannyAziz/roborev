@@ -1328,6 +1328,8 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 	))
 	assert.False(sameCursorCloudRepo("https://github.com/acme/widgets.git", ""))
 	assert.False(sameCursorCloudRepo("https://github.com/acme/widgets.git", "://"))
+	// main does not fold www.github.com, so this host keeps path case.
+	assert.False(sameCursorCloudRepo("https://www.github.com/Org/Repo", "https://www.github.com/org/repo"))
 }
 
 func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
@@ -1337,7 +1339,7 @@ func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
 		delay: 600 * time.Millisecond,
 		text:  "review\n" + cursorCloudLaunchMarker + token + "\n",
 	}
-	err := reconcileCursorCloudLaunch(client, repo, token, nil)
+	err := reconcileCursorCloudLaunch(context.Background(), client, repo, token, nil)
 	require.NoError(t, err)
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -1433,11 +1435,25 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	})
 }
 
+func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
+	prev := cursorCloudReconcileWindow
+	cursorCloudReconcileWindow = time.Minute
+	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
+	limited := &rateLimitCloud{}
+	err := reconcileCursorCloudLaunch(context.Background(), limited, "https://github.com/acme/widgets.git", "tok", nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, limited.lists)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = reconcileCursorCloudLaunch(ctx, &emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestReconcileWindowEndIsNotSilent(t *testing.T) {
 	prev := cursorCloudReconcileWindow
 	cursorCloudReconcileWindow = time.Millisecond
 	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
-	err := reconcileCursorCloudLaunch(&emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+	err := reconcileCursorCloudLaunch(context.Background(), &emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not find the launch")
 }
@@ -1446,7 +1462,7 @@ func TestReconcileSurfacesPromptErrorWhenNothingMatches(t *testing.T) {
 	prev := cursorCloudReconcileWindow
 	cursorCloudReconcileWindow = time.Millisecond
 	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
-	err := reconcileCursorCloudLaunch(&promptErrCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+	err := reconcileCursorCloudLaunch(context.Background(), &promptErrCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "bc_other")
 	assert.Contains(t, err.Error(), "prompt failed")
@@ -1512,6 +1528,24 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type rateLimitCloud struct{ lists int }
+
+func (c *rateLimitCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *rateLimitCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *rateLimitCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *rateLimitCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *rateLimitCloud) StopAgent(context.Context, string) error              { return nil }
+func (c *rateLimitCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *rateLimitCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	return nil, &cursorcloud.APIError{Op: "list agents", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
 }
 
 type emptyListCloud struct{}
