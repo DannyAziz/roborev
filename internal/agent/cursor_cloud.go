@@ -538,8 +538,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		if waitCursorCloud(ctx, backoff) != nil {
 			break
 		}
-		if backoff < cursorCloudReconcileBackoffMax {
-			backoff *= 2
+		backoff *= 2
+		if backoff > cursorCloudReconcileBackoffMax {
+			backoff = cursorCloudReconcileBackoffMax
 		}
 	}
 	if !foundLaunch {

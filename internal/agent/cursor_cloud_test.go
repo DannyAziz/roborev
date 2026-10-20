@@ -1435,6 +1435,31 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	})
 }
 
+func TestCursorCloudReconcileBackoffClampsAtMax(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		prev := cursorCloudReconcileWindow
+		cursorCloudReconcileWindow = 7 * time.Second
+		defer func() { cursorCloudReconcileWindow = prev }()
+		client := &stampListCloud{}
+		err := reconcileCursorCloudLaunch(context.Background(), client, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		require.GreaterOrEqual(t, len(client.times), 2)
+		deltas := make([]time.Duration, 0, len(client.times)-1)
+		for i := 1; i < len(client.times); i++ {
+			deltas = append(deltas, client.times[i].Sub(client.times[i-1]))
+		}
+		assert.Equal(t, []time.Duration{
+			50 * time.Millisecond,
+			100 * time.Millisecond,
+			200 * time.Millisecond,
+			400 * time.Millisecond,
+			800 * time.Millisecond,
+			1600 * time.Millisecond,
+			2 * time.Second,
+		}, deltas)
+	})
+}
+
 func TestReconcilePassBudgetStartsBeforeList(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		prevPass := cursorCloudReconcilePassTimeout
@@ -1568,6 +1593,25 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type stampListCloud struct {
+	times []time.Time
+}
+
+func (c *stampListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *stampListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *stampListCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *stampListCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *stampListCloud) StopAgent(context.Context, string) error              { return nil }
+func (c *stampListCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *stampListCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.times = append(c.times, time.Now())
+	return nil, nil
 }
 
 type budgetListCloud struct {
