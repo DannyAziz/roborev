@@ -388,8 +388,23 @@ func TestCloudLaunchTableMigrationKeepsRows(t *testing.T) {
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches`).Scan(&n))
 	assert.Equal(t, 0, n)
-	_, err := db.Exec(`INSERT INTO review_job_cloud_launches (job_id, launch_token) VALUES (1, 'tok')`)
+	_, err := db.Exec(`INSERT INTO review_job_cloud_launches (job_id, launch_token, agent_id) VALUES (1, 'tok', 'bc_keep')`)
 	require.NoError(t, err)
+
+	// Open runs this migration on every startup. A second open has to keep a
+	// launch row that was written after the table already existed.
+	var dbPath string
+	require.NoError(t, db.QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&dbPath))
+	require.NoError(t, db.Close())
+	reopened, err := Open(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	var token, agentID string
+	require.NoError(t, reopened.QueryRow(
+		`SELECT launch_token, agent_id FROM review_job_cloud_launches WHERE job_id = 1`,
+	).Scan(&token, &agentID))
+	assert.Equal(t, "tok", token)
+	assert.Equal(t, "bc_keep", agentID)
 }
 
 func TestCloudLaunchIdentityMigrationKeepsRows(t *testing.T) {
