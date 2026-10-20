@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -1847,6 +1848,11 @@ func ResolveCloudLaunchCleanDelay(repoPath string, globalCfg *Config) time.Durat
 	}
 	if hours < MinCloudLaunchCleanDelayHours {
 		hours = MinCloudLaunchCleanDelayHours
+	}
+	// A larger count overflows into a negative delay, which the cleanup
+	// gate would treat as already elapsed.
+	if maxHours := math.MaxInt64 / int64(time.Hour); int64(hours) > maxHours {
+		return time.Duration(maxHours) * time.Hour
 	}
 	return time.Duration(hours) * time.Hour
 }

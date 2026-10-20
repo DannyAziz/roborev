@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -667,6 +668,17 @@ func TestResolveCloudLaunchCleanDelay(t *testing.T) {
 	assert.Equal(t, time.Hour, ResolveCloudLaunchCleanDelay(negDir, &Config{CloudLaunchCleanDelayHours: 12}))
 	badDir := newTempRepo(t, "cloud_launch_clean_delay_hours = \"soon\"\n")
 	assert.Equal(t, time.Hour, ResolveCloudLaunchCleanDelay(badDir, &Config{CloudLaunchCleanDelayHours: 12}))
+}
+
+// An hour count past what time.Duration holds must not overflow into a
+// negative delay that the cleanup gate treats as already elapsed.
+func TestResolveCloudLaunchCleanDelayDoesNotOverflow(t *testing.T) {
+	maxDelay := time.Duration(math.MaxInt64/int64(time.Hour)) * time.Hour
+	tmpDir := newTempRepo(t, "")
+	assert.Equal(t, maxDelay, ResolveCloudLaunchCleanDelay(tmpDir, &Config{CloudLaunchCleanDelayHours: 2562048}))
+	assert.Equal(t, maxDelay, ResolveCloudLaunchCleanDelay(tmpDir, &Config{CloudLaunchCleanDelayHours: math.MaxInt}))
+	repoDir := newTempRepo(t, "cloud_launch_clean_delay_hours = 2562048\n")
+	assert.Equal(t, maxDelay, ResolveCloudLaunchCleanDelay(repoDir, nil))
 }
 
 func TestResolveAgentQuotaCooldown(t *testing.T) {
