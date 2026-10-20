@@ -37,8 +37,7 @@ func (s daemonAgentHookSource) ResolveTrackedRepo(
 		// .roborev.toml on the default branch, falling back to REVIEW.md.
 		// Global guidelines alone do not count; they are not tuned to
 		// this repo.
-		resolved.ReviewGuidelinesMissing =
-			strings.TrimSpace(prompt.LoadGuidelines(ctx, resolved.RootPath)) == ""
+		resolved.ReviewGuidelinesMissing = strings.TrimSpace(prompt.LoadGuidelines(ctx, resolved.RootPath)) == ""
 	}
 	return resolved, true
 }
