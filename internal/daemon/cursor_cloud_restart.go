@@ -101,8 +101,10 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	if err != nil {
 		return err
 	}
-	// A token with no saved agent id is cleaned only when this list contained
-	// it. An empty list is the lag, not a confirmed delete.
+	// The saved id's delete already returned. That alone does not clean,
+	// including through MarkCloudLaunchCleanedByToken. The marker sweep
+	// must finish with no listed agent left for this token. found means
+	// every listed match was deleted; an error above means one remains.
 	if row.AgentID == "" && !found {
 		if cloudLaunchAgedOut(row.CreatedAt, time.Now().UTC()) {
 			return reportCloudLaunchOrphan(db, row)
