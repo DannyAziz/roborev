@@ -10,6 +10,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestMarkerWriteZeroRowsReturnsError is the pin for a marker write that
+// updates nothing. Returning nil after RowsAffected()==0 fails this test.
+func TestMarkerWriteZeroRowsReturnsError(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	_, _, job := createJobChain(t, db, "/tmp/marker-zero", "abc123")
+	_, err := db.Exec(`INSERT INTO review_job_cloud_launches
+		(job_id, launch_token, cleaned, orphan_note) VALUES (?, 'cleaned-tok', 1, '')`, job.ID)
+	require.NoError(t, err)
+
+	err = db.NoteLaunchOrphanRisk("missing-tok", CloudLaunchPendingNote)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not recorded")
+	err = db.NoteLaunchOrphanRisk("cleaned-tok", CloudLaunchPendingNote)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not recorded")
+	var note string
+	require.NoError(t, db.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = 'cleaned-tok'`).Scan(&note))
+	assert.Empty(t, note)
+}
+
 func TestNoteLaunchOrphanRiskZeroRowsErrors(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
@@ -31,7 +53,9 @@ func TestNoteLaunchOrphanRiskDoesNotReplaceSetNote(t *testing.T) {
 		(job_id, launch_token, orphan_note) VALUES (?, 'keep-tok', 'cursor-cloud orphan risk: first')`, job.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, db.NoteLaunchOrphanRisk("keep-tok", "cursor-cloud orphan risk: second"))
+	err = db.NoteLaunchOrphanRisk("keep-tok", "cursor-cloud orphan risk: second")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not recorded")
 	var note string
 	require.NoError(t, db.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE launch_token = 'keep-tok'`).Scan(&note))
 	assert.Equal(t, "cursor-cloud orphan risk: first", note)
@@ -143,6 +167,51 @@ func TestCloudLaunchMigrationBackfillsUncleanedMarker(t *testing.T) {
 		assert.NotEqual(t, "done-tok", row.Token)
 	}
 	assert.True(t, saw)
+}
+
+func TestCloudLaunchMigrationKeepsEmptyTokenUncleaned(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	_, _, blankJob := createJobChain(t, db, "/tmp/token-blank", "abc123")
+	_, _, nullJob := createJobChain(t, db, "/tmp/token-null", "def456")
+	_, _, cleanedJob := createJobChain(t, db, "/tmp/token-cleaned", "fff789")
+	_, err := db.Exec(`DROP TABLE review_job_cloud_launches`)
+	require.NoError(t, err)
+	// The pre-upgrade column is nullable, so an older binary can store NULL
+	// or ''. NOT NULL without a default does not stop an explicit empty string.
+	_, err = db.Exec(`CREATE TABLE review_job_cloud_launches (
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT,
+		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO review_job_cloud_launches (job_id, launch_token, agent_id, cleaned) VALUES
+		(?, '', 'bc_blank', 0),
+		(?, NULL, 'bc_null', 0),
+		(?, '', 'bc_done', 1)`, blankJob.ID, nullJob.ID, cleanedJob.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, db.ensureCloudLaunchTable())
+
+	type gotRow struct {
+		token, note string
+		cleaned     int
+	}
+	var blank, nullTok, done gotRow
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(launch_token, '<nil>'), orphan_note, cleaned
+		FROM review_job_cloud_launches WHERE agent_id = 'bc_blank'`).Scan(&blank.token, &blank.note, &blank.cleaned))
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(launch_token, '<nil>'), orphan_note, cleaned
+		FROM review_job_cloud_launches WHERE agent_id = 'bc_null'`).Scan(&nullTok.token, &nullTok.note, &nullTok.cleaned))
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(launch_token, '<nil>'), orphan_note, cleaned
+		FROM review_job_cloud_launches WHERE agent_id = 'bc_done'`).Scan(&done.token, &done.note, &done.cleaned))
+	assert.Empty(t, blank.token)
+	assert.Equal(t, 0, blank.cleaned)
+	assert.Contains(t, blank.note, "orphan risk")
+	assert.Empty(t, nullTok.token)
+	assert.Equal(t, 0, nullTok.cleaned)
+	assert.Contains(t, nullTok.note, "orphan risk")
+	assert.Empty(t, done.token)
+	assert.Equal(t, 1, done.cleaned)
+	assert.Empty(t, done.note)
 }
 
 func TestPostgresCloudLaunchMigrationBackfillsUncleanedMarker(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL

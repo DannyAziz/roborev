@@ -849,6 +849,75 @@ func (c *create429Cloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, e
 	return c.Fake.ListAgents(ctx)
 }
 
+func TestCursorCloudRecoveryCleansLaunchAfterJobDelete(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	const token = "launch-token-deleted-job"
+	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, token, true)
+	conn, err := tc.DB.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), `PRAGMA foreign_keys = OFF`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), `DELETE FROM review_jobs WHERE id = ?`, job.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake))
+
+	_, err = fake.GetAgent(t.Context(), created.ID)
+	require.Error(t, err)
+	var cleaned int
+	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = ?`, token).Scan(&cleaned))
+	assert.Equal(t, 1, cleaned)
+}
+
+func TestWorkerDeleteFailureKeepsVMAliveText(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	fake.CreateStatus = cursorcloud.StatusFinished
+	fake.Final = "ok"
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable",
+		},
+	}
+	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
+	cloud.SetLaunchLimitsForTest(4, 20)
+	bound := tc.Pool.bindCursorCloudLaunch(testWorkerID, job, cloud)
+
+	_, err := bound.Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
+	require.Error(t, err)
+	tc.Pool.failCursorCloudWithoutRetry(testWorkerID, job, agent.CursorCloudHost, err)
+
+	var text string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&text))
+	t.Logf("user-visible error: %s", text)
+	assert.Contains(t, text, "orphan risk")
+	assert.Contains(t, text, "pending cleanup")
+	assert.Contains(t, text, "delete agent")
+}
+
+func TestEmptyTokenUpgradeStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
+		(job_id, launch_token, agent_id, repo_identity, orphan_note, cleaned)
+		VALUES (?, '', '', ?, ?, 0)`, job.ID, cursorCloudRestartRepo, storage.CloudLaunchPendingNote)
+	require.NoError(t, err)
+
+	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake))
+
+	var cleaned int
+	var note string
+	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned, orphan_note FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&cleaned, &note))
+	assert.Equal(t, 0, cleaned)
+	assert.Contains(t, note, "orphan risk")
+	assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
+}
+
 func cursorCloudRestartFixture(t *testing.T) (*workerTestContext, *cursorcloudtest.Fake) {
 	t.Helper()
 	tc := newWorkerTestContext(t, 1)

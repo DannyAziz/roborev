@@ -330,20 +330,20 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			}
 			return
 		}
-		// The VM is still there. Say so now; the row stays uncleaned for the
-		// next startup sweep. Do not wait for that restart to mention it.
-		msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup for agent %s: %v", created.ID, delErr)
-		log.Print(msg)
+		// The VM is still there. The returned error is what the worker stores
+		// over the job row, so the sentence has to stay in that error.
+		msg := fmt.Errorf("cursor-cloud orphan risk: pending cleanup for agent %s: %w", created.ID, delErr)
+		log.Print(msg.Error())
 		if a.NoteCleanupFailure != nil {
-			if noteErr := a.NoteCleanupFailure(msg); noteErr != nil {
-				delErr = errors.Join(delErr, noteErr)
+			if noteErr := a.NoteCleanupFailure(msg.Error()); noteErr != nil {
+				msg = errors.Join(msg, noteErr)
 			}
 		}
 		if err != nil {
-			err = errors.Join(err, delErr)
+			err = errors.Join(err, msg)
 			return
 		}
-		err = cursorCloudNonRetryable(delErr)
+		err = cursorCloudNonRetryable(msg)
 	}()
 	if a.BindAgent != nil {
 		if bindErr := a.BindAgent(token, created.ID); bindErr != nil {

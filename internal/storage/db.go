@@ -1628,6 +1628,11 @@ func (db *DB) ensureCloudLaunchTable() error {
 			return fmt.Errorf("cloud launch column: %w", err)
 		}
 	}
+	// An older table can store NULL. The rebuilt column is NOT NULL, and the
+	// empty-token cleanup must see '' rather than fail the copy.
+	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET launch_token = '' WHERE launch_token IS NULL`); err != nil {
+		return fmt.Errorf("cloud launch token: %w", err)
+	}
 	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now') WHERE created_at = ''`); err != nil {
 		return fmt.Errorf("cloud launch created_at: %w", err)
 	}

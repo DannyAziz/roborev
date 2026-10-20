@@ -75,7 +75,9 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 	}
 	if row.TokenNull || row.Token == "" {
-		// No marker can find a VM for this row. Leave it uncleaned.
+		// No marker can find a VM for this row. A saved id was deleted
+		// above, and an empty list is not a confirmed delete. Leave it
+		// uncleaned.
 		return reportCloudLaunchOrphan(db, row)
 	}
 	repoURL := row.RepoIdentity

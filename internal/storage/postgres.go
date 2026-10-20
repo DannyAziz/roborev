@@ -1724,7 +1724,7 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 const localCloudLaunchDDL = `CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
 	id BIGSERIAL PRIMARY KEY,
 	job_id BIGINT,
-	launch_token TEXT NOT NULL DEFAULT '',
+	launch_token TEXT NOT NULL,
 	agent_id TEXT NOT NULL DEFAULT '',
 	cleaned BOOLEAN NOT NULL DEFAULT FALSE,
 	repo_identity TEXT NOT NULL DEFAULT '',
@@ -1739,6 +1739,14 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 	}
 	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`); err != nil {
 		log.Printf("cursor-cloud: orphan_note: %v", err)
+	}
+	// DEFAULT '' let an older insert omit the token and store a blank.
+	// New writes must pass a token. Existing blanks stay blank and uncleaned.
+	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ALTER COLUMN launch_token DROP DEFAULT`); err != nil {
+		log.Printf("cursor-cloud: launch token default: %v", err)
+	}
+	if _, err := p.pool.Exec(ctx, `UPDATE review_job_cloud_launches SET launch_token = '' WHERE launch_token IS NULL`); err != nil {
+		log.Printf("cursor-cloud: launch token null: %v", err)
 	}
 	if _, err := p.pool.Exec(ctx, `UPDATE review_job_cloud_launches SET orphan_note = $1
 		WHERE NOT cleaned AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {

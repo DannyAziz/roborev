@@ -106,7 +106,8 @@ func (db *DB) ListUncleanedCloudLaunches() ([]CloudLaunch, error) {
 		COALESCE(l.repo_identity, ''), COALESCE(l.created_at, '')
 		FROM review_job_cloud_launches l
 		LEFT JOIN review_jobs j ON j.id = l.job_id
-		LEFT JOIN repos r ON r.id = j.repo_id WHERE l.cleaned = 0 ORDER BY l.id`)
+		LEFT JOIN repos r ON r.id = j.repo_id
+		WHERE l.cleaned = 0 ORDER BY l.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +164,8 @@ func (db *DB) CountUncleanedCloudLaunches(jobID int64) (int, error) {
 }
 
 // NoteLaunchOrphanRisk fills an empty orphan_note. It does not change a note
-// that is already set, and it returns an error when no uncleaned row matches.
+// that is already set. A write that updates zero rows returns an error,
+// including when the token is missing or the note was already recorded.
 func (db *DB) NoteLaunchOrphanRisk(token, msg string) error {
 	token = strings.TrimSpace(token)
 	msg = strings.TrimSpace(msg)
@@ -179,15 +181,7 @@ func (db *DB) NoteLaunchOrphanRisk(token, msg string) error {
 	if err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
-	}
-	var existing int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches
-		WHERE launch_token = ? AND cleaned = 0`, token).Scan(&existing); err != nil {
-		return err
-	}
-	if existing == 0 {
+	if n == 0 {
 		return fmt.Errorf("cursor-cloud: launch note was not recorded")
 	}
 	return nil
@@ -264,7 +258,8 @@ func (db *DB) keepCloudLaunchAfterJobDelete() error {
 			orphan_note TEXT NOT NULL DEFAULT '')`,
 		`INSERT INTO review_job_cloud_launches_keep
 			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note)
-			SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note
+			SELECT id, job_id, launch_token, agent_id, cleaned,
+				repo_identity, created_at, orphan_note
 			FROM review_job_cloud_launches`,
 		`DROP TABLE review_job_cloud_launches`,
 		`ALTER TABLE review_job_cloud_launches_keep RENAME TO review_job_cloud_launches`,

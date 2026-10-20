@@ -104,9 +104,10 @@ func TestKnownIDDeleteCleansOnlyAfterNilOr404(t *testing.T) {
 	})
 }
 
-// TestEmptyTokenCleansOnlyOnConfirmedEmptyList no longer lists. An empty
-// token stays uncleaned whether or not other agents are present.
-func TestEmptyTokenCleansOnlyOnConfirmedEmptyList(t *testing.T) {
+// TestEmptyTokenStaysUncleanedWithoutConfirmedDelete does not list and does
+// not mark the row cleaned. An empty token has no marker that can prove a
+// VM is gone.
+func TestEmptyTokenStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
 	t.Run("non-empty list", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
 		sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -129,6 +130,7 @@ func TestEmptyTokenCleansOnlyOnConfirmedEmptyList(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 1, n)
 		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
+		assert.Contains(t, cursorCloudLaunchNote(t, tc.DB, job.ID), "orphan risk")
 	})
 }
 
