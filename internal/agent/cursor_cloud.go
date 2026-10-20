@@ -920,8 +920,9 @@ func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
 // markLaunchCleanedAfterDelete lists once more so a provider-side duplicate
 // of token is deleted before the row is cleaned. That list retries a
 // transient 429, 5xx, or timeout. The id already removed is not in that
-// list. A list or delete error leaves the row uncleaned. The row is
-// cleaned only after the delete and this sweep returns no error.
+// list. A list or delete error leaves the row uncleaned. SweepAllowsClean
+// then requires this sweep to be empty and the listing-lag window to have
+// passed. A sweep that deletes a VM does not clean.
 func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Client, repoURL, token, reconcileToken string, output io.Writer) error {
 	if a == nil || a.MarkLaunchCleaned == nil {
 		return nil
