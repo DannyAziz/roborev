@@ -8,11 +8,13 @@ export interface ReviewProjectionJob {
   branch?: string;
   commit_subject?: string;
   enqueued_at: string;
+  error?: string;
   finished_at?: string;
   git_ref: string;
   id: number;
   model?: string;
   non_voting?: boolean;
+  orphan_warning?: string;
   panel_member_name?: string;
   panel_name?: string;
   panel_role?: string;

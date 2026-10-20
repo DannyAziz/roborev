@@ -13,6 +13,7 @@
   const output = $derived(stores.roborevReview?.getOutput() ?? "");
   const selectedJob = $derived(stores.roborevReview?.getSelectedJob());
   const failed = $derived(selectedJob?.status === "failed");
+  const orphanWarning = $derived(selectedJob?.orphan_warning?.trim() ?? "");
   const failureReason = $derived(
     selectedJob?.error?.trim() ||
       "The review agent failed before producing output.",
@@ -61,6 +62,12 @@
   });
 </script>
 
+{#if orphanWarning}
+  <div class="review-orphan-warning" role="alert">
+    <strong>Warning:</strong>
+    {orphanWarning}
+  </div>
+{/if}
 {#if stores.roborevReview?.isLoading()}
   <div class="review-state">Loading review…</div>
 {:else if failed}
@@ -90,6 +97,17 @@
 {/if}
 
 <style>
+  .review-orphan-warning {
+    margin: var(--space-3) var(--space-3) 0;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--accent-amber);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
   .review-state {
     padding: 24px;
     text-align: center;
