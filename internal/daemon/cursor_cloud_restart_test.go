@@ -355,11 +355,12 @@ func cursorCloudAllowNullToken(t *testing.T, db *storage.DB) {
 	_, err := db.Exec(`CREATE TABLE review_job_cloud_launches_nullable (
 		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT,
 		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
-		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '')`)
+		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
+		orphan_note TEXT NOT NULL DEFAULT '')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO review_job_cloud_launches_nullable
-		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at)
-		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at
+		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note)
+		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note
 		FROM review_job_cloud_launches`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DROP TABLE review_job_cloud_launches`)

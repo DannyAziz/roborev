@@ -58,6 +58,9 @@ func (c *countingCreate) CreateAgent(ctx context.Context, req cursorcloud.Create
 	return c.Fake.CreateAgent(ctx, req)
 }
 
+// TestKnownIDDeleteCleansOnlyAfterNilOr404 still deletes a saved id. An
+// empty token is not marked cleaned after that delete: there is no marker
+// for any other VM, so the row stays uncleaned.
 func TestKnownIDDeleteCleansOnlyAfterNilOr404(t *testing.T) {
 	t.Run("delete error", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
@@ -75,12 +78,16 @@ func TestKnownIDDeleteCleansOnlyAfterNilOr404(t *testing.T) {
 	})
 	t.Run("nil delete", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
-		job, _ := cursorCloudEmptyTokenAgent(t, tc, fake, true)
+		job, id := cursorCloudEmptyTokenAgent(t, tc, fake, true)
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		_, err := fake.GetAgent(t.Context(), id)
+		require.Error(t, err)
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
-		assert.Equal(t, 0, n)
-		assert.Empty(t, cursorCloudLaunchNote(t, tc.DB, job.ID))
+		assert.Equal(t, 1, n)
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Contains(t, updated.Error, "orphan risk")
 	})
 	t.Run("404 delete", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
@@ -93,10 +100,12 @@ func TestKnownIDDeleteCleansOnlyAfterNilOr404(t *testing.T) {
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
-		assert.Equal(t, 0, n)
+		assert.Equal(t, 1, n)
 	})
 }
 
+// TestEmptyTokenCleansOnlyOnConfirmedEmptyList no longer lists. An empty
+// token stays uncleaned whether or not other agents are present.
 func TestEmptyTokenCleansOnlyOnConfirmedEmptyList(t *testing.T) {
 	t.Run("non-empty list", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
@@ -104,10 +113,11 @@ func TestEmptyTokenCleansOnlyOnConfirmedEmptyList(t *testing.T) {
 		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 		cursorCloudSeedAgent(t, fake, sha, "someone else")
 		cursorCloudInsertEmptyToken(t, tc.DB, job.ID, "")
-		require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 1, n)
+		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
 	})
 	t.Run("empty list", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
@@ -117,7 +127,8 @@ func TestEmptyTokenCleansOnlyOnConfirmedEmptyList(t *testing.T) {
 		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
-		assert.Equal(t, 0, n)
+		assert.Equal(t, 1, n)
+		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
 	})
 }
 
