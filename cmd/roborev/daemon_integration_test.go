@@ -321,7 +321,6 @@ func TestDaemonSignalCleanup(t *testing.T) {
 	sigCh <- os.Interrupt
 	require.NoError(t, <-errCh)
 	assert.True(t, cleanupCalled, "signal cleanup must run before Execute returns")
-
 }
 
 // syncBuffer is a goroutine-safe bytes.Buffer for capturing subprocess
