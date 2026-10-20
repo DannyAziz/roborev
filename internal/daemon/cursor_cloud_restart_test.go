@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 	"uuid"
 
 	"github.com/stretchr/testify/assert"
@@ -754,16 +755,18 @@ func TestDoneContextPersistsNoCloudLaunch(t *testing.T) {
 }
 
 // TestCursorCloudRestartReaps429Create is a create that stores an agent and
-// then returns 429. The in-process reconcile lists once and stops on that
-// 429, so the agent is still there. The startup sweep lists again: a list
-// 429 leaves the token row uncleaned. A later miss keeps the row. The next
-// list deletes the agent and does not create another.
+// then returns 429. The in-process reconcile retries that list and still
+// stops while every attempt is 429, so the agent is still there. The
+// startup sweep lists again: a list 429 leaves the token row uncleaned. A
+// later miss keeps the row. The next list deletes the agent and does not
+// create another.
 func TestCursorCloudRestartReaps429Create(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
 	tc, fake := cursorCloudRestartFixture(t)
 	provider := &create429Cloud{Fake: fake}
 	provider.setListErr(&cursorcloud.APIError{
 		Op: "list agents", StatusCode: http.StatusTooManyRequests, Message: "too many requests",
+		HasRetryAfter: true, RetryAfter: time.Millisecond,
 	})
 	prev, err := agent.Get(agent.CursorCloudHost)
 	require.NoError(t, err)
@@ -788,7 +791,7 @@ func TestCursorCloudRestartReaps429Create(t *testing.T) {
 	err = recoverStaleJobs(context.Background(), tc.DB, provider)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "too many requests")
-	assert.Equal(t, 2, provider.listCalls(), "create reconcile and the startup sweep each consume one list 429")
+	assert.Equal(t, 4, provider.listCalls(), "in-process list retries three times, then the startup sweep lists once")
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)

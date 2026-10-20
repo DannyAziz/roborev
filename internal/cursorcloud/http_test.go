@@ -300,6 +300,46 @@ func TestHTTPErrorMappingAndRedaction(t *testing.T) {
 	}
 }
 
+func TestHTTPRetryAfterIsKeptOnAPIError(t *testing.T) {
+	when := time.Now().Add(30 * time.Second).UTC()
+	cases := []struct {
+		name    string
+		header  string
+		wantSet bool
+		exact   time.Duration
+		min     time.Duration
+		max     time.Duration
+	}{
+		{name: "delay seconds", header: "4", wantSet: true, exact: 4 * time.Second},
+		{name: "zero", header: "0", wantSet: true, exact: 0},
+		{name: "http date", header: when.Format(http.TimeFormat), wantSet: true, min: 29 * time.Second, max: 30 * time.Second},
+		{name: "absent", header: "", wantSet: false},
+		{name: "garbage", header: "later", wantSet: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tc.header != "" {
+					w.Header().Set("Retry-After", tc.header)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, `{"message":"slow down"}`)
+			})
+			_, err := client.GetAgent(context.Background(), "bc_1")
+			var apiErr *cursorcloud.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, tc.wantSet, apiErr.HasRetryAfter)
+			if tc.exact != 0 || tc.header == "0" {
+				assert.Equal(t, tc.exact, apiErr.RetryAfter)
+			}
+			if tc.max > 0 {
+				assert.GreaterOrEqual(t, apiErr.RetryAfter, tc.min)
+				assert.LessOrEqual(t, apiErr.RetryAfter, tc.max)
+			}
+		})
+	}
+}
+
 func TestHTTPRedirectIsNotFollowed(t *testing.T) {
 	hits := 0
 	client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {

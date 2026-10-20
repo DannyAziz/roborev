@@ -2131,10 +2131,12 @@ func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
 	prev := cursorCloudReconcileWindow
 	cursorCloudReconcileWindow = time.Minute
 	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
-	limited := &rateLimitCloud{}
-	err := reconcileCursorCloudLaunch(context.Background(), limited, "https://github.com/acme/widgets.git", "tok", nil)
-	require.Error(t, err)
-	assert.Equal(t, 1, limited.lists)
+	synctest.Test(t, func(t *testing.T) {
+		limited := &rateLimitCloud{}
+		err := reconcileCursorCloudLaunch(context.Background(), limited, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		assert.Equal(t, cursorCloudDeleteAttempts, limited.lists)
+	})
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -2285,12 +2287,14 @@ func (c *listDeadlineCloud) UserPrompt(context.Context, string) (string, error) 
 func (c *listDeadlineCloud) StopAgent(context.Context, string) error              { return nil }
 func (c *listDeadlineCloud) DeleteAgent(context.Context, string) error            { return nil }
 func (c *listDeadlineCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
-	c.listed = true
-	c.listErr = ctx.Err()
-	deadline, ok := ctx.Deadline()
-	c.hasDeadline = ok
-	if ok {
-		c.remain = time.Until(deadline)
+	if !c.listed {
+		c.listed = true
+		c.listErr = ctx.Err()
+		deadline, ok := ctx.Deadline()
+		c.hasDeadline = ok
+		if ok {
+			c.remain = time.Until(deadline)
+		}
 	}
 	return nil, &cursorcloud.APIError{Op: "list agents", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
 }

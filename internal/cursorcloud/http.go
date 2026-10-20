@@ -232,6 +232,11 @@ type APIError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	// RetryAfter is the Retry-After delay (RFC 9110). HasRetryAfter is
+	// false when the header was absent or not a delay-seconds / HTTP-date.
+	// A present zero means retry immediately.
+	RetryAfter    time.Duration
+	HasRetryAfter bool
 }
 
 func (e *APIError) Error() string {
@@ -484,7 +489,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		return c.redactErr(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return c.apiError(op, resp.StatusCode, data)
+		return c.apiError(op, resp.StatusCode, data, resp.Header)
 	}
 	if out == nil {
 		return nil
@@ -559,7 +564,7 @@ func (c *httpClient) authorization() string {
 	return "Basic " + token
 }
 
-func (c *httpClient) apiError(op string, status int, data []byte) error {
+func (c *httpClient) apiError(op string, status int, data []byte, header http.Header) error {
 	code, message, ok := parseAPIErrorBody(data)
 	if !ok {
 		message = string(data)
@@ -571,12 +576,39 @@ func (c *httpClient) apiError(op string, status int, data []byte) error {
 	if len(message) > maxErrorMessageBytes {
 		message = message[:maxErrorMessageBytes]
 	}
+	retryAfter, hasRetryAfter := parseRetryAfter(header.Get("Retry-After"), time.Now())
 	return &APIError{
-		Op:         op,
-		StatusCode: status,
-		Code:       code,
-		Message:    strings.TrimSpace(message),
+		Op:            op,
+		StatusCode:    status,
+		Code:          code,
+		Message:       strings.TrimSpace(message),
+		RetryAfter:    retryAfter,
+		HasRetryAfter: hasRetryAfter,
 	}
+}
+
+// parseRetryAfter reads RFC 9110 Retry-After: delay-seconds or an HTTP-date.
+// A date already in the past is a present header with a zero wait.
+func parseRetryAfter(raw string, now time.Time) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	when, err := http.ParseTime(raw)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		return 0, true
+	}
+	return delay, true
 }
 
 func parseAPIErrorBody(data []byte) (code, message string, ok bool) {

@@ -32,11 +32,15 @@ const (
 
 	cursorCloudAgentName = CursorCloudHost
 	cursorCloudMaxPoll   = 5 * time.Second
-	// cursorCloudDeleteAttempts bounds retries of one failed DELETE.
-	// A 4xx is not retried; it will not succeed on the next attempt.
+	// cursorCloudDeleteAttempts bounds in-process retries of one list or
+	// DELETE. 429, 5xx, and a timeout are retried. Other 4xx is not: it
+	// will not succeed on the next attempt. 429 is the exception because
+	// Retry-After (RFC 9110) says the same request may succeed later.
+	// https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after
 	cursorCloudDeleteAttempts = 3
-	// cursorCloudDeleteBackoff separates this process's DELETE attempts.
-	// DELETE /v0/agents does not define a retry interval
+	// cursorCloudDeleteBackoff separates this process's attempts when the
+	// response has no Retry-After. DELETE /v0/agents does not define a
+	// retry interval
 	// (https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent).
 	// 100ms only keeps the three local attempts from being one burst.
 	cursorCloudDeleteBackoff = 100 * time.Millisecond
@@ -313,6 +317,18 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output, func() error {
 			return a.markLaunchCleaned(token)
 		}); recErr != nil {
+			// The list gave up while a VM may still be billing. The job
+			// error is the record; a log line is not enough, and FailJob
+			// replaces whatever NoteCleanupFailure wrote, so the returned
+			// error has to carry the same text.
+			if errors.Is(recErr, errCursorCloudListUnconfirmed) {
+				log.Print(recErr.Error())
+				if a.NoteCleanupFailure != nil {
+					if noteErr := a.NoteCleanupFailure(recErr.Error()); noteErr != nil {
+						recErr = errors.Join(recErr, noteErr)
+					}
+				}
+			}
 			err = errors.Join(err, recErr)
 		}
 		return "", cursorCloudNonRetryable(err)
@@ -320,13 +336,18 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// Delete is armed before any later work, including the status line, so a
 	// panic or error there still removes the VM.
 	defer func() {
-		delErr := deleteCursorCloudAgent(client, created.ID, output)
+		delErr := deleteCursorCloudAgent(ctx, client, created.ID, output)
 		if delErr == nil {
 			// The id from this response is gone. A provider-side duplicate
 			// shares the marker and is not that id, so the row is cleaned
 			// only after the sweep deletes every remaining match.
 			if cleanErr := a.markLaunchCleanedAfterDelete(client, repoURL, token, reconcileToken, output); cleanErr != nil {
 				log.Printf("cursor-cloud: launch row left uncleaned after delete: %v", cleanErr)
+				if a.NoteCleanupFailure != nil {
+					if noteErr := a.NoteCleanupFailure(cleanErr.Error()); noteErr != nil {
+						log.Printf("cursor-cloud: orphan note was not stored: %v", noteErr)
+					}
+				}
 			}
 			return
 		}
@@ -463,13 +484,17 @@ func cursorCloudPreSend(err error) bool {
 	return op.Op == "dial"
 }
 
-func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writer) error {
+func deleteCursorCloudAgent(ctx context.Context, client cursorcloud.Client, id string, output io.Writer) error {
 	// Stop pauses the VM. v0 Delete is documented as permanent and does not
 	// say it stops billing, so stop runs first and delete still runs when
 	// stop fails. https://cursor.com/docs/cloud-agent/api/v0#stop-an-agent
 	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
 	// Stop and each DELETE get a fresh timeout. Sharing one 60s context let
-	// a stalled stop starve the deletes.
+	// a stalled stop starve the deletes. The wait between DELETE attempts
+	// uses ctx, so a cancel stops the retry without skipping the first try.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var stopNotePanic any
 	defer func() {
 		if stopNotePanic != nil {
@@ -483,21 +508,16 @@ func deleteCursorCloudAgent(client cursorcloud.Client, id string, output io.Writ
 		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, stopErr)
 		stopNotePanic = cleanupNotePanic(output, note.Error())
 	}
-	var err error
-	for attempt := 1; attempt <= cursorCloudDeleteAttempts; attempt++ {
-		if attempt > 1 {
-			time.Sleep(cursorCloudDeleteBackoff)
-		}
-		delCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
-		err = client.DeleteAgent(delCtx, id)
-		cancel()
-		if err == nil || cursorCloudDeleteGone(err) {
-			// 404 means the agent is already gone. That attempt is done.
-			return nil
-		}
-		if cursorCloudDeleteFinal(err) {
-			break
-		}
+	err := retryCursorCloud(ctx, cursorCloudDeleteRetryable, func() error {
+		// WithoutCancel so a cancel during this attempt still finishes it.
+		// The next attempt's wait observes the cancel.
+		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorCloudDeleteTimeout)
+		defer cancel()
+		return client.DeleteAgent(delCtx, id)
+	})
+	if err == nil || cursorCloudDeleteGone(err) {
+		// 404 means the agent is already gone. That attempt is done.
+		return nil
 	}
 	surfaced := fmt.Errorf("cursor-cloud: delete agent %s: %w", id, err)
 	writeCursorCloudCleanupNote(output, surfaced.Error())
@@ -528,12 +548,23 @@ func cleanupNotePanic(output io.Writer, note string) (panicked any) {
 }
 
 // cursorCloudDeleteFinal reports a DELETE that must not be retried.
-// 4xx other than 404 is the client's request, not a transient server
-// failure. 500 is not final: it is retried, and the delete stays not-done
-// when every attempt fails.
+// 4xx other than 404 and 429 is the client's request, not a transient
+// server failure. 429 carries Retry-After and is retried. 500 is not
+// final: it is retried, and the delete stays not-done when every attempt
+// fails.
 func cursorCloudDeleteFinal(err error) bool {
 	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
-	return ok && apiErr != nil && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusNotFound
+	if !ok || apiErr == nil {
+		return false
+	}
+	if apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode == http.StatusNotFound {
+		return false
+	}
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
+}
+
+func cursorCloudDeleteRetryable(err error) bool {
+	return err != nil && !cursorCloudDeleteGone(err) && !cursorCloudDeleteFinal(err)
 }
 
 // cursorCloudDeleteGone reports a DELETE whose agent is already absent.
@@ -606,10 +637,11 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		// Start the 60s before ListAgents. One clock for the whole
 		// reconcile would already be spent by earlier passes, and starting
 		// it after the list returns would hide the list's duration.
+		// listCursorCloudAgents gives each attempt its own 60s child of
+		// this window, and retries 429, 5xx, and timeout before we see
+		// the error. A cancel of this window stops that wait.
 		passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
-		listCtx, listCancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
-		agents, err := client.ListAgents(listCtx)
-		listCancel()
+		agents, err := listCursorCloudAgents(ctx, client)
 		var found bool
 		var matchErr error
 		if err == nil {
@@ -617,10 +649,13 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		}
 		passCancel()
 		if err != nil {
-			errs = appendReconcileErr(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
-			if cursorCloudRateLimited(err) {
+			if cursorCloudTransient(err) {
+				// Retries are already spent. Another pass would keep
+				// calling ListAgents. The sentinel is the orphan note.
+				errs = appendReconcileErr(errs, fmt.Errorf("%w: cursor-cloud: reconcile list: %w", errCursorCloudListUnconfirmed, err))
 				break
 			}
+			errs = appendReconcileErr(errs, fmt.Errorf("cursor-cloud: reconcile list: %w", err))
 		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
@@ -635,9 +670,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 				foundLaunch = true
 				break
 			}
-			// A conversation 429 stops the reconcile the same way a list 429
-			// does. Reading more candidates or listing again would keep
-			// spending the rate limit.
+			// A conversation 429 stops the reconcile. The list already
+			// retried its own 429. Reading more candidates or listing
+			// again would keep spending the rate limit.
 			if cursorCloudRateLimited(matchErr) {
 				break
 			}
@@ -683,6 +718,95 @@ func appendReconcileTerminal(errs []error, err error) []error {
 		errs = append([]error(nil), errs[:cursorCloudReconcileMaxErrs-1]...)
 	}
 	return append(errs, err)
+}
+
+// errCursorCloudListUnconfirmed is the orphan-risk note for a list that
+// stayed transient after the in-process retries. The job error stores
+// this text. The log is not the record.
+var errCursorCloudListUnconfirmed = errors.New("cursor-cloud orphan risk: pending cleanup")
+
+// listCursorCloudAgents retries a transient list on the same ctx. Each
+// attempt has its own cursorCloudDeleteTimeout. ctx cancel ends the wait
+// between attempts and does not start another one.
+func listCursorCloudAgents(ctx context.Context, client cursorcloud.Client) ([]cursorcloud.Agent, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var agents []cursorcloud.Agent
+	err := retryCursorCloud(ctx, cursorCloudTransient, func() error {
+		callCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
+		defer cancel()
+		var callErr error
+		agents, callErr = client.ListAgents(callCtx)
+		return callErr
+	})
+	return agents, err
+}
+
+// retryCursorCloud runs call up to cursorCloudDeleteAttempts times. The
+// first call always runs. A later call waits Retry-After, or the local
+// backoff when the response has none. ctx cancel during that wait returns
+// immediately and does not call again.
+func retryCursorCloud(ctx context.Context, retryable func(error) bool, call func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var err error
+	for attempt := 1; attempt <= cursorCloudDeleteAttempts; attempt++ {
+		if attempt > 1 {
+			if waitErr := waitCursorCloud(ctx, cursorCloudRetryDelay(err)); waitErr != nil {
+				return waitErr
+			}
+		}
+		err = call()
+		if retryable == nil || !retryable(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// cursorCloudRetryDelay is the pause before the next attempt. A
+// Retry-After header wins. It is not waited past cursorCloudDeleteTimeout:
+// that is already the deadline of one list or DELETE, and a longer pause
+// belongs to the next daemon start, not another timer here.
+func cursorCloudRetryDelay(err error) time.Duration {
+	delay := cursorCloudDeleteBackoff
+	if apiErr, ok := errors.AsType[*cursorcloud.APIError](err); ok && apiErr != nil && apiErr.HasRetryAfter {
+		delay = apiErr.RetryAfter
+	}
+	if delay < 0 {
+		delay = cursorCloudDeleteBackoff
+	}
+	if delay > cursorCloudDeleteTimeout {
+		delay = cursorCloudDeleteTimeout
+	}
+	return delay
+}
+
+// cursorCloudTransient reports a list or DELETE failure that may succeed
+// on a later attempt: 429, 5xx, or a timeout.
+func cursorCloudTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if apiErr, ok := err.(*cursorcloud.APIError); ok { //nolint:errorlint // walk every joined sibling; errors.As returns only the first APIError
+		return apiErr != nil && (apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= 500)
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		return slices.ContainsFunc(joined.Unwrap(), cursorCloudTransient)
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return cursorCloudTransient(wrapped.Unwrap())
+	}
+	return false
 }
 
 func cursorCloudRateLimited(err error) bool {
@@ -732,7 +856,7 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 			continue
 		}
 		found = true
-		if delErr := deleteCursorCloudAgent(client, ag.ID, output); delErr != nil {
+		if delErr := deleteCursorCloudAgent(ctx, client, ag.ID, output); delErr != nil {
 			return true, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
 		}
 	}
@@ -740,7 +864,7 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 }
 
 func StopAndDeleteCursorCloudAgent(client cursorcloud.Client, id string) error {
-	return deleteCursorCloudAgent(client, id, nil)
+	return deleteCursorCloudAgent(context.Background(), client, id, nil)
 }
 
 func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
@@ -751,8 +875,10 @@ func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
 }
 
 // markLaunchCleanedAfterDelete lists once more so a provider-side duplicate
-// of token is deleted before the row is cleaned. The id already removed is
-// not in that list. A list or delete error leaves the row uncleaned.
+// of token is deleted before the row is cleaned. That list retries a
+// transient 429, 5xx, or timeout. The id already removed is not in that
+// list. A list or delete error leaves the row uncleaned. The row is
+// cleaned only after the delete and this sweep returns no error.
 func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Client, repoURL, token, reconcileToken string, output io.Writer) error {
 	if a == nil || a.MarkLaunchCleaned == nil {
 		return nil
@@ -760,11 +886,9 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 	if !CursorCloudRepoUsable(repoURL) {
 		return errors.New("cursor-cloud: launch has no repository to sweep")
 	}
-	listCtx, cancel := context.WithTimeout(context.Background(), cursorCloudDeleteTimeout)
-	agents, err := client.ListAgents(listCtx)
-	cancel()
+	agents, err := listCursorCloudAgents(context.Background(), client)
 	if err != nil {
-		return fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+		return fmt.Errorf("cursor-cloud orphan risk: pending cleanup: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
 	_, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
