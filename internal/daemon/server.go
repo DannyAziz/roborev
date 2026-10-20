@@ -34,6 +34,7 @@ import (
 	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/goalreview"
 	"go.kenn.io/roborev/internal/mcpserver"
@@ -51,6 +52,7 @@ type Server struct {
 	daemonTLS               config.DaemonTLSConfig // Immutable startup TLS settings.
 	tcpTLS                  bool                   // The TCP API listener requires mutual TLS.
 	db                      *storage.DB
+	cloudLaunchClient       cursorcloud.Client // Tests inject the startup sweep. Nil uses CURSOR_API_KEY.
 	configWatcher           *ConfigWatcher
 	broadcaster             Broadcaster
 	workerPool              *WorkerPool

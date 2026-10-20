@@ -63,6 +63,7 @@ func TestDefaultConfigLeavesPostgresSchemaAtV23(t *testing.T) {
 	schema := strings.Join(pgSchemaStatements(), "\n")
 	assert.NotContains(schema, "backup_auto")
 	assert.Contains(schema, "non_voting")
+	assert.NotContains(schema, "review_job_cloud_launches")
 }
 
 func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {

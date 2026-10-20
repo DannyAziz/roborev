@@ -583,6 +583,10 @@ func (db *DB) GetRepoStats(repoID int64) (*RepoStats, error) {
 // ErrRepoHasJobs is returned when trying to delete a repo with jobs without cascade
 var ErrRepoHasJobs = errors.New("repository has existing jobs; use cascade to delete them")
 
+// ErrRepoHasCloudLaunch is returned when a repo delete would drop an
+// uncleaned cursor-cloud launch. The VM would lose its record.
+var ErrRepoHasCloudLaunch = errors.New("repository has an uncleaned cursor-cloud launch")
+
 // DeleteRepo deletes a repo and optionally its associated data
 // If cascade is true, also deletes all jobs, reviews, and responses for the repo
 // If cascade is false and jobs exist, returns ErrRepoHasJobs
@@ -620,6 +624,15 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 
 	if !cascade && jobCount > 0 {
 		return ErrRepoHasJobs
+	}
+	var liveLaunches int
+	err = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_job_cloud_launches
+		WHERE cleaned = 0 AND job_id IN (SELECT id FROM review_jobs WHERE repo_id = ?)`, repoID).Scan(&liveLaunches)
+	if err != nil {
+		return err
+	}
+	if liveLaunches > 0 {
+		return ErrRepoHasCloudLaunch
 	}
 
 	if cascade {

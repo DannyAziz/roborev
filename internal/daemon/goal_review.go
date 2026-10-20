@@ -152,7 +152,11 @@ func (wp *WorkerPool) processGoalReview(ctx context.Context, workerID string, jo
 			a = pi.WithProvider(job.Provider)
 		}
 	}
-	if err := goalreview.ValidateAgent(a); err != nil {
+	admit := wp.goalReviewAdmit
+	if admit == nil {
+		admit = goalreview.ValidateAgent
+	}
+	if err := admit(a); err != nil {
 		fail(err)
 		return
 	}

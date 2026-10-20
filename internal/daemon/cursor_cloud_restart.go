@@ -25,7 +25,10 @@ func (s *Server) recoverStaleJobs(ctx context.Context) error {
 	if err := s.db.ResetStaleJobs(); err != nil {
 		return err
 	}
-	client, _ := cursorcloud.NewFromEnv()
+	client := s.cloudLaunchClient
+	if client == nil {
+		client, _ = cursorcloud.NewFromEnv()
+	}
 	if err := recoverCloudLaunches(ctx, s.db, client); err != nil {
 		log.Printf("cursor-cloud: interrupted launch cleanup will retry on next start: %v", err)
 	}

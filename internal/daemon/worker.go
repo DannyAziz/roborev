@@ -116,9 +116,10 @@ type WorkerPool struct {
 	retryBackoff time.Duration
 
 	// Test hooks for deterministic synchronization (nil in production)
-	testHookAfterSecondCheck    func()           // Called after second runningJobs check, before second DB lookup
-	testHookCooldownLockUpgrade func()           // Called between RUnlock and Lock in isAgentCoolingDown
-	goalReviewRunner            goalReviewRunner // Test-only schema adapter; nil in production.
+	testHookAfterSecondCheck    func()                  // Called after second runningJobs check, before second DB lookup
+	testHookCooldownLockUpgrade func()                  // Called between RUnlock and Lock in isAgentCoolingDown
+	goalReviewRunner            goalReviewRunner        // Test-only schema adapter; nil in production.
+	goalReviewAdmit             func(agent.Agent) error // Test-only stand-in for goalreview.ValidateAgent.
 }
 
 // NewWorkerPool creates a new worker pool
