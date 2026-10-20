@@ -76,9 +76,17 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 	}
 	if row.TokenNull || row.Token == "" {
-		// No marker can find a VM for this row. A saved id was deleted
-		// above, and an empty list is not a confirmed delete. Leave it
-		// uncleaned.
+		// No marker can find a VM for this row. An empty list deletes
+		// nothing, and there is no saved id to delete, so this is not a
+		// by-id delete. SweepAllowsClean refuses the clean. The orphan
+		// note stays, and a later start still sweeps the row.
+		if row.AgentID == "" {
+			now := agent.CursorCloudNow()
+			since, _ := parseCloudLaunchCreated(row.CreatedAt)
+			if agent.SweepAllowsClean(false, false, since, now) {
+				return db.MarkCloudLaunchCleanedByToken(row.Token)
+			}
+		}
 		return reportCloudLaunchOrphan(db, row)
 	}
 	repoURL := row.RepoIdentity

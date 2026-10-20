@@ -119,6 +119,11 @@ func TestEmptyTokenStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 1, n)
 		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
+		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
+		assert.Contains(t, cursorCloudLaunchNote(t, tc.DB, job.ID), "orphan risk")
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Contains(t, updated.Error, "orphan risk")
 	})
 	t.Run("empty list", func(t *testing.T) {
 		tc, fake := cursorCloudRestartFixture(t)
