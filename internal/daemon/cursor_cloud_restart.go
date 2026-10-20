@@ -207,7 +207,7 @@ func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bo
 }
 
 func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch, delay time.Duration) error {
-	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within %s", row.JobID, row.ID, delay)
+	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within cloud_launch_clean_delay_hours (%s)", row.JobID, row.ID, delay)
 	log.Print(msg)
 	return db.NoteCloudLaunchRisk(row.JobID, msg)
 }
