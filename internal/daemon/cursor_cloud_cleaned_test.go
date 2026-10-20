@@ -65,11 +65,12 @@ func newBoundCloud(t *testing.T, tc *workerTestContext, job *storage.ReviewJob, 
 	return tc.Pool.bindCursorCloudLaunch(testWorkerID, job, cloud)
 }
 
-func assertLaunchCleaned(t *testing.T, tc *workerTestContext, jobID int64, fake *cursorcloudtest.Fake, goneID string) {
+func assertLaunchHeld(t *testing.T, tc *workerTestContext, jobID int64, fake *cursorcloudtest.Fake, goneID string) {
 	t.Helper()
 	n, err := tc.DB.CountUncleanedCloudLaunches(jobID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, jobID))
 	if goneID != "" {
 		_, err = fake.GetAgent(t.Context(), goneID)
 		require.Error(t, err)
@@ -77,9 +78,8 @@ func assertLaunchCleaned(t *testing.T, tc *workerTestContext, jobID int64, fake 
 }
 
 // TestCursorCloud429ReapMarksCleaned is C0/C0A. A 429 whose reconcile finds
-// and deletes the VM marks the launch cleaned. Aging that row must not write
-// an orphan note. Leaving cleaned=0 fails the count, then the aged restart
-// writes the note.
+// and deletes the VM from that one list leaves the launch uncleaned. The
+// pending note stays, so a later restart still sweeps the row.
 func TestCursorCloud429ReapMarksCleaned(t *testing.T) {
 	tc, _ := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -93,27 +93,17 @@ func TestCursorCloud429ReapMarksCleaned(t *testing.T) {
 	require.Error(t, err)
 	deleted := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
 	require.NotEmpty(t, deleted)
-	assertLaunchCleaned(t, tc, job.ID, fake, deleted[0])
-
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	logs := cursorCloudCaptureLog(t)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.NotContains(t, logs.String(), "orphan risk")
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.NotContains(t, updated.Error, "orphan risk")
-	assertLaunchCleaned(t, tc, job.ID, fake, "")
+	assertLaunchHeld(t, tc, job.ID, fake, deleted[0])
 }
 
 // TestCursorCloudInFlightCreateReapMarksCleaned is J2. The POST was sent, the
 // response never arrived, and the VM is already listed. Reconcile deletes it
-// and marks the launch cleaned, same as the 429 reap.
+// and leaves the launch uncleaned, same as the 429 reap.
 //
 // The client-deadline cell returns context.DeadlineExceeded while Review's
 // context is still live. The canceled and expired-deadline cells finish that
-// same context after the agent is stored. Both still mark the launch cleaned.
-// A plain 500 is the same stored-then-returned shape. Skipping the cleaned
-// mark leaves the row uncleaned and these cells fail.
+// same context after the agent is stored. A plain 500 is the same
+// stored-then-returned shape. Cleaning from that one list fails these cells.
 func TestCursorCloudInFlightCreateReapMarksCleaned(t *testing.T) {
 	t.Run("client deadline", func(t *testing.T) {
 		assertInFlightCreateReaped(t, context.Background(), &cloudCreateScript{
@@ -154,7 +144,7 @@ func assertInFlightCreateReaped(t *testing.T, ctx context.Context, client cursor
 	fake := clientFake(client)
 	deleted := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
 	require.NotEmpty(t, deleted)
-	assertLaunchCleaned(t, tc, job.ID, fake, deleted[0])
+	assertLaunchHeld(t, tc, job.ID, fake, deleted[0])
 }
 
 func clientFake(client cursorcloud.Client) *cursorcloudtest.Fake {
@@ -244,7 +234,8 @@ func TestCursorCloudSuccessDeleteMarksCleaned(t *testing.T) {
 			assert.Equal(t, "ok", text)
 			n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 			require.NoError(t, err)
-			assert.Equal(t, 0, n)
+			assert.Equal(t, 1, n)
+			assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
 			if mode == "nil" {
 				deleted := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
 				require.NotEmpty(t, deleted)
@@ -274,7 +265,8 @@ func TestCursorCloudDuplicateCreateBeforeCleaned(t *testing.T) {
 		}
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
-		assert.Equal(t, 0, n)
+		assert.Equal(t, 1, n)
+		assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
 	})
 	t.Run("second delete refused", func(t *testing.T) {
 		tc, _ := cursorCloudRestartFixture(t)
@@ -394,6 +386,7 @@ func TestCursorCloudRestartCleansAfterAppliedDelete(t *testing.T) {
 	const token = "launch-token-c2"
 	cursorCloudBeginToken(t, tc, job.ID, token)
 	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, "bc_already_gone"))
+	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 	fake.MethodErrors = map[string]error{
 		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
 			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",

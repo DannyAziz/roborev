@@ -168,7 +168,8 @@ func assertInProcessClear(t *testing.T, deleteErr error, cleaned bool) {
 	require.NoError(t, nerr)
 	if cleaned {
 		require.NoError(t, err)
-		assert.Equal(t, 0, n)
+		assert.Equal(t, 1, n)
+		assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
 		return
 	}
 	require.Error(t, err)

@@ -59,6 +59,44 @@ const (
 // fixture and is not used.
 var cursorCloudReconcileWindow = 60 * time.Second
 
+// cursorCloudNow is the clock for the listing-lag window. Tests replace it.
+var cursorCloudNow = time.Now
+
+// ListingLagElapsed reports whether now is at or after the listing-lag
+// window from since. The window is cursorCloudReconcileWindow: an empty
+// marker list before that age can still omit a VM, so it does not clean.
+func ListingLagElapsed(since, now time.Time) bool {
+	if since.IsZero() {
+		return false
+	}
+	return !now.Before(since.Add(cursorCloudReconcileWindow))
+}
+
+// SweepAllowsClean is the only gate for marking a launch cleaned.
+// found means this sweep deleted at least one VM, so a later empty sweep
+// is still required. byIDDeleted means every VM found so far was removed
+// by id. The empty sweep counts only once the listing-lag window has passed.
+func SweepAllowsClean(found, byIDDeleted bool, since, now time.Time) bool {
+	if found || !byIDDeleted {
+		return false
+	}
+	return ListingLagElapsed(since, now)
+}
+
+// SetCursorCloudClockForTest replaces the listing-lag clock. The returned
+// function restores the previous clock.
+func SetCursorCloudClockForTest(now func() time.Time) func() {
+	prev := cursorCloudNow
+	if now == nil {
+		now = time.Now
+	}
+	cursorCloudNow = now
+	return func() { cursorCloudNow = prev }
+}
+
+// CursorCloudNow returns the listing-lag clock.
+func CursorCloudNow() time.Time { return cursorCloudNow() }
+
 // cursorCloudReconcilePassTimeout is the one deadline shared by every
 // candidate conversation read in a reconcile pass. It is the existing
 // per-call cursorCloudDeleteTimeout reused as a budget for the whole
@@ -189,10 +227,14 @@ type CursorCloudAgent struct {
 	// NoteCleanupFailure records a stop or delete that did not finish.
 	// The launch row stays uncleaned.
 	NoteCleanupFailure func(msg string) error
-	// MarkLaunchCleaned runs after a nil or 404 delete of every VM this
-	// token could own. A partial delete, or a list that did not run, must
-	// not call it. The storage callback clears orphan_note.
+	// MarkLaunchCleaned runs only after SweepAllowsClean: every VM found
+	// for the token was deleted by id, and a later marker sweep was empty
+	// at or after the listing-lag window. The storage callback clears
+	// orphan_note.
 	MarkLaunchCleaned func(token string) error
+	// launchedAt is the listing-lag start. An empty sweep before
+	// launchedAt plus the lag window does not clean.
+	launchedAt time.Time
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -292,6 +334,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			return "", bindErr
 		}
 	}
+	a.launchedAt = cursorCloudNow()
 	marker := CursorCloudLaunchMarker(a.DaemonID, token)
 	reconcileToken := token
 	if id := strings.TrimSpace(a.DaemonID); id != "" {
@@ -618,7 +661,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 	// started only decides whether another pass begins. Each pass's
 	// conversation reads share one deadline that starts before that
 	// pass's list, so a slow list consumes it.
-	started := time.Now()
+	started := cursorCloudNow()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
 	foundLaunch := false
@@ -630,7 +673,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 			errs = appendReconcileErr(errs, err)
 			break
 		}
-		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
+		if attempt > 0 && !cursorCloudNow().Before(started.Add(cursorCloudReconcileWindow)) {
 			windowExpired = true
 			break
 		}
@@ -659,9 +702,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
-			} else if len(onCleaned) > 0 && onCleaned[0] != nil {
-				// found with no match error means every listed VM for this
-				// token was deleted with nil or 404.
+			} else if len(onCleaned) > 0 && onCleaned[0] != nil && SweepAllowsClean(found, true, started, cursorCloudNow()) {
+				// found is true here, so this sweep deleted VMs and does
+				// not clean. A later empty sweep past the lag window does.
 				if markErr := onCleaned[0](); markErr != nil {
 					errs = appendReconcileErr(errs, markErr)
 				}
@@ -891,10 +934,15 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 		return fmt.Errorf("cursor-cloud orphan risk: pending cleanup: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
-	_, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
+	found, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
 	passCancel()
 	if sweepErr != nil {
 		return sweepErr
+	}
+	// The id delete already returned nil or 404. This sweep cleans only
+	// when it found nothing and the listing-lag window has passed.
+	if !SweepAllowsClean(found, true, a.launchedAt, cursorCloudNow()) {
+		return nil
 	}
 	return a.markLaunchCleaned(token)
 }

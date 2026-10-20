@@ -40,6 +40,7 @@ func TestCursorCloudRestartStopsPersistedAgent(t *testing.T) {
 	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
 	logLine := "cursor-cloud: created agent " + created.ID + "\n"
 	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte(logLine), 0o600))
+	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
 	require.NoError(t, recoverStaleJobs(t.Context(), tc.DB, fake))
@@ -144,6 +145,7 @@ func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
+	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 
 	creates = cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
 	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
@@ -200,7 +202,7 @@ func TestCursorCloudRestartRetires404(t *testing.T) {
 	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 	_, err = fake.GetAgent(t.Context(), created.ID)
 	require.NoError(t, err, "404 means the server already dropped the agent; cleanup must not invent a second delete")
 }
@@ -231,7 +233,7 @@ func TestCursorCloudRestartKeepsUnlistedToken(t *testing.T) {
 	require.Error(t, err)
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 }
 
 // TestCursorCloudRestartKeepsTokenAcrossTwoLags is lag 2. Two restarts both
@@ -259,7 +261,7 @@ func TestCursorCloudRestartKeepsTokenAcrossTwoLags(t *testing.T) {
 	require.Error(t, err)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 }
 
 // TestCursorCloudRestartReportsUnlistedOrphan ages a token-only miss past
@@ -423,7 +425,7 @@ func TestCursorCloudRestartUsesStoredRepoIdentity(t *testing.T) {
 	assert.Equal(t, decoy.ID, got.ID)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 }
 
 type cursorCloudPanicWriter struct{}
@@ -548,6 +550,7 @@ func TestCursorCloudRestartFailsSynthesisBackupLaunch(t *testing.T) {
 	)
 	require.NoError(t, err)
 	cursorCloudPersistAttempt(t, tc, fake, synth.ID, "launch-token-synth", true)
+	cursorCloudAgeLaunchPastLag(t, tc.DB, synth.ID)
 	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
 	const logLine = "cursor-cloud: created agent bc_synth\n"
 	require.NoError(t, os.WriteFile(JobLogPath(synth.ID), []byte(logLine), 0o600))
@@ -652,12 +655,13 @@ func TestCursorCloudRestartDeletesLegacyRowWithLiveRemote(t *testing.T) {
 	require.Error(t, err)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	err = recoverStaleJobs(context.Background(), tc.DB, fake)
+	require.ErrorContains(t, err, "not listed yet")
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 	_, err = fake.GetAgent(t.Context(), created.ID)
 	require.Error(t, err)
 }
@@ -709,7 +713,7 @@ func TestCursorCloudRestartDeletesAcceptedFileHostLaunch(t *testing.T) {
 	require.Error(t, err)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 }
 
 func TestCursorCloudUpdateInterruptDoesNotRelaunch(t *testing.T) {
@@ -814,7 +818,7 @@ func TestCursorCloudRestartReaps429Create(t *testing.T) {
 	require.Error(t, err)
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, n)
 }
 
 // create429Cloud stores the launch, then answers 429. listErr withholds the
@@ -881,6 +885,7 @@ func TestCursorCloudRecoveryCleansLaunchAfterJobDelete(t *testing.T) {
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 	const token = "launch-token-deleted-job"
 	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, token, true)
+	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 	conn, err := tc.DB.Conn(t.Context())
 	require.NoError(t, err)
 	defer conn.Close()
@@ -1049,6 +1054,12 @@ func cursorCloudShowToken(t *testing.T, tc *workerTestContext, fake *cursorcloud
 func cursorCloudAgeLaunch(t *testing.T, db *storage.DB, jobID int64) {
 	t.Helper()
 	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-25 hours') WHERE job_id = ?`, jobID)
+	require.NoError(t, err)
+}
+
+func cursorCloudAgeLaunchPastLag(t *testing.T, db *storage.DB, jobID int64) {
+	t.Helper()
+	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-2 minutes') WHERE job_id = ?`, jobID)
 	require.NoError(t, err)
 }
 

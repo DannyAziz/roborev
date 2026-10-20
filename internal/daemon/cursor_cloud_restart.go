@@ -105,25 +105,39 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	if err != nil {
 		return err
 	}
-	// The saved id's delete already returned. That alone does not clean,
-	// including through MarkCloudLaunchCleanedByToken. The marker sweep
-	// must finish with no listed agent left for this token. found means
-	// every listed match was deleted; an error above means one remains.
-	if row.AgentID == "" && !found {
-		if cloudLaunchAgedOut(row.CreatedAt, time.Now().UTC()) {
-			return reportCloudLaunchOrphan(db, row)
-		}
-		return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
+	// Clean only after a by-id delete of every VM found so far and a later
+	// empty sweep at or after the listing-lag window. found means this
+	// sweep deleted a VM, so it is not that confirming empty sweep. A
+	// delete failure and an unusable repo already returned above with the
+	// orphan note still on the job. Leaving the row uncleaned keeps it.
+	now := agent.CursorCloudNow()
+	since, _ := parseCloudLaunchCreated(row.CreatedAt)
+	if agent.SweepAllowsClean(found, row.AgentID != "", since, now) {
+		return db.MarkCloudLaunchCleanedByToken(row.Token)
 	}
-	return db.MarkCloudLaunchCleanedByToken(row.Token)
+	if found {
+		return nil
+	}
+	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now) {
+		return reportCloudLaunchOrphan(db, row)
+	}
+	return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
 }
 
-func cloudLaunchAgedOut(createdAt string, now time.Time) bool {
+func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
 	created, err := time.ParseInLocation("2006-01-02 15:04:05", createdAt, time.UTC)
 	if err != nil {
 		if created, err = time.Parse(time.RFC3339, createdAt); err != nil {
-			return false
+			return time.Time{}, false
 		}
+	}
+	return created, true
+}
+
+func cloudLaunchAgedOut(createdAt string, now time.Time) bool {
+	created, ok := parseCloudLaunchCreated(createdAt)
+	if !ok {
+		return false
 	}
 	return !created.Add(cloudLaunchMaxAge).After(now)
 }
