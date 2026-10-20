@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -287,11 +288,10 @@ func TestCursorCloudDuplicateCreateBeforeCleaned(t *testing.T) {
 	})
 }
 
-// TestCursorCloudRestartSweepsDuplicateWithoutRepo deletes the saved agent
-// and the other VM that carries the same launch token when the repository
-// cannot be named. One list does not clean. Leaving the duplicate in place,
-// or skipping the sweep, fails this test.
-func TestCursorCloudRestartSweepsDuplicateWithoutRepo(t *testing.T) {
+// TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned is the
+// unusable-repository branch with a saved agent id. The marker sweep cannot
+// run. The launch stays uncleaned and the job error keeps the orphan risk.
+func TestCursorCloudRestartDuplicateWithoutRepoStaysUncleaned(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
@@ -304,15 +304,31 @@ func TestCursorCloudRestartSweepsDuplicateWithoutRepo(t *testing.T) {
 	require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, ""))
 	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, saved.ID))
 	tc.GitRepo.Run("remote", "remove", "origin")
+	var launchID int64
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT id FROM review_job_cloud_launches WHERE job_id = ? AND launch_token = ?`,
+		job.ID, token,
+	).Scan(&launchID))
+	logs := cursorCloudCaptureLog(t)
 
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	_, err = fake.GetAgent(t.Context(), saved.ID)
-	require.Error(t, err)
-	_, err = fake.GetAgent(t.Context(), dup.ID)
-	require.Error(t, err)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
+	err = recoverStaleJobs(context.Background(), tc.DB, fake)
+	_, getErr := fake.GetAgent(t.Context(), saved.ID)
+	require.Error(t, getErr)
+	got, getErr := fake.GetAgent(t.Context(), dup.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, dup.ID, got.ID)
+	n, countErr := tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, countErr)
 	assert.Equal(t, 1, n)
+	assert.Contains(t, logs.String(), fmt.Sprintf(
+		"cursor-cloud: cleanup job %d launch %d: cursor-cloud: launch %d has no repository to sweep",
+		job.ID, launchID, launchID,
+	))
+	var storedErr string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&storedErr))
+	assert.Contains(t, storedErr, "orphan risk")
+	assert.NotContains(t, storedErr, "orphan_warning")
+	require.Error(t, err)
 }
 
 // TestCursorCloudRestartCleansAfterAppliedDelete is C2. The delete already

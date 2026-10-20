@@ -103,16 +103,20 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		repoURL = config.StripURLCredentials(git.GetRemoteURL(row.RepoPath, ""))
 	}
 	if !agent.CursorCloudRepoUsable(repoURL) {
-		// The repository cannot select a list filter. The token is unique,
-		// so the marker sweep still deletes by id. This list is not a later
-		// pass. A saved-id or token-only miss is noted once the launch is
-		// aged out, including when the list was non-empty.
-		found, err := agent.DeleteCursorCloudLaunchByToken(ctx, client, daemonID, row.Token)
-		if err != nil {
-			// The sweep did not confirm a delete. Note that before returning.
-			return errors.Join(err, noteUnconfirmedCloudDelete(db, row))
+		// A saved id was deleted above. Another VM from the same token is
+		// only visible to the marker sweep, so the row stays uncleaned.
+		// Nothing is listed or deleted by token alone, and nothing is
+		// cleaned, by token or by scope.
+		if row.AgentID != "" {
+			return errors.Join(
+				fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID),
+				reportCloudLaunchOrphan(db, row, cleanDelay),
+			)
 		}
-		return holdListedSweep(db, row, found, seen, noted, cleanDelay, true)
+		// Nothing to list, so this is not list lag. A token-only row can still
+		// have a live VM. Surface the orphan on this start and every later
+		// start. A failed note write is returned.
+		return reportCloudLaunchOrphan(db, row, cleanDelay)
 	}
 	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
 	if err != nil {
@@ -125,7 +129,7 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 		found = found || again
 	}
-	return holdListedSweep(db, row, found, seen, noted, cleanDelay, false)
+	return holdListedSweep(db, row, found, seen, noted, cleanDelay)
 }
 
 func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bool, cleanDelay time.Duration) error {
@@ -137,7 +141,7 @@ func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bo
 	return reportCloudLaunchOrphan(db, row, cleanDelay)
 }
 
-func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted bool, cleanDelay time.Duration, unusable bool) error {
+func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted bool, cleanDelay time.Duration) error {
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
 	if noted && agent.SweepAllowsClean(found, row.AgentID != "", seen, since, now, cleanDelay) {
@@ -145,15 +149,6 @@ func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted
 	}
 	if err := db.NoteCloudLaunchSweep(row.ID); err != nil {
 		return err
-	}
-	if unusable {
-		if !found || cloudLaunchAgedOut(row.CreatedAt, now, cleanDelay) {
-			return reportCloudLaunchOrphan(db, row, cleanDelay)
-		}
-		if err := db.NoteCloudLaunchRisk(row.JobID, agent.CursorCloudPendingOrphanNote()); err != nil {
-			return err
-		}
-		return nil
 	}
 	if row.AgentID == "" && cloudLaunchAgedOut(row.CreatedAt, now, cleanDelay) {
 		// Aged out with or without listed agents. The note is not limited
@@ -167,10 +162,6 @@ func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted
 		return nil
 	}
 	return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
-}
-
-func noteUnconfirmedCloudDelete(db *storage.DB, row storage.CloudLaunch) error {
-	return db.NoteCloudLaunchRisk(row.JobID, agent.CursorCloudPendingOrphanNote())
 }
 
 // persistedCleanNote reports whether a previous pass already stored the

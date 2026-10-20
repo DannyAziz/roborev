@@ -627,10 +627,10 @@ func TestCursorCloudRestartUsesStoredIdentityWithoutRemote(t *testing.T) {
 }
 
 // TestCursorCloudRestartNotesLegacyGoneRemote is the pin for a token-only
-// row stored before repo_identity existed. The checkout remote is gone.
-// The marker sweep lists and finds no agent. Every start surfaces the
-// orphan and leaves the row uncleaned. Cleaning the row, or skipping the
-// list, fails this test.
+// row stored before repo_identity existed. The checkout remote is gone, so
+// recovery cannot list. Every start surfaces the orphan marker and leaves
+// the row uncleaned. A silent success, or a sweep error with no marker,
+// fails this test.
 func TestCursorCloudRestartNotesLegacyGoneRemote(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -644,8 +644,7 @@ func TestCursorCloudRestartNotesLegacyGoneRemote(t *testing.T) {
 
 // TestCursorCloudRestartNotesLegacyUnusableRepo is the same pin when the
 // stored checkout itself cannot be read. repo_identity is empty and the
-// repo path is not a git checkout. The sweep lists, finds nothing, and
-// notes the orphan.
+// repo path is not a git checkout, so there is still nothing to list.
 func TestCursorCloudRestartNotesLegacyUnusableRepo(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -1124,69 +1123,13 @@ func cursorCloudAssertLegacySweepOrphan(t *testing.T, tc *workerTestContext, fak
 		assert.Contains(updated.Error, storage.CloudLaunchInterruptedError)
 	}
 	assert.Contains(logs.String(), "orphan risk")
-	assert.NotEmpty(cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
+	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
 	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-}
-
-// TestCursorCloudRestartDeletesFileURLLaunch is the pin for a token stored
-// with file:///. The checkout remote is that same URL, so it cannot filter
-// the list. A matching agent is deleted and the row is cleaned. Skipping
-// the sweep leaves the agent in place.
-func TestCursorCloudRestartDeletesFileURLLaunch(t *testing.T) {
-	cursorCloudAssertUnusableMatchDeleted(t, "file:///", "launch-token-file-url")
-}
-
-// TestCursorCloudRestartDeletesPathlessHTTPSLaunch is the pin for a token
-// stored with a pathless https URL. The sweep deletes the matching agent
-// and cleans the row.
-func TestCursorCloudRestartDeletesPathlessHTTPSLaunch(t *testing.T) {
-	cursorCloudAssertUnusableMatchDeleted(t, "https://example.com", "launch-token-pathless-https")
-}
-
-// TestCursorCloudRestartDeletesLegacyGoneRemoteLaunch is the pin for a
-// token-only row from before repo_identity existed, once the checkout
-// remote is gone. The matching agent is deleted and the row is cleaned.
-func TestCursorCloudRestartDeletesLegacyGoneRemoteLaunch(t *testing.T) {
-	cursorCloudAssertUnusableMatchDeleted(t, "", "launch-token-legacy-gone-match")
-}
-
-// TestCursorCloudRestartNotesUnusableMiss is the pin for a token whose
-// repository cannot be listed and whose marker is not on any listed agent.
-// The sweep runs. The row stays uncleaned and the orphan is noted. Skipping
-// the list, or cleaning the miss, fails this test.
-func TestCursorCloudRestartNotesUnusableMiss(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-unusable-miss"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ? WHERE job_id = ?`, "file:///", job.ID)
-	require.NoError(t, err)
-	tc.GitRepo.Run("remote", "remove", "origin")
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	other := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), "launch-token-someone-else")) //nolint:forbidigo // launch marker is prompt text
-	logs := cursorCloudCaptureLog(t)
-
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	got, err := fake.GetAgent(t.Context(), other.ID)
-	require.NoError(t, err)
-	assert := assert.New(t)
-	assert.Equal(other.ID, got.ID)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(1, n)
-	assert.NotEmpty(cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
-	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	assert.Contains(logs.String(), "orphan risk")
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Contains(updated.Error, "orphan risk")
 }
 
 // TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged is the saved-id
-// miss on an unusable repository. One empty sweep does not clean. Once the
-// launch is aged out the orphan note is written. Dropping that note because
+// miss on an unusable repository. Nothing is listed and nothing is
+// cleaned. Once the launch is aged out the orphan note is written. Dropping that note because
 // the saved id was deleted, which is what the old unusable-repo branch did,
 // fails this test.
 func TestUnconfirmedDeleteNoteMatrix(t *testing.T) {
@@ -1268,7 +1211,7 @@ func TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "has no repository to sweep")
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
@@ -1277,31 +1220,59 @@ func TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged(t *testing.T) {
 	assert.Contains(t, jobErr, "was not listed within")
 }
 
-func cursorCloudAssertUnusableMatchDeleted(t *testing.T, identity, token string) {
+// TestCursorCloudRestartUnusableRepoNeverCleans is the unusable-repo pin.
+// The saved id was deleted, an earlier pass already listed the launch and
+// noted the orphan, and the launch is past the delay. Without a repository
+// the row still stays uncleaned, the orphan is reported, and recovery
+// returns the sweep error. Cleaning by token on this path fails this test.
+func TestCursorCloudRestartUnusableRepoNeverCleans(t *testing.T) {
+	tc, fake, job := cursorCloudUnusableConfirmingSweep(t, "launch-token-unusable-never-clean")
+
+	for range 2 {
+		err := recoverStaleJobs(context.Background(), tc.DB, fake)
+		require.ErrorContains(t, err, "has no repository to sweep")
+		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
+	}
+	var jobErr string
+	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
+	assert.Contains(t, jobErr, "orphan risk")
+}
+
+// TestCursorCloudRestartUnusableRepoNoteWriteFailureReturnsError pins the
+// orphan report on the unusable-repo path. A trigger aborts the job note
+// write. Recovery returns that error and the row stays uncleaned. Cleaning
+// instead of writing the note, or dropping the write error, fails this test.
+func TestCursorCloudRestartUnusableRepoNoteWriteFailureReturnsError(t *testing.T) {
+	tc, fake, job := cursorCloudUnusableConfirmingSweep(t, "launch-token-unusable-note-fail")
+	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_unusable_note
+		BEFORE UPDATE OF error ON review_jobs
+		WHEN NEW.error LIKE '%orphan risk%'
+		BEGIN
+			SELECT RAISE(ABORT, 'note write failed');
+		END`)
+	require.NoError(t, err)
+
+	err = recoverCloudLaunches(context.Background(), tc.DB, fake, nil)
+	require.ErrorContains(t, err, "note write failed")
+	assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
+}
+
+// cursorCloudUnusableConfirmingSweep sets up a saved-id launch whose
+// repository cannot be listed, in the state where a usable repository's
+// empty sweep would clean: aged out, already listed, and already noted.
+func cursorCloudUnusableConfirmingSweep(t *testing.T, token string) (*workerTestContext, *cursorcloudtest.Fake, *storage.ReviewJob) {
 	t.Helper()
-	require.False(t, agent.CursorCloudRepoUsable(identity))
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudBeginToken(t, tc, job.ID, token)
-	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ? WHERE job_id = ?`, identity, job.ID)
+	cursorCloudPersistAttempt(t, tc, fake, job.ID, token, true)
+	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ?, sweep_seen = 1 WHERE job_id = ?`, "file:///", job.ID)
 	require.NoError(t, err)
-	if identity == "" {
-		tc.GitRepo.Run("remote", "remove", "origin")
-	} else {
-		tc.GitRepo.Run("remote", "set-url", "origin", identity)
-	}
-	machineID, err := tc.DB.GetMachineID()
+	tc.GitRepo.Run("remote", "remove", "origin")
+	_, err = tc.DB.Exec(`UPDATE review_jobs SET error = ? WHERE id = ?`, agent.CursorCloudPendingOrphanNote(), job.ID)
 	require.NoError(t, err)
-	created := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
-
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	cursorCloudAgeLaunch(t, tc.DB, job.ID)
+	return tc, fake, job
 }
 
 func cursorCloudBeginToken(t *testing.T, tc *workerTestContext, jobID int64, token string) {

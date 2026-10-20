@@ -703,7 +703,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		var found bool
 		var matchErr error
 		if err == nil {
-			found, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output, false)
+			found, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output)
 		}
 		passCancel()
 		if err != nil {
@@ -891,7 +891,7 @@ func MarkCursorCloudSent(err error) error {
 	return cursorCloudNonRetryable(err)
 }
 
-func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer, anyRepo bool) (bool, error) {
+func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
 	var errs []error
 	found := false
 	for _, ag := range agents {
@@ -899,9 +899,7 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 			errs = append(errs, err)
 			break
 		}
-		// anyRepo is the restart path for a token whose repository cannot be
-		// named. The token is unique, so the marker is enough to delete by id.
-		if !anyRepo && !sameCursorCloudRepo(repoURL, ag.SourceRepository) {
+		if !sameCursorCloudRepo(repoURL, ag.SourceRepository) {
 			continue
 		}
 		text, promptErr := client.UserPrompt(ctx, ag.ID)
@@ -952,7 +950,7 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 		return fmt.Errorf("cursor-cloud orphan risk: pending cleanup: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
-	found, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output, false)
+	found, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
 	passCancel()
 	if sweepErr != nil {
 		return sweepErr
@@ -985,22 +983,6 @@ func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Cli
 	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || !CursorCloudRepoUsable(repoURL) {
 		return false, errors.New("cursor-cloud: cleanup marker is incomplete")
 	}
-	return deleteCursorCloudLaunchByMarker(ctx, client, daemonID, token, repoURL, false)
-}
-
-// DeleteCursorCloudLaunchByToken lists agents and deletes every one whose
-// prompt contains this daemon's marker for token. The token is unique per
-// launch, so a file URL, a pathless https URL, or a missing remote does not
-// skip the sweep. Callers still require a usable repository for
-// DeleteCursorCloudLaunchByMarker, which also matches the source.
-func DeleteCursorCloudLaunchByToken(ctx context.Context, client cursorcloud.Client, daemonID, token string) (bool, error) {
-	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" {
-		return false, errors.New("cursor-cloud: cleanup marker is incomplete")
-	}
-	return deleteCursorCloudLaunchByMarker(ctx, client, daemonID, token, "", true)
-}
-
-func deleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string, anyRepo bool) (bool, error) {
 	listCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 	agents, err := client.ListAgents(listCtx)
 	cancel()
@@ -1009,7 +991,7 @@ func deleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Cli
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	return deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil, anyRepo)
+	return deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
 }
 
 func sameCursorCloudRepo(want, got string) bool {
