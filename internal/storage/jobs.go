@@ -1801,7 +1801,7 @@ func (db *DB) FailoverJob(jobID int64, workerID, backupAgent, backupModel string
 		    worker_id = NULL,
 		    started_at = NULL,
 		    finished_at = NULL,
-		    error = NULL,
+		    error = CASE WHEN instr(COALESCE(error, ''), 'orphan risk') > 0 THEN error ELSE NULL END,
 		    session_id = NULL,
 		    session_resumed = 0,
 		    resume_source_job_uuid = NULL,

@@ -160,6 +160,29 @@ func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
 	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 }
 
+// TestCursorCloudRestartDeleteFailureNotesJob is a restart delete that is
+// refused. The failure is not only a log line: the job error keeps the
+// orphan risk and the launch stays uncleaned.
+func TestCursorCloudRestartDeleteFailureNotesJob(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-restart-403", true)
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusForbidden, Message: "forbidden",
+		},
+	}
+
+	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, updated.Error, "orphan risk")
+}
+
 // TestCursorCloudRestartRetires404 marks cleanup done when delete reports
 // the agent is already gone, and not when delete fails.
 func TestCursorCloudRestartRetires404(t *testing.T) {

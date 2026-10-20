@@ -147,6 +147,39 @@ func TestProcessJobCursorCloudDoesNotRepost(t *testing.T) {
 	}
 }
 
+// TestCursorCloudDeleteForbiddenKeepsOrphanNoteThroughFailover is a 403
+// delete. The backup still runs, and the job error keeps the orphan risk
+// after failover and after that backup finishes.
+func TestCursorCloudDeleteForbiddenKeepsOrphanNoteThroughFailover(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "test-key")
+	tc, fake := cursorCloudRestartFixture(t)
+	fake.CreateStatus = cursorcloud.StatusFinished
+	fake.Final = cursorCloudPassJSON
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusForbidden, Message: "forbidden",
+		},
+	}
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	job.BackupAgent = "test"
+
+	tc.Pool.processJob(testWorkerID, job)
+
+	queued := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", queued.Agent)
+	assert.Contains(t, queued.Error, "orphan risk")
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	done := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	assert.Contains(t, done.Error, "orphan risk")
+}
+
 // TestSynthesisCursorCloudLaunchIsNotRetried pins the non-host synthesis
 // path. Formatting that error with %v drops ErrCursorCloudNonRetryable, and
 // the job is queued for another agent run.

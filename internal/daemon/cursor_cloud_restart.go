@@ -71,7 +71,8 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	if row.AgentID != "" {
 		log.Printf("cursor-cloud: stop interrupted agent %s for job %d", row.AgentID, row.JobID)
 		if err := agent.StopAndDeleteCursorCloudAgent(client, row.AgentID); err != nil {
-			return err
+			msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup for agent %s: %v", row.AgentID, err)
+			return errors.Join(err, db.NoteCloudLaunchRisk(row.JobID, msg))
 		}
 	}
 	if row.TokenNull || row.Token == "" {
@@ -88,7 +89,10 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		// A saved id was deleted above. Another VM from the same token is
 		// only visible to the marker sweep, so the row stays uncleaned.
 		if row.AgentID != "" {
-			return fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID)
+			return errors.Join(
+				fmt.Errorf("cursor-cloud: launch %d has no repository to sweep", row.ID),
+				reportCloudLaunchOrphan(db, row),
+			)
 		}
 		// Nothing to list, so this is not list lag. A token-only row can still
 		// have a live VM. Surface the orphan on this start and every later
