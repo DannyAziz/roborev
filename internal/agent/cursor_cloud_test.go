@@ -1197,6 +1197,57 @@ func TestCursorCloudConflictFinishedStopStaysQuiet(t *testing.T) {
 	assert.Equal(t, 1, deleteCount(fake))
 }
 
+// TestCursorCloudServerStopAlreadyStoppedStaysQuiet is a 5xx stop that says
+// the agent is already stopped. The status is not in the quiet set; the
+// "already" text is what keeps it out of the review output.
+func TestCursorCloudServerStopAlreadyStoppedStaysQuiet(t *testing.T) {
+	fake := &cursorcloudtest.Fake{
+		CreateStatus: cursorcloud.StatusFinished,
+		Final:        "ok",
+		MethodErrors: map[string]error{
+			cursorcloudtest.MethodStop: &cursorcloud.APIError{
+				Op: "stop agent", StatusCode: http.StatusInternalServerError, Message: "agent already stopped",
+			},
+		},
+	}
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	out := &bytes.Buffer{}
+	_, err := (&CursorCloudAgent{
+		Client: fake, RepoURL: "https://example.com/acme/repo.git",
+	}).Review(context.Background(), t.TempDir(), "0123456789abcdef0123456789abcdef01234567", "prompt", out)
+	require.NoError(t, err)
+	assert.NotContains(t, out.String(), "stop agent")
+	assert.NotContains(t, logs.String(), "stop agent")
+	assert.Equal(t, 1, deleteCount(fake))
+}
+
+// TestCursorCloudPlainStopAlreadyFinishedStaysQuiet is a stop error that is
+// not an API status. "already finished" is enough to keep it quiet.
+func TestCursorCloudPlainStopAlreadyFinishedStaysQuiet(t *testing.T) {
+	fake := &cursorcloudtest.Fake{
+		CreateStatus: cursorcloud.StatusFinished,
+		Final:        "ok",
+		MethodErrors: map[string]error{
+			cursorcloudtest.MethodStop: errors.New("agent already finished"),
+		},
+	}
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	out := &bytes.Buffer{}
+	_, err := (&CursorCloudAgent{
+		Client: fake, RepoURL: "https://example.com/acme/repo.git",
+	}).Review(context.Background(), t.TempDir(), "0123456789abcdef0123456789abcdef01234567", "prompt", out)
+	require.NoError(t, err)
+	assert.NotContains(t, out.String(), "stop agent")
+	assert.NotContains(t, logs.String(), "stop agent")
+	assert.Equal(t, 1, deleteCount(fake))
+}
+
 func TestCursorCloudStopHangStillDeletes(t *testing.T) {
 	prev := cursorCloudDeleteTimeout
 	cursorCloudDeleteTimeout = 150 * time.Millisecond
@@ -1356,6 +1407,15 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 	assert.False(sameCursorCloudRepo("https://github.com/acme/widgets.git", "://"))
 	// main does not fold www.github.com, so this host keeps path case.
 	assert.False(sameCursorCloudRepo("https://www.github.com/Org/Repo", "https://www.github.com/org/repo"))
+	// A port on github.com is still that host, so the path case folds.
+	assert.True(sameCursorCloudRepo(
+		"https://github.com:443/Acme/Widgets.git",
+		"https://github.com:443/acme/widgets",
+	))
+	assert.Equal(
+		"https://github.com:443/acme/widgets",
+		config.RemoteIdentity("https://GitHub.com:443/Acme/Widgets.git"),
+	)
 }
 
 func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
@@ -1863,6 +1923,21 @@ func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
 // TestCursorCloudReconcileWindowOutlastsHalfSecond keeps the default 60s
 // window. The launch shows up after 600ms, which is past a 500ms window and
 // inside 60s. The first list that can see it is the one at 750ms.
+// TestReconcileListKeepsItsOwnTimeout is the first list. The review context
+// is already canceled, and the list still has the 60s metadata deadline
+// instead of that canceled context.
+func TestReconcileListKeepsItsOwnTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client := &listDeadlineCloud{}
+		err := reconcileCursorCloudLaunch(ctx, client, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		assert.True(t, client.hasDeadline)
+		assert.Equal(t, cursorCloudDeleteTimeout, client.remain)
+	})
+}
+
 func TestCursorCloudReconcileWindowOutlastsHalfSecond(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const repo = "https://github.com/acme/widgets.git"
@@ -1962,6 +2037,30 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 			assert.Equal(t, 1, creates)
 		})
 	}
+}
+
+type listDeadlineCloud struct {
+	hasDeadline bool
+	remain      time.Duration
+}
+
+func (c *listDeadlineCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, errors.New("unused")
+}
+func (c *listDeadlineCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+func (c *listDeadlineCloud) FinalMessage(context.Context, string) (string, error) { return "", nil }
+func (c *listDeadlineCloud) UserPrompt(context.Context, string) (string, error)   { return "", nil }
+func (c *listDeadlineCloud) StopAgent(context.Context, string) error              { return nil }
+func (c *listDeadlineCloud) DeleteAgent(context.Context, string) error            { return nil }
+func (c *listDeadlineCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	deadline, ok := ctx.Deadline()
+	c.hasDeadline = ok
+	if ok {
+		c.remain = time.Until(deadline)
+	}
+	return nil, &cursorcloud.APIError{Op: "list agents", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
 }
 
 type lateWindowCloud struct {
