@@ -1614,7 +1614,7 @@ func (db *DB) migrate() error {
 // keeps its rows; a duplicate column means this process already migrated.
 func (db *DB) ensureCloudLaunchTable() error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
-		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES review_jobs(id) ON DELETE CASCADE,
+		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL,
 		launch_token TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
 		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
 		sweep_seen INTEGER NOT NULL DEFAULT 0)`); err != nil {

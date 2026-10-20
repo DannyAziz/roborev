@@ -1756,4 +1756,90 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 		WHERE NOT cleaned AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
 		log.Printf("cursor-cloud: orphan note backfill: %v", err)
 	}
+	p.dropCloudLaunchJobFK(ctx)
+}
+
+// dropCloudLaunchJobFK removes a job foreign key left by an older
+// CREATE TABLE ... ON DELETE CASCADE. CREATE TABLE IF NOT EXISTS does not
+// alter that constraint, so deleting the job would drop the launch row.
+func (p *PgPool) dropCloudLaunchJobFK(ctx context.Context) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT c.conname
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = $1
+		  AND t.relname = 'review_job_cloud_launches'
+		  AND c.contype = 'f'`, pgSchemaName)
+	if err != nil {
+		log.Printf("cursor-cloud: launch foreign key: %v", err)
+		return
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			log.Printf("cursor-cloud: launch foreign key: %v", err)
+			return
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cursor-cloud: launch foreign key: %v", err)
+		return
+	}
+	table := pgx.Identifier{pgSchemaName, "review_job_cloud_launches"}.Sanitize()
+	for _, name := range names {
+		stmt := "ALTER TABLE " + table + " DROP CONSTRAINT " + pgx.Identifier{name}.Sanitize()
+		if _, err := p.pool.Exec(ctx, stmt); err != nil {
+			log.Printf("cursor-cloud: drop launch foreign key: %v", err)
+		}
+	}
+}
+
+// DeleteRepo removes a mirrored repository. An uncleaned launch row blocks
+// the delete on every path. Cascade deletes jobs and does not delete launch rows.
+func (p *PgPool) DeleteRepo(ctx context.Context, repoID int64, cascade bool) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var jobCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM review_jobs WHERE repo_id = $1`, repoID).Scan(&jobCount); err != nil {
+		return err
+	}
+	var liveLaunches int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM review_job_cloud_launches
+		WHERE NOT cleaned AND job_id IN (SELECT id FROM review_jobs WHERE repo_id = $1)`, repoID).Scan(&liveLaunches); err != nil {
+		return err
+	}
+	if liveLaunches > 0 {
+		return ErrRepoHasCloudLaunch
+	}
+	if !cascade && jobCount > 0 {
+		return ErrRepoHasJobs
+	}
+	if cascade {
+		for _, stmt := range []string{
+			`DELETE FROM responses WHERE job_uuid IN (SELECT uuid FROM review_jobs WHERE repo_id = $1)`,
+			`DELETE FROM reviews WHERE job_uuid IN (SELECT uuid FROM review_jobs WHERE repo_id = $1)`,
+			`DELETE FROM review_jobs WHERE repo_id = $1`,
+			`DELETE FROM commits WHERE repo_id = $1`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, repoID); err != nil {
+				return err
+			}
+		}
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM repos WHERE id = $1`, repoID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return tx.Commit(ctx)
 }
