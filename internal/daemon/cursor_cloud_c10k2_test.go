@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,6 +38,27 @@ func TestNoUsableRepoPathDoesNotCleanByKey(t *testing.T) {
 	updated, err := tc.DB.GetJobByID(job.ID)
 	require.NoError(t, err)
 	assert.Contains(t, updated.Error, "orphan risk")
+}
+
+// TestCreate429LeavesUnconfirmedLaunchUncleaned is the pin for a create that
+// returns 429 after the VM is stored. Cleaning on that status, before the
+// reconcile list confirms a delete, drops a launch that is still up.
+func TestCreate429LeavesUnconfirmedLaunchUncleaned(t *testing.T) {
+	tc, _ := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	fake := &cursorcloudtest.Fake{}
+	script := &list429Script{Fake: fake, retryAfter: time.Millisecond, always: true}
+
+	_, err := newBoundCloud(t, tc, job, script).Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
+	require.Error(t, err)
+	assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
+	script.mu.Lock()
+	id := script.createdID
+	script.mu.Unlock()
+	got, getErr := fake.GetAgent(t.Context(), id)
+	require.NoError(t, getErr)
+	assert.Equal(t, id, got.ID)
 }
 
 // TestRestartMarkerListErrorDoesNotClean is the pin for the restart sweep's
