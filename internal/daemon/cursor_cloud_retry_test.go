@@ -290,6 +290,9 @@ func TestProcessJobCursorCloudMalformedJSONDoesNotRelaunch(t *testing.T) {
 	t.Cleanup(func() { agent.Register(prev) })
 
 	wtc := newWorkerTestContext(t, 1)
+	// The pool default waits before a retry can be claimed. ClaimJob then
+	// returns nil and this loop stops after one create.
+	wtc.Pool.retryBackoff = 0
 	sha := testutil.GetHeadSHA(t, wtc.TmpDir)
 	job := wtc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 	originalID := job.ID
