@@ -39,15 +39,15 @@ func RunAgentReview(
 	}
 	if !jsontext.Value([]byte(raw)).IsValid() {
 		if noVerdict := NoVerdict(raw); noVerdict != nil {
-			return ReviewResult{}, noVerdict
+			return ReviewResult{}, sentCloudLaunch(a, noVerdict)
 		}
 	}
 	structured, err := DecodeStructuredReview(jsontext.Value(raw))
 	if err != nil {
-		return ReviewResult{}, err
+		return ReviewResult{}, sentCloudLaunch(a, err)
 	}
 	if err := validateLiveDocument(a.Name(), structured); err != nil {
-		return ReviewResult{}, err
+		return ReviewResult{}, sentCloudLaunch(a, err)
 	}
 	output := structured.Markdown(minSeverity)
 	if out != nil {
@@ -60,4 +60,13 @@ func RunAgentReview(
 		StructuredOutput: append(jsontext.Value(nil), raw...),
 		MinSeverity:      minSeverity,
 	}, nil
+}
+
+// sentCloudLaunch marks a failure after a cursor-cloud create returned.
+// The launch already happened, so the worker must not start another one.
+func sentCloudLaunch(a agent.Agent, err error) error {
+	if a == nil || a.Name() != agent.CursorCloudHost {
+		return err
+	}
+	return agent.MarkCursorCloudSent(err)
 }

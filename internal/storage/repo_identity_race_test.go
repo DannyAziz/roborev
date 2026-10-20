@@ -13,6 +13,7 @@ import (
 )
 
 func TestAdoptCanonicalZeroRowsRereadsCanonical(t *testing.T) {
+	t.Parallel()
 	stored := "https://github.com/Acme/Widgets.git"
 	canonical := config.RemoteIdentity(stored)
 	require.NotEqual(t, stored, canonical)
@@ -41,7 +42,7 @@ func (r scanRow) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	*(dest[0].(*int64)) = r.id
+	*dest[0].(*int64) = r.id
 	return nil
 }
 

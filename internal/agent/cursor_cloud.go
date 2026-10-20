@@ -44,10 +44,10 @@ const (
 	cursorCloudReconcileBackoff = 50 * time.Millisecond
 )
 
-// cursorCloudReconcileWindow is how long a lost create keeps starting
-// another list after the first. The first list still runs when the
-// review context is already done. The window does not cancel a list or
-// conversation call that has already started.
+// cursorCloudReconcileWindow bounds every reconcile pass after a create
+// was sent. Polling uses context.WithoutCancel plus this timeout, so a
+// caller deadline or cancel cannot skip a later list. It is the same
+// length as cursorCloudDeleteTimeout.
 //
 // 60s is an existing policy value nobody has checked against a measured
 // publish lag. It is the same length as cursorcloud's defaultRequestTimeout
@@ -63,12 +63,11 @@ var cursorCloudReconcileWindow = 60 * time.Second
 var cursorCloudReconcilePassTimeout = cursorCloudDeleteTimeout
 
 // cursorCloudDeleteTimeout bounds one stop, one DELETE, one reconcile list,
-// or one reconcile conversation read. The first reconcile list and the
-// delete it triggers use this timeout on context.Background, so a review
-// context that is already done cannot skip them. Later attempts use the
-// review context and stop when it is done. A stop that never answers must
-// not cancel the deletes. 60s matches the cursorcloud client's
-// defaultRequestTimeout, its one deadline for a metadata call.
+// or one reconcile conversation read. Reconcile passes run on a context
+// detached from the review, so a review context that is already done
+// cannot skip a later list. A stop that never answers must not cancel
+// the deletes. 60s matches the cursorcloud client's defaultRequestTimeout,
+// its one deadline for a metadata call.
 var cursorCloudDeleteTimeout = 60 * time.Second
 
 const (
@@ -266,6 +265,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// stripped of userinfo. The marker lets a create that fails after send
 	// be found by listing agents and reading the conversation.
 	token := newLaunchToken()
+	if err := ctx.Err(); err != nil {
+		// Already done before CreateAgent. The POST was not sent.
+		refund()
+		return "", err
+	}
 	if a.BindLaunch != nil {
 		if bindErr := a.BindLaunch(token, repoURL); bindErr != nil {
 			refund()
@@ -541,31 +545,34 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// started gates the next list only. A list already running keeps its
-	// own timeout. Each pass's conversation reads share one deadline that
-	// starts before that pass's list, so a slow list consumes it.
+	// The create was sent. Every pass, including the wait between lists,
+	// uses a context the caller's deadline and cancel cannot finish.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorCloudReconcileWindow)
+	defer cancel()
+	// started only decides whether another pass begins. Each pass's
+	// conversation reads share one deadline that starts before that
+	// pass's list, so a slow list consumes it.
 	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
 	foundLaunch := false
+	windowExpired := false
 	backoff := cursorCloudReconcileBackoff
 	for attempt := 0; ; attempt++ {
-		// The review context stops later attempts only. The first list
-		// runs even when that context is already canceled or expired.
-		base := ctx
-		if attempt == 0 {
-			base = context.Background()
-		} else if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+		if err := ctx.Err(); err != nil {
+			windowExpired = true
+			errs = appendReconcileErr(errs, err)
+			break
 		}
 		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
+			windowExpired = true
 			break
 		}
 		// Start the 60s before ListAgents. One clock for the whole
 		// reconcile would already be spent by earlier passes, and starting
 		// it after the list returns would hide the list's duration.
-		passCtx, passCancel := context.WithTimeout(base, cursorCloudReconcilePassTimeout)
-		listCtx, listCancel := context.WithTimeout(base, cursorCloudDeleteTimeout)
+		passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
+		listCtx, listCancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 		agents, err := client.ListAgents(listCtx)
 		listCancel()
 		var found bool
@@ -595,7 +602,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 			}
 		}
 		if err := waitCursorCloud(ctx, backoff); err != nil {
-			return errors.Join(append(errs, err)...)
+			windowExpired = true
+			errs = appendReconcileErr(errs, err)
+			break
 		}
 		backoff *= 2
 		if backoff > cursorCloudReconcileBackoffMax {
@@ -603,6 +612,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		}
 	}
 	if !foundLaunch {
+		if windowExpired {
+			writeCursorCloudCleanupNote(output, "cursor-cloud: reconcile window expired before the launch was found")
+		}
 		errs = appendReconcileErr(errs, errors.New("cursor-cloud: reconcile did not find the launch"))
 	}
 	return errors.Join(errs...)
@@ -621,8 +633,27 @@ func appendReconcileErr(errs []error, err error) []error {
 }
 
 func cursorCloudRateLimited(err error) bool {
-	apiErr, ok := errors.AsType[*cursorcloud.APIError](err)
-	return ok && apiErr != nil && apiErr.StatusCode == http.StatusTooManyRequests
+	// errors.As stops at the first APIError. A 429 joined after a 500
+	// still has to stop the reconcile, whichever sibling is first.
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*cursorcloud.APIError); ok { //nolint:errorlint // walk every joined sibling; errors.As returns only the first APIError
+		return apiErr != nil && apiErr.StatusCode == http.StatusTooManyRequests
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		return slices.ContainsFunc(joined.Unwrap(), cursorCloudRateLimited)
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return cursorCloudRateLimited(wrapped.Unwrap())
+	}
+	return false
+}
+
+// MarkCursorCloudSent marks a failure after CreateAgent was sent. The
+// worker must not POST /v0/agents again for this attempt.
+func MarkCursorCloudSent(err error) error {
+	return cursorCloudNonRetryable(err)
 }
 
 func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {

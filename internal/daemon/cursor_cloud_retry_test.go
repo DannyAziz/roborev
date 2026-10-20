@@ -19,6 +19,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/cursorcloud"
+	"go.kenn.io/roborev/internal/cursorcloud/cursorcloudtest"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
@@ -231,6 +232,51 @@ func TestProcessJobCursorCloudDeadlineCheckStandsAlone(t *testing.T) {
 	require.NoError(t, claimErr)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "test", claimed.Agent)
+}
+
+// A finished cloud review whose text is not a structured document must
+// not launch again. One job, one CreateAgent.
+func TestProcessJobCursorCloudDecodeDoesNotRelaunch(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
+	const repo = "https://example.com/acme/repo.git"
+	fake := &cursorcloudtest.Fake{
+		CreateStatus: cursorcloud.StatusFinished,
+		Final:        `{"not_a_review":true}`,
+	}
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.CursorCloudAgent{Client: fake, RepoURL: repo})
+	t.Cleanup(func() { agent.Register(prev) })
+
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	job.BackupAgent = "test"
+
+	for range maxRetries + 2 {
+		if job.Agent != agent.CursorCloudHost {
+			break
+		}
+		tc.Pool.processJob(testWorkerID, job)
+		next, claimErr := tc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, claimErr)
+		if next == nil {
+			break
+		}
+		job = next
+	}
+	assert.Equal(t, 1, createCountFromFake(fake))
+	assert.NotEqual(t, agent.CursorCloudHost, job.Agent)
+}
+
+func createCountFromFake(fake *cursorcloudtest.Fake) int {
+	n := 0
+	for _, call := range fake.Calls() {
+		if call.Method == cursorcloudtest.MethodCreate {
+			n++
+		}
+	}
+	return n
 }
 
 func TestCursorCloudPreLaunchValidationCanFailOver(t *testing.T) {

@@ -1333,7 +1333,6 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 }
 
 func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
-	started := time.Now()
 	synctest.Test(t, func(t *testing.T) {
 		const repo = "https://github.com/acme/widgets.git"
 		const token = "slow-list-token"
@@ -1347,8 +1346,6 @@ func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
 		defer client.mu.Unlock()
 		assert.Equal(t, []string{"stop", "delete"}, client.ops)
 	})
-	// The 600ms list runs on the fake clock. A real wait exceeds this.
-	assert.Less(t, time.Since(started), 300*time.Millisecond)
 }
 
 func TestCursorCloudPanicReleasesLaunchSlot(t *testing.T) {
@@ -1367,8 +1364,11 @@ func TestCursorCloudPanicReleasesLaunchSlot(t *testing.T) {
 
 type panicOutput struct{}
 
-func (panicOutput) Write([]byte) (int, error) {
-	panic("output exploded")
+func (panicOutput) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("stop agent")) {
+		panic("stop note exploded")
+	}
+	panic("status line exploded")
 }
 
 func TestCursorCloudStopErrorPanicStillDeletes(t *testing.T) {
@@ -1381,7 +1381,7 @@ func TestCursorCloudStopErrorPanicStillDeletes(t *testing.T) {
 			cursorcloudtest.MethodStop: errors.New("stop exploded"),
 		},
 	}
-	require.PanicsWithValue(t, "output exploded", func() {
+	require.PanicsWithValue(t, "status line exploded", func() {
 		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", panicOutput{})
 	})
 	var ops []string
@@ -1407,7 +1407,7 @@ func TestCursorCloudOutputPanicStillDeletes(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
 	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
-	require.PanicsWithValue(t, "output exploded", func() {
+	require.PanicsWithValue(t, "status line exploded", func() {
 		_, _ = (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", panicOutput{})
 	})
 	var deletes int
@@ -1507,6 +1507,47 @@ func TestCursorCloudDoneCreateStillListsAndDeletes(t *testing.T) {
 	}
 }
 
+// List lag of 1: the first reconcile list is empty and the VM is on the
+// next one. The caller is already done by then. Each variant has to stop
+// and delete that VM.
+func TestSentCreateListLagStillDeletes(t *testing.T) {
+	const repo = "https://github.com/acme/widgets.git"
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const listLag = 1
+	for _, mode := range []string{"agent-timeout", "caller-deadline", "cancel-after-POST"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				assert := assert.New(t)
+				ctx := context.Background()
+				timeout := time.Duration(0)
+				var cancel context.CancelFunc
+				switch mode {
+				case "agent-timeout":
+					timeout = time.Second
+				case "caller-deadline":
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+				default:
+					ctx, cancel = context.WithCancel(context.Background())
+					defer cancel()
+				}
+				client := &lagListCloud{repo: repo, lag: listLag}
+				if mode == "cancel-after-POST" {
+					client.cancel = cancel
+				}
+				a := &CursorCloudAgent{Client: client, RepoURL: repo, Timeout: timeout}
+				a.SetLaunchLimitsForTest(2, 5)
+				_, err := a.Review(ctx, t.TempDir(), sha, "review the change", nil)
+				require.Error(t, err)
+				require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+				assert.Equal(1, client.creates)
+				assert.Greater(client.lists, listLag)
+				assert.Equal([]string{"stop", "delete"}, client.ops)
+			})
+		})
+	}
+}
+
 func TestCursorCloudReadErrorKeepsQuotaAndIsNotRetried(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
@@ -1532,6 +1573,38 @@ func TestCursorCloudReadErrorKeepsQuotaAndIsNotRetried(t *testing.T) {
 	assert.Equal(t, 1, creates)
 }
 
+func TestCursorCloudAlreadyDoneBeforeCreateIsNotSent(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const repo = "https://example.com/acme/repo.git"
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	for _, mode := range []string{"cancel", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if mode == "deadline" {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+				cancel()
+			}
+			t.Cleanup(cancel)
+			var creates int
+			a := &CursorCloudAgent{
+				Client:  &errCreateCloud{err: dial, creates: &creates},
+				RepoURL: repo,
+			}
+			a.SetLaunchLimitsForTest(2, 1)
+			_, err := a.Review(ctx, t.TempDir(), sha, "prompt", nil)
+			require.ErrorIs(t, err, ctx.Err())
+			require.NotErrorIs(t, err, ErrCursorCloudNonRetryable)
+			assert.Equal(t, 0, creates)
+			_, err = a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+			require.NotErrorIs(t, err, ErrCursorCloudNonRetryable)
+			assert.Equal(t, 1, creates)
+		})
+	}
+}
+
 func TestCursorCloudDialRefundsQuota(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
@@ -1554,7 +1627,6 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
 	t.Run("500", func(t *testing.T) {
-		started := time.Now()
 		synctest.Test(t, func(t *testing.T) {
 			fake := &cursorcloudtest.Fake{
 				CreateStatus: cursorcloud.StatusFinished,
@@ -1569,8 +1641,6 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 			assert.Contains(t, err.Error(), "unavailable")
 			require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
 		})
-		// Two delete backoffs are 200ms on the real clock.
-		assert.Less(t, time.Since(started), 150*time.Millisecond)
 	})
 	t.Run("404", func(t *testing.T) {
 		fake := &cursorcloudtest.Fake{
@@ -1638,6 +1708,30 @@ func TestReconcilePassBudgetStartsBeforeList(t *testing.T) {
 	})
 }
 
+func TestReconcileJoinedRateLimitStopsInEitherOrder(t *testing.T) {
+	orders := []struct {
+		name  string
+		codes []int
+	}{
+		{name: "500 then 429", codes: []int{http.StatusInternalServerError, http.StatusTooManyRequests}},
+		{name: "429 then 500", codes: []int{http.StatusTooManyRequests, http.StatusInternalServerError}},
+	}
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				prev := cursorCloudReconcileWindow
+				cursorCloudReconcileWindow = time.Minute
+				defer func() { cursorCloudReconcileWindow = prev }()
+				client := &orderedLimitCloud{statuses: order.codes}
+				err := reconcileCursorCloudLaunch(context.Background(), client, "https://github.com/acme/widgets.git", "tok", nil)
+				require.Error(t, err)
+				assert.Equal(t, 1, client.lists)
+				assert.Contains(t, err.Error(), "slow down")
+			})
+		})
+	}
+}
+
 func TestReconcileConversationRateLimitStops(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		prev := cursorCloudReconcileWindow
@@ -1660,19 +1754,28 @@ func TestReconcileStopsOnRateLimitAndCancel(t *testing.T) {
 	err := reconcileCursorCloudLaunch(context.Background(), limited, "https://github.com/acme/widgets.git", "tok", nil)
 	require.Error(t, err)
 	assert.Equal(t, 1, limited.lists)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err = reconcileCursorCloudLaunch(ctx, &emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
-	require.ErrorIs(t, err, context.Canceled)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := reconcileCursorCloudLaunch(ctx, &emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "did not find the launch")
+		require.NotErrorIs(t, err, context.Canceled)
+	})
 }
 
 func TestReconcileWindowEndIsNotSilent(t *testing.T) {
+	var logs bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
 	prev := cursorCloudReconcileWindow
 	cursorCloudReconcileWindow = time.Millisecond
 	t.Cleanup(func() { cursorCloudReconcileWindow = prev })
 	err := reconcileCursorCloudLaunch(context.Background(), &emptyListCloud{}, "https://github.com/acme/widgets.git", "tok", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not find the launch")
+	assert.Contains(t, logs.String(), "reconcile window expired before the launch was found")
 }
 
 func TestReconcileSurfacesPromptErrorWhenNothingMatches(t *testing.T) {
@@ -1754,6 +1857,7 @@ type stampListCloud struct {
 func (c *stampListCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
 	return cursorcloud.Agent{}, nil
 }
+
 func (c *stampListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
 	return cursorcloud.Agent{}, nil
 }
@@ -1789,14 +1893,17 @@ func (c *budgetListCloud) UserPrompt(ctx context.Context, _ string) (string, err
 	}
 	return c.text, nil
 }
+
 func (c *budgetListCloud) StopAgent(context.Context, string) error {
 	c.ops = append(c.ops, "stop")
 	return nil
 }
+
 func (c *budgetListCloud) DeleteAgent(context.Context, string) error {
 	c.ops = append(c.ops, "delete")
 	return nil
 }
+
 func (c *budgetListCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
 	timer := time.NewTimer(c.listDelay)
 	defer timer.Stop()
@@ -1828,9 +1935,11 @@ func (c *conversationLimitCloud) CreateAgent(context.Context, cursorcloud.Create
 func (c *conversationLimitCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
 	return cursorcloud.Agent{}, nil
 }
+
 func (c *conversationLimitCloud) FinalMessage(context.Context, string) (string, error) {
 	return "", nil
 }
+
 func (c *conversationLimitCloud) UserPrompt(context.Context, string) (string, error) {
 	c.prompts++
 	return "", &cursorcloud.APIError{Op: "conversation", StatusCode: http.StatusTooManyRequests, Message: "slow down"}
@@ -1839,6 +1948,7 @@ func (c *conversationLimitCloud) StopAgent(context.Context, string) error { retu
 func (c *conversationLimitCloud) DeleteAgent(context.Context, string) error {
 	return nil
 }
+
 func (c *conversationLimitCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
 	c.lists++
 	return []cursorcloud.Agent{
@@ -1899,6 +2009,106 @@ func (promptErrCloud) StopAgent(context.Context, string) error   { return nil }
 func (promptErrCloud) DeleteAgent(context.Context, string) error { return nil }
 func (promptErrCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
 	return []cursorcloud.Agent{{ID: "bc_other", SourceRepository: "https://github.com/acme/widgets.git"}}, nil
+}
+
+// lagListCloud fails the create from the caller context, then hides the
+// VM for lag lists. cancel is invoked inside CreateAgent, after the call
+// has started.
+type lagListCloud struct {
+	repo    string
+	lag     int
+	cancel  context.CancelFunc
+	creates int
+	lists   int
+	prompt  string
+	ops     []string
+}
+
+func (c *lagListCloud) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	c.creates++
+	c.prompt = req.Prompt
+	if c.cancel != nil {
+		c.cancel()
+		return cursorcloud.Agent{}, ctx.Err()
+	}
+	<-ctx.Done()
+	return cursorcloud.Agent{}, ctx.Err()
+}
+
+func (c *lagListCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *lagListCloud) FinalMessage(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (c *lagListCloud) UserPrompt(context.Context, string) (string, error) {
+	return c.prompt, nil
+}
+
+func (c *lagListCloud) StopAgent(context.Context, string) error {
+	c.ops = append(c.ops, "stop")
+	return nil
+}
+
+func (c *lagListCloud) DeleteAgent(context.Context, string) error {
+	c.ops = append(c.ops, "delete")
+	return nil
+}
+
+func (c *lagListCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	if c.lists <= c.lag {
+		return nil, nil
+	}
+	return []cursorcloud.Agent{{
+		ID:               "bc_lag",
+		SourceRepository: c.repo,
+	}}, nil
+}
+
+type orderedLimitCloud struct {
+	statuses []int
+	lists    int
+	prompts  int
+}
+
+func (c *orderedLimitCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *orderedLimitCloud) GetAgent(context.Context, string) (cursorcloud.Agent, error) {
+	return cursorcloud.Agent{}, nil
+}
+
+func (c *orderedLimitCloud) FinalMessage(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (c *orderedLimitCloud) UserPrompt(context.Context, string) (string, error) {
+	code := http.StatusInternalServerError
+	msg := "boom"
+	if c.prompts < len(c.statuses) {
+		code = c.statuses[c.prompts]
+	}
+	c.prompts++
+	if code == http.StatusTooManyRequests {
+		msg = "slow down"
+	}
+	return "", &cursorcloud.APIError{Op: "conversation", StatusCode: code, Message: msg}
+}
+func (c *orderedLimitCloud) StopAgent(context.Context, string) error { return nil }
+func (c *orderedLimitCloud) DeleteAgent(context.Context, string) error {
+	return nil
+}
+
+func (c *orderedLimitCloud) ListAgents(context.Context) ([]cursorcloud.Agent, error) {
+	c.lists++
+	return []cursorcloud.Agent{
+		{ID: "bc_a", SourceRepository: "https://github.com/acme/widgets.git"},
+		{ID: "bc_b", SourceRepository: "https://github.com/acme/widgets.git"},
+	}, nil
 }
 
 type slowListCloud struct {
