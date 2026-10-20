@@ -70,12 +70,27 @@ func (db *DB) MarkCloudLaunchCleaned(launchID int64) error {
 	return err
 }
 
+// CloudLaunchSweepSeen reports whether an earlier pass already listed this
+// launch. The pass that lists does not clean. A later restart reads this
+// before it lists again.
+func (db *DB) CloudLaunchSweepSeen(id int64) (bool, error) {
+	var seen int
+	err := db.QueryRow(`SELECT sweep_seen FROM review_job_cloud_launches WHERE id = ?`, id).Scan(&seen)
+	return seen != 0, err
+}
+
+// NoteCloudLaunchSweep records that this pass listed. It does not clean.
+func (db *DB) NoteCloudLaunchSweep(id int64) error {
+	_, err := db.Exec(`UPDATE review_job_cloud_launches SET sweep_seen = 1 WHERE id = ? AND cleaned = 0`, id)
+	return err
+}
+
 // MarkCloudLaunchCleanedByToken clears every uncleaned row for token.
 // The token is unique per launch row and the row can outlive its job, so
 // the job id is not part of the key. orphan_note changes only inside
 // MarkCloudLaunchCleaned. Callers mark cleaned only after SweepAllowsClean:
-// a later independent empty sweep, after the documented minimum age, and
-// only once every VM found so far was deleted by id.
+// a later restart whose own list is empty, after the documented minimum age,
+// and only once every VM found so far was deleted by id.
 func (db *DB) MarkCloudLaunchCleanedByToken(token string) error {
 	rows, err := db.Query(`SELECT id FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 0 ORDER BY id`, token)
 	if err != nil {
@@ -258,11 +273,12 @@ func (db *DB) keepCloudLaunchAfterJobDelete() error {
 			cleaned INTEGER NOT NULL DEFAULT 0,
 			repo_identity TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT '',
-			orphan_note TEXT NOT NULL DEFAULT '')`,
+			orphan_note TEXT NOT NULL DEFAULT '',
+			sweep_seen INTEGER NOT NULL DEFAULT 0)`,
 		`INSERT INTO review_job_cloud_launches_keep
-			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note)
+			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen)
 			SELECT id, job_id, launch_token, agent_id, cleaned,
-				repo_identity, created_at, orphan_note
+				repo_identity, created_at, orphan_note, sweep_seen
 			FROM review_job_cloud_launches`,
 		`DROP TABLE review_job_cloud_launches`,
 		`ALTER TABLE review_job_cloud_launches_keep RENAME TO review_job_cloud_launches`,

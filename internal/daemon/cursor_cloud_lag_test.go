@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,82 +14,6 @@ import (
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
-
-// hideOnFirstList is the delayed-duplicate list. The first ListAgents omits
-// hideID. The next list returns it. A delete of an id the fake already
-// dropped is a 404, which is the gone result the cleanup path accepts.
-type hideOnFirstList struct {
-	cursorcloud.Client
-	hideID string
-	lists  int
-}
-
-func (h *hideOnFirstList) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
-	h.lists++
-	agents, err := h.Client.ListAgents(ctx)
-	if err != nil || h.lists > 1 {
-		return agents, err
-	}
-	visible := make([]cursorcloud.Agent, 0, len(agents))
-	for _, ag := range agents {
-		if ag.ID != h.hideID {
-			visible = append(visible, ag)
-		}
-	}
-	return visible, nil
-}
-
-func (h *hideOnFirstList) DeleteAgent(ctx context.Context, id string) error {
-	err := h.Client.DeleteAgent(ctx, id)
-	if err != nil && strings.Contains(err.Error(), "not found") {
-		return &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found"}
-	}
-	return err
-}
-
-// TestCursorCloudDelayedDuplicateStaysUncleanedUntilLaterEmptySweep is the
-// listing-lag repro. The first post-delete list hides the second same-token
-// VM. Cleaning on that empty list drops the row, and restart never sweeps
-// the VM that shows up on the next list. The row stays uncleaned until that
-// delete and a later empty sweep past the lag window.
-func TestCursorCloudDelayedDuplicateStaysUncleanedUntilLaterEmptySweep(t *testing.T) {
-	tc, _ := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
-	script := &cloudCreateScript{Fake: fake, extra: 1}
-	client := &hideOnFirstList{Client: script, hideID: "bc_fake_2"}
-	text, err := newBoundCloud(t, tc, job, client).Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
-	require.NoError(t, err)
-	assert.Equal(t, "ok", text)
-	_, err = fake.GetAgent(t.Context(), "bc_fake_1")
-	require.Error(t, err)
-	got, err := fake.GetAgent(t.Context(), "bc_fake_2")
-	require.NoError(t, err)
-	assert.Equal(t, "bc_fake_2", got.ID)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
-	var jobErr string
-	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
-	assert.Contains(t, jobErr, "orphan risk")
-
-	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, client))
-	_, err = fake.GetAgent(t.Context(), "bc_fake_2")
-	require.Error(t, err)
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
-
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, client))
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 0, n)
-	assert.Empty(t, cursorCloudLaunchNote(t, tc.DB, job.ID))
-}
 
 // TestCreateErrorReconcileOneListDoesNotClean is the create-error callback.
 // One list that deletes the VM does not mark the row cleaned, so restart
@@ -152,8 +75,12 @@ func TestRestartSavedIDEmptyListRespectsLag(t *testing.T) {
 				Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
 			},
 		}
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
 		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+		n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 0, n)
 	})

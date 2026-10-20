@@ -316,8 +316,9 @@ func TestCursorCloudRestartSweepsDuplicateWithoutRepo(t *testing.T) {
 }
 
 // TestCursorCloudRestartCleansAfterAppliedDelete is C2. The delete already
-// removed the VM, then the process died before marking cleaned. Restart's
-// 404 for the saved id, plus a list that does not show another VM, marks it.
+// removed the VM, then the process died before marking cleaned. The restart
+// that lists the miss leaves the row uncleaned. The next restart's empty
+// list marks it.
 func TestCursorCloudRestartCleansAfterAppliedDelete(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -332,8 +333,12 @@ func TestCursorCloudRestartCleansAfterAppliedDelete(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 }

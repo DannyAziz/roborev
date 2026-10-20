@@ -658,8 +658,15 @@ func TestResolveCloudLaunchCleanDelay(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, nil))
 	assert.Equal(t, 24*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, &Config{}))
 	assert.Equal(t, 12*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, &Config{CloudLaunchCleanDelayHours: 12}))
+	assert.Equal(t, 24*time.Hour, ResolveCloudLaunchCleanDelay(tmpDir, &Config{CloudLaunchCleanDelayHours: -5}))
 	repoDir := newTempRepo(t, "cloud_launch_clean_delay_hours = 6\n")
 	assert.Equal(t, 6*time.Hour, ResolveCloudLaunchCleanDelay(repoDir, &Config{CloudLaunchCleanDelayHours: 12}))
+	zeroDir := newTempRepo(t, "cloud_launch_clean_delay_hours = 0\n")
+	assert.Equal(t, time.Hour, ResolveCloudLaunchCleanDelay(zeroDir, &Config{CloudLaunchCleanDelayHours: 12}))
+	negDir := newTempRepo(t, "cloud_launch_clean_delay_hours = -3\n")
+	assert.Equal(t, time.Hour, ResolveCloudLaunchCleanDelay(negDir, &Config{CloudLaunchCleanDelayHours: 12}))
+	badDir := newTempRepo(t, "cloud_launch_clean_delay_hours = \"soon\"\n")
+	assert.Equal(t, time.Hour, ResolveCloudLaunchCleanDelay(badDir, &Config{CloudLaunchCleanDelayHours: 12}))
 }
 
 func TestResolveAgentQuotaCooldown(t *testing.T) {

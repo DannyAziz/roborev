@@ -254,7 +254,7 @@ type Config struct {
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
 	JobTimeoutMinutes          int                             `toml:"job_timeout_minutes"`
-	CloudLaunchCleanDelayHours int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later empty restart sweep may clean a cursor-cloud launch. 0 uses 24. Until then the row stays uncleaned and the job keeps the orphan note."`
+	CloudLaunchCleanDelayHours int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later restart's empty sweep may clean a cursor-cloud launch. A second list in the same pass does not. 0 uses 24. Never under 1."`
 	IsolateReviews             bool                            `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts."`
 	HookTimeoutSeconds         int                             `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
 	AgentQuotaCooldown         string                          `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
@@ -788,7 +788,7 @@ type RepoConfig struct {
 	ReviewMDFallback                *bool                           `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
 	ReviewGuidelinesSupersedeGlobal bool                            `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
 	JobTimeoutMinutes               int                             `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
-	CloudLaunchCleanDelayHours      int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later empty restart sweep may clean a cursor-cloud launch in this repo. 0 inherits the global value, then 24."`
+	CloudLaunchCleanDelayHours      int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later restart's empty sweep may clean a cursor-cloud launch in this repo. A value of at least 1 wins over global. 0, negative, or unparseable clamps to 1 and does not inherit global."`
 	IsolateReviews                  *bool                           `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts for this repo."`
 	HookTimeoutSeconds              int                             `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
 	ExcludedBranches                []string                        `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
@@ -1026,6 +1026,10 @@ unclear, leave it open and ask the user for direction. Then continue the task th
 	// mark it cleaned. 24h is the existing bound: a same-day restart can
 	// still see a VM an earlier list missed. It is not a measured listing lag.
 	DefaultCloudLaunchCleanDelayHours = 24
+	// MinCloudLaunchCleanDelayHours is the floor. A repo value of 0, a
+	// negative value, or a value that does not parse clamps here. It does
+	// not mean the wait is already over, and it does not inherit global.
+	MinCloudLaunchCleanDelayHours = 1
 )
 
 // DefaultConfig returns the default configuration
@@ -1824,19 +1828,56 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 
 // ResolveCloudLaunchCleanDelay is the minimum age of a cursor-cloud launch
 // before a later independent empty restart sweep may mark it cleaned.
-// Priority: per-repo cloud_launch_clean_delay_hours, then global, then
-// DefaultCloudLaunchCleanDelayHours. Zero or negative values are ignored.
+// A per-repo value of at least MinCloudLaunchCleanDelayHours wins over the
+// global value. A repo value of 0, a negative value, or a value that does
+// not parse clamps to that floor: it does not inherit global and it does
+// not mean the wait is already over. Global 0 or negative is unset and uses
+// DefaultCloudLaunchCleanDelayHours. The result is never under the floor.
 func ResolveCloudLaunchCleanDelay(repoPath string, globalCfg *Config) time.Duration {
-	var repoVal int
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
-		repoVal = clampPositive(repoCfg.CloudLaunchCleanDelayHours)
+	hours := DefaultCloudLaunchCleanDelayHours
+	if globalCfg != nil && globalCfg.CloudLaunchCleanDelayHours > 0 {
+		hours = globalCfg.CloudLaunchCleanDelayHours
 	}
-	var globalVal int
-	if globalCfg != nil {
-		globalVal = clampPositive(globalCfg.CloudLaunchCleanDelayHours)
+	repoHours, repoSet, err := repoCloudLaunchCleanDelayHours(repoPath)
+	switch {
+	case err != nil || (repoSet && repoHours < MinCloudLaunchCleanDelayHours):
+		hours = MinCloudLaunchCleanDelayHours
+	case repoSet:
+		hours = repoHours
 	}
-	hours := resolve(DefaultCloudLaunchCleanDelayHours, repoVal, globalVal)
+	if hours < MinCloudLaunchCleanDelayHours {
+		hours = MinCloudLaunchCleanDelayHours
+	}
 	return time.Duration(hours) * time.Hour
+}
+
+// repoCloudLaunchCleanDelayHours reads the per-repo key. set is false when
+// the key is absent. A present value that is not an integer, or a file that
+// does not parse, returns an error so the caller can clamp instead of
+// treating the delay as already elapsed.
+func repoCloudLaunchCleanDelayHours(repoPath string) (int, bool, error) {
+	_, raw, err := LoadRepoConfigWithRaw(repoPath)
+	if err != nil {
+		return 0, false, err
+	}
+	if raw == nil {
+		return 0, false, nil
+	}
+	v, ok := raw["cloud_launch_clean_delay_hours"]
+	if !ok {
+		return 0, false, nil
+	}
+	switch n := v.(type) {
+	case int64:
+		return int(n), true, nil
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, true, fmt.Errorf("config: cloud_launch_clean_delay_hours is not an integer")
+		}
+		return int(n), true, nil
+	default:
+		return 0, true, fmt.Errorf("config: cloud_launch_clean_delay_hours is not an integer")
+	}
 }
 
 // DefaultHookTimeoutForOS returns the platform default post-commit hook

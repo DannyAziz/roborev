@@ -73,14 +73,23 @@ func CursorCloudPendingOrphanNote() string { return cursorCloudPendingOrphanNote
 // SweepAllowsClean is the only gate for marking a launch cleaned.
 // found means this sweep deleted a VM, so it is not an empty sweep.
 // byIDDeleted means every VM found so far was removed by id.
-// independent means this sweep is a later call (a new restart or a separate
-// reconcile), not a retry or a second list inside the same call.
-// minDelay is config cloud_launch_clean_delay_hours, default 24. A same-day
-// restart still has to be able to see a VM an earlier list missed, so an
-// empty sweep before that age does not clean. It is not a measured listing lag.
+// independent means an earlier pass already listed. A second list inside
+// the pass that is deciding, including a reconcile retry, stays false.
+// minDelay is config cloud_launch_clean_delay_hours. A valid repo value of
+// at least 1 hour wins over global; 0, negative, and unparseable clamp to
+// 1 hour. A same-day restart still has to be able to see a VM an earlier
+// list missed, so an empty sweep before that age does not clean. It is not
+// a measured listing lag. A non-positive duration is already elapsed, so
+// restart must not pass one.
 func SweepAllowsClean(found, byIDDeleted, independent bool, since, now time.Time, minDelay time.Duration) bool {
-	if found || !byIDDeleted || !independent || minDelay <= 0 || since.IsZero() {
+	if found || !byIDDeleted || !independent || since.IsZero() {
 		return false
+	}
+	// A non-positive delay is not a hold. Restart normalizes the configured
+	// hours to at least one hour before calling. In-process sweeps pass
+	// independent false, so they still do not clean.
+	if minDelay <= 0 {
+		return !now.Before(since)
 	}
 	return !now.Before(since.Add(minDelay))
 }

@@ -43,7 +43,7 @@ func TestCursorCloudRestartStopsPersistedAgent(t *testing.T) {
 	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(t.Context(), tc.DB, fake))
+	require.ErrorContains(t, recoverStaleJobs(t.Context(), tc.DB, fake), "not listed yet")
 	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
 
 	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop))
@@ -57,6 +57,15 @@ func TestCursorCloudRestartStopsPersistedAgent(t *testing.T) {
 	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
 	assert.Equal(t, 0, updated.RetryCount)
 	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
+		},
+	}
+	require.NoError(t, recoverStaleJobs(t.Context(), tc.DB, fake))
+	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 	claimed, err := tc.DB.ClaimJob(testWorkerID + "-again")
@@ -148,7 +157,7 @@ func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
 	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 
 	creates = cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
 	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
 	for _, id := range []string{agentA.ID, agentB.ID} {
 		assert.Contains(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop), id)
@@ -156,6 +165,15 @@ func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
 		_, getErr := fake.GetAgent(t.Context(), id)
 		require.Error(t, getErr)
 	}
+	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
+		},
+	}
+	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
 	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
@@ -385,11 +403,11 @@ func cursorCloudAllowNullToken(t *testing.T, db *storage.DB) {
 		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT,
 		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
 		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
-		orphan_note TEXT NOT NULL DEFAULT '')`)
+		orphan_note TEXT NOT NULL DEFAULT '', sweep_seen INTEGER NOT NULL DEFAULT 0)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO review_job_cloud_launches_nullable
-		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note)
-		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note
+		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen)
+		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen
 		FROM review_job_cloud_launches`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DROP TABLE review_job_cloud_launches`)
@@ -559,7 +577,7 @@ func TestCursorCloudRestartFailsSynthesisBackupLaunch(t *testing.T) {
 	require.NoError(t, os.WriteFile(JobLogPath(synth.ID), []byte(logLine), 0o600))
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
 	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
@@ -898,11 +916,20 @@ func TestCursorCloudRecoveryCleansLaunchAfterJobDelete(t *testing.T) {
 	_, err = conn.ExecContext(t.Context(), `DELETE FROM review_jobs WHERE id = ?`, job.ID)
 	require.NoError(t, err)
 
+	require.ErrorContains(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil), "not listed yet")
+	var cleaned int
+	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = ?`, token).Scan(&cleaned))
+	assert.Equal(t, 0, cleaned)
+
+	fake.MethodErrors = map[string]error{
+		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
+		},
+	}
 	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil))
 
 	_, err = fake.GetAgent(t.Context(), created.ID)
 	require.Error(t, err)
-	var cleaned int
 	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = ?`, token).Scan(&cleaned))
 	assert.Equal(t, 1, cleaned)
 }

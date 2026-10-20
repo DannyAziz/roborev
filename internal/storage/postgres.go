@@ -1729,7 +1729,8 @@ const localCloudLaunchDDL = `CREATE TABLE IF NOT EXISTS review_job_cloud_launche
 	cleaned BOOLEAN NOT NULL DEFAULT FALSE,
 	repo_identity TEXT NOT NULL DEFAULT '',
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	orphan_note TEXT NOT NULL DEFAULT ''
+	orphan_note TEXT NOT NULL DEFAULT '',
+	sweep_seen INTEGER NOT NULL DEFAULT 0
 )`
 
 func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
@@ -1739,6 +1740,9 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 	}
 	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`); err != nil {
 		log.Printf("cursor-cloud: orphan_note: %v", err)
+	}
+	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS sweep_seen INTEGER NOT NULL DEFAULT 0`); err != nil {
+		log.Printf("cursor-cloud: sweep_seen: %v", err)
 	}
 	// DEFAULT '' let an older insert omit the token and store a blank.
 	// New writes must pass a token. Existing blanks stay blank and uncleaned.
