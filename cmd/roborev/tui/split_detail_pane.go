@@ -241,6 +241,9 @@ func (m model) renderDetailPane(innerW, innerH int) []string {
 	var warn []string
 	if job, ok := m.selectedJob(); ok {
 		warn = launchOrphanWarningLines(*job, innerW)
+	} else if m.selectedReviewLoaded() && m.currentReview.Job != nil {
+		// The anchored review's row was pruned; its job still holds the note.
+		warn = launchOrphanWarningLines(*m.currentReview.Job, innerW)
 	}
 	if len(warn) > 0 {
 		maxWarn := fullH

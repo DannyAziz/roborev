@@ -111,3 +111,26 @@ func TestNoReviewFlashShowsLaunchOrphanWarning(t *testing.T) {
 		assert.Contains(t, got.flashMessage, "Warning: "+note, status)
 	}
 }
+
+// An anchored review whose job row hide-closed pruned keeps its launch
+// warning. There is no row, so the warning comes from the review's job.
+func TestAnchoredReviewKeepsLaunchOrphanWarning(t *testing.T) {
+	t.Parallel()
+	const note = "cursor-cloud orphan risk: anchored-pin-4c1"
+	review := splitTestReview()
+	review.Job.OrphanWarning = note
+	m := splitModel(withReview(review))
+	m.currentView = viewReview
+	m.focus = focusDetail
+	m.hideClosed = true
+	pruned := []storage.ReviewJob{testQueueJobs()[0], testQueueJobs()[2]}
+	res, _ := m.handleJobsMsg(jobsMsg{jobs: pruned, stats: storage.JobStats{}})
+	got := res.(model)
+	_, ok := got.selectedJob()
+	require.False(t, ok, "sanity: the job row is gone")
+	require.True(t, got.selectedReviewLoaded())
+
+	lines := strings.Join(got.renderDetailPane(88, 25), "\n")
+	assert.Contains(t, lines, "first finding")
+	assert.Contains(t, lines, "anchored-pin-4c1")
+}
