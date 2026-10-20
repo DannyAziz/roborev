@@ -1333,17 +1333,22 @@ func TestSelfHostedRepoCaseIsNotMerged(t *testing.T) {
 }
 
 func TestCursorCloudSlowListStopsAndDeletesOrphan(t *testing.T) {
-	const repo = "https://github.com/acme/widgets.git"
-	const token = "slow-list-token"
-	client := &slowListCloud{
-		delay: 600 * time.Millisecond,
-		text:  "review\n" + cursorCloudLaunchMarker + token + "\n",
-	}
-	err := reconcileCursorCloudLaunch(context.Background(), client, repo, token, nil)
-	require.NoError(t, err)
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	assert.Equal(t, []string{"stop", "delete"}, client.ops)
+	started := time.Now()
+	synctest.Test(t, func(t *testing.T) {
+		const repo = "https://github.com/acme/widgets.git"
+		const token = "slow-list-token"
+		client := &slowListCloud{
+			delay: 600 * time.Millisecond,
+			text:  "review\n" + cursorCloudLaunchMarker + token + "\n",
+		}
+		err := reconcileCursorCloudLaunch(context.Background(), client, repo, token, nil)
+		require.NoError(t, err)
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		assert.Equal(t, []string{"stop", "delete"}, client.ops)
+	})
+	// The 600ms list runs on the fake clock. A real wait exceeds this.
+	assert.Less(t, time.Since(started), 300*time.Millisecond)
 }
 
 func TestCursorCloudPanicReleasesLaunchSlot(t *testing.T) {
@@ -1407,18 +1412,23 @@ func TestCursorCloudDeleteRetries500And404IsDone(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const repo = "https://example.com/acme/repo.git"
 	t.Run("500", func(t *testing.T) {
-		fake := &cursorcloudtest.Fake{
-			CreateStatus: cursorcloud.StatusFinished,
-			Final:        "ok",
-			MethodErrors: map[string]error{
-				cursorcloudtest.MethodDelete: &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable"},
-			},
-		}
-		_, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
-		require.Error(t, err)
-		assert.Equal(t, cursorCloudDeleteAttempts, deleteCount(fake))
-		assert.Contains(t, err.Error(), "unavailable")
-		require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+		started := time.Now()
+		synctest.Test(t, func(t *testing.T) {
+			fake := &cursorcloudtest.Fake{
+				CreateStatus: cursorcloud.StatusFinished,
+				Final:        "ok",
+				MethodErrors: map[string]error{
+					cursorcloudtest.MethodDelete: &cursorcloud.APIError{Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable"},
+				},
+			}
+			_, err := (&CursorCloudAgent{Client: fake, RepoURL: repo}).Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+			require.Error(t, err)
+			assert.Equal(t, cursorCloudDeleteAttempts, deleteCount(fake))
+			assert.Contains(t, err.Error(), "unavailable")
+			require.ErrorIs(t, err, ErrCursorCloudNonRetryable)
+		})
+		// Two delete backoffs are 200ms on the real clock.
+		assert.Less(t, time.Since(started), 150*time.Millisecond)
 	})
 	t.Run("404", func(t *testing.T) {
 		fake := &cursorcloudtest.Fake{
