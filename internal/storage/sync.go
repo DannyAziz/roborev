@@ -932,7 +932,7 @@ func (db *DB) upsertPulledJob(j PulledJob, repoID int64, commitID *int64) (bool,
 		ON CONFLICT(uuid) DO UPDATE SET
 			status = excluded.status,
 			finished_at = excluded.finished_at,
-			error = excluded.error,
+			error = `+jobErrorKeepNote("excluded.error")+`,
 			model = excluded.model,
 			provider = excluded.provider,
 			requested_model = excluded.requested_model,

@@ -827,6 +827,28 @@ func TestHandleCtrlRerunJob_ClearsClosedAndVerdict(t *testing.T) {
 		"rerun job should be visible with hideClosed")
 }
 
+func TestHandleCtrlRerunJob_KeepsOrphanNote(t *testing.T) {
+	t.Parallel()
+	m := newModel(testEndpoint, withExternalIODisabled())
+	m.jobs = []storage.ReviewJob{
+		makeJob(8,
+			withStatus(storage.JobStatusFailed),
+			func(j *storage.ReviewJob) {
+				j.Error = "disk failed"
+				j.OrphanWarning = "cursor-cloud orphan risk: keep-this-token"
+			},
+		),
+	}
+
+	params, _ := json.Marshal(map[string]int64{"job_id": 8})
+	updated, resp, _ := m.handleCtrlRerunJob(params)
+	require.True(t, resp.OK, "expected OK, got error: %s", resp.Error)
+	assert.Equal(t, storage.JobStatusQueued, updated.jobs[0].Status)
+	assert.Contains(t, updated.jobs[0].Error, "cursor-cloud orphan risk: keep-this-token",
+		"tui rerun dropped the orphan note")
+	assert.NotContains(t, updated.jobs[0].Error, "disk failed")
+}
+
 func TestHandleCtrlRerunJob_WrongStatus(t *testing.T) {
 	t.Parallel()
 	m := newModel(testEndpoint, withExternalIODisabled())

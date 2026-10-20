@@ -144,6 +144,22 @@ func (db *DB) ListUncleanedCloudLaunches() ([]CloudLaunch, error) {
 	return out, rows.Err()
 }
 
+// jobErrorKeepNote is the SQL expression for a new job error value.
+// newExpr is NULL, a bound placeholder, or excluded.error. An uncleaned
+// launch keeps a stored error that already contains the orphan-risk note.
+// A cleaned row, or an error that does not carry the note, takes newExpr.
+func jobErrorKeepNote(newExpr string) string {
+	return `CASE
+		WHEN EXISTS (
+			SELECT 1 FROM review_job_cloud_launches
+			WHERE job_id = review_jobs.id AND cleaned = 0
+		) AND instr(COALESCE(review_jobs.error, ''), 'orphan risk') > 0
+		  AND instr(COALESCE(` + newExpr + `, ''), 'orphan risk') = 0
+		THEN TRIM(COALESCE(` + newExpr + `, '') || ' ' || review_jobs.error)
+		ELSE ` + newExpr + `
+	END`
+}
+
 // NoteCloudLaunchRisk records a launch that is still uncleaned. The job error
 // is what status JSON shows. The row is not marked cleaned.
 func (db *DB) NoteCloudLaunchRisk(jobID int64, msg string) error {
@@ -178,6 +194,28 @@ func currentAttemptCloudLaunchSQL() string {
 	) OR (review_jobs.agent_invoked = 1 AND review_jobs.agent = 'cursor-cloud')`
 }
 
+// RecordUncleanedLaunchNote writes msg onto an uncleaned launch and the job
+// error. A note that is already set is left as it is. A cleaned row is not
+// changed. msg must contain the orphan-risk marker.
+func (db *DB) RecordUncleanedLaunchNote(jobID int64, msg string) error {
+	msg = strings.TrimSpace(msg)
+	if jobID == 0 || msg == "" || !strings.Contains(msg, "orphan risk") {
+		return fmt.Errorf("cursor-cloud: launch note was not recorded")
+	}
+	n, err := db.CountUncleanedCloudLaunches(jobID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET orphan_note = ?
+		WHERE job_id = ? AND cleaned = 0 AND orphan_note = ''`, msg, jobID); err != nil {
+		return err
+	}
+	return db.NoteCloudLaunchRisk(jobID, msg)
+}
+
 // FailSentCloudLaunch fails a running attempt that already launched a
 // cursor-cloud VM on this attempt. A sent row still counts after cleanup
 // marks it cleaned. A configured cursor-cloud backup that did not launch,
@@ -185,11 +223,11 @@ func currentAttemptCloudLaunchSQL() string {
 func (db *DB) FailSentCloudLaunch(jobID int64, workerID string) (bool, error) {
 	now := time.Now().Format(time.RFC3339)
 	res, err := db.Exec(`UPDATE review_jobs
-		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
+		SET status = 'failed', worker_id = NULL, finished_at = ?, error = `+jobErrorKeepNote("?")+`,
 		    updated_at = ?, synced_at = NULL
 		WHERE id = ? AND status = 'running' AND worker_id = ?
 		  AND (`+currentAttemptCloudLaunchSQL()+`)`,
-		now, CloudLaunchInterruptedError, now, jobID, workerID)
+		now, CloudLaunchInterruptedError, CloudLaunchInterruptedError, CloudLaunchInterruptedError, now, jobID, workerID)
 	if err != nil {
 		return false, err
 	}

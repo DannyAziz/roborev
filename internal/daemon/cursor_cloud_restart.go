@@ -47,7 +47,12 @@ func recoverCloudLaunches(ctx context.Context, db *storage.DB, client cursorclou
 		return err
 	}
 	if client == nil {
-		return fmt.Errorf("cursor-cloud: %d interrupted launch(es) have no client", len(rows))
+		var errs []error
+		for _, row := range rows {
+			errs = append(errs, noteRestartClientFailure(db, row))
+		}
+		errs = append(errs, fmt.Errorf("cursor-cloud: %d interrupted launch(es) have no client", len(rows)))
+		return errors.Join(errs...)
 	}
 	machineID, err := db.GetMachineID()
 	if err != nil {
@@ -120,7 +125,10 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	}
 	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
 	if err != nil {
-		return err
+		if agent.CursorCloudCleanupOp(err) == "list" {
+			return noteRestartListFailure(db, row, err)
+		}
+		return noteRestartSweepFailure(db, row, err)
 	}
 	if cursorCloudSamePassResweep != nil {
 		again, againErr := cursorCloudSamePassResweep(ctx, client, daemonID, row.Token, repoURL)
@@ -189,6 +197,24 @@ func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
 	return created, true
 }
 
+func noteRestartClientFailure(db *storage.DB, row storage.CloudLaunch) error {
+	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: no client for launch %d", row.ID)
+	log.Print(msg)
+	return db.RecordUncleanedLaunchNote(row.JobID, msg)
+}
+
+func noteRestartListFailure(db *storage.DB, row storage.CloudLaunch, cause error) error {
+	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: list: %v", cause)
+	log.Print(msg)
+	return errors.Join(cause, db.RecordUncleanedLaunchNote(row.JobID, msg))
+}
+
+func noteRestartSweepFailure(db *storage.DB, row storage.CloudLaunch, cause error) error {
+	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: sweep: %v", cause)
+	log.Print(msg)
+	return errors.Join(cause, db.RecordUncleanedLaunchNote(row.JobID, msg))
+}
+
 func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bool {
 	created, ok := parseCloudLaunchCreated(createdAt)
 	if !ok {
@@ -200,5 +226,8 @@ func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bo
 func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch, delay time.Duration) error {
 	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within cloud_launch_clean_delay_hours (%s)", row.JobID, row.ID, delay)
 	log.Print(msg)
-	return db.NoteCloudLaunchRisk(row.JobID, msg)
+	if err := db.RecordUncleanedLaunchNote(row.JobID, msg); err != nil {
+		return err
+	}
+	return nil
 }

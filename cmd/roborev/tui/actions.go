@@ -226,11 +226,26 @@ func (m *model) startRerun(job *storage.ReviewJob, selectedAgent string) tea.Cmd
 		job.Status = storage.JobStatusQueued
 		job.StartedAt = nil
 		job.FinishedAt = nil
-		job.Error = ""
+		job.Error = keptLaunchNote(job)
 		job.Closed = nil
 		job.Verdict = nil
 	}
 	return m.rerunJob(snap)
+}
+
+// keptLaunchNote is the orphan-risk text a rerun must keep on screen while
+// the launch row is still uncleaned. The attempt error itself is cleared.
+func keptLaunchNote(job *storage.ReviewJob) string {
+	if job == nil {
+		return ""
+	}
+	if note := strings.TrimSpace(job.OrphanWarning); note != "" {
+		return note
+	}
+	if strings.Contains(job.Error, "orphan risk") {
+		return job.Error
+	}
+	return ""
 }
 
 // rerunJob sends a rerun request to the server for failed/canceled jobs.

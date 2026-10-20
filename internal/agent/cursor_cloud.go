@@ -987,11 +987,47 @@ func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Cli
 	agents, err := client.ListAgents(listCtx)
 	cancel()
 	if err != nil {
-		return false, fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+		return false, &cursorCloudCleanupError{op: cursorCloudCleanupList, err: fmt.Errorf("cursor-cloud: cleanup list: %w", err)}
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	return deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
+	found, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
+	if err != nil {
+		return found, &cursorCloudCleanupError{op: cursorCloudCleanupSweep, err: err}
+	}
+	return found, nil
+}
+
+const (
+	cursorCloudCleanupList  = "list"
+	cursorCloudCleanupSweep = "sweep"
+)
+
+// cursorCloudCleanupError marks a restart list or sweep that did not finish.
+// Error text stays the wrapped cause so callers can still match the provider
+// message.
+type cursorCloudCleanupError struct {
+	op  string
+	err error
+}
+
+func (e *cursorCloudCleanupError) Error() string {
+	if e == nil || e.err == nil {
+		return "cursor-cloud: cleanup"
+	}
+	return e.err.Error()
+}
+
+func (e *cursorCloudCleanupError) Unwrap() error { return e.err }
+
+// CursorCloudCleanupOp reports "list" or "sweep" when err came from
+// DeleteCursorCloudLaunchByMarker. Other errors return "".
+func CursorCloudCleanupOp(err error) string {
+	var cleanup *cursorCloudCleanupError
+	if !errors.As(err, &cleanup) || cleanup == nil {
+		return ""
+	}
+	return cleanup.op
 }
 
 func sameCursorCloudRepo(want, got string) bool {

@@ -1183,7 +1183,9 @@ func TestUnconfirmedDeleteNoteMatrix(t *testing.T) {
 					assert.Contains(t, jobErr, "orphan risk")
 					var rowNote string
 					require.NoError(t, tc.DB.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&rowNote))
-					if noted {
+					if noted || !usable {
+						// An unusable repository reports the orphan onto
+						// the row.
 						assert.Contains(t, rowNote, "orphan risk")
 					} else {
 						assert.Empty(t, rowNote)
