@@ -1933,6 +1933,8 @@ func TestReconcileListKeepsItsOwnTimeout(t *testing.T) {
 		client := &listDeadlineCloud{}
 		err := reconcileCursorCloudLaunch(ctx, client, "https://github.com/acme/widgets.git", "tok", nil)
 		require.Error(t, err)
+		require.True(t, client.listed)
+		require.NoError(t, client.listErr)
 		assert.True(t, client.hasDeadline)
 		assert.Equal(t, cursorCloudDeleteTimeout, client.remain)
 	})
@@ -2040,8 +2042,10 @@ func TestSentCreateStaysNonRetryableWhenReconcileIsPreSend(t *testing.T) {
 }
 
 type listDeadlineCloud struct {
+	listed      bool
 	hasDeadline bool
 	remain      time.Duration
+	listErr     error
 }
 
 func (c *listDeadlineCloud) CreateAgent(context.Context, cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
@@ -2055,6 +2059,8 @@ func (c *listDeadlineCloud) UserPrompt(context.Context, string) (string, error) 
 func (c *listDeadlineCloud) StopAgent(context.Context, string) error              { return nil }
 func (c *listDeadlineCloud) DeleteAgent(context.Context, string) error            { return nil }
 func (c *listDeadlineCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	c.listed = true
+	c.listErr = ctx.Err()
 	deadline, ok := ctx.Deadline()
 	c.hasDeadline = ok
 	if ok {
