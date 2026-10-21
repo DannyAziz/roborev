@@ -1175,10 +1175,10 @@ explicit `host` without `ROBOREV_HOST_AGENT=1` is the same kind of error.
 `--host cursor-cloud` is stored on the job, and that job never runs on a local
 agent: budget routing does not substitute one, and the job never falls back to
 one, including a workflow backup. A launch refused before the create is sent (a
-bad ref or a missing remote) and a launch that fails
-after the create is sent both fail the job. When `host = "cursor-cloud"` in
-config or `ROBOREV_DEFAULT_HOST` selects cursor-cloud, a configured non-cloud
-backup may still run.
+bad ref or a missing remote) and a launch that fails after the create is sent
+both fail the job. When `host = "cursor-cloud"` in config or
+`ROBOREV_DEFAULT_HOST` selects cursor-cloud, a configured non-cloud backup may
+still run.
 
 The cloud review is created at the exact commit SHA and polled until it
 finishes. `CREATING` and any other unknown status stay in progress. The agent's
@@ -1227,8 +1227,9 @@ launched at the head commit. The adapter still refuses a ref that is empty,
 Launch limits are checked before the agent is created. The defaults are 4
 concurrent launches and 60 launches in a rolling hour. 4 matches the default
 worker count. 60 is one launch a minute. A launch past either limit creates no
-agent and the job waits in the queue until a slot frees. A finished review frees its concurrent slot after
-the agent is deleted. A launch stops counting one hour after it started.
+agent and the job waits in the queue until a slot frees. A finished review frees
+its concurrent slot after the agent is deleted. A launch stops counting one hour
+after it started.
 
 Set `ROBOREV_CURSOR_CLOUD_MAX_CONCURRENT` and
 `ROBOREV_CURSOR_CLOUD_MAX_PER_HOUR` to a positive integer to change a limit. An
