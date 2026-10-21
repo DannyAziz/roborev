@@ -3,7 +3,10 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -60,6 +63,31 @@ func TestCINamedPanelCursorCloudWithoutOptInDoesNotLaunch(t *testing.T) {
 	assert.False(t, h.hasPanel(t, "acme/api", 22, head))
 }
 
+func TestCINamedPanelForkCursorCloudDoesNotLaunch(t *testing.T) {
+	h := cloudGateHarness(t)
+	h.Cfg.CI.Panel = "ci"
+	h.Cfg.Review = config.ReviewConfig{
+		Subagents: map[string]config.SubagentSpec{
+			"cloud": {Agent: agent.CursorCloudHost, ReviewType: "review"},
+		},
+		Panels: map[string]config.PanelSpec{
+			"ci": {Members: []string{"cloud"}, SynthesisAgent: "test"},
+		},
+	}
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	const head = "ffffffffffffffffffffffffffffffffffffffff"
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+		Number: 26, HeadRefOid: head, HeadRefName: "feature", BaseRefName: "main",
+		HeadRepo: "fork/api", BaseRepo: "acme/api",
+	}, h.Cfg)
+	require.NoError(t, err)
+	assert.False(t, h.hasPanel(t, "acme/api", 26, head))
+	assert.Contains(t, logs.String(), `head repo "fork/api" is not base repo "acme/api"`)
+}
+
 func TestCIForkMatrixCursorCloudDoesNotLaunch(t *testing.T) {
 	h := cloudGateHarness(t)
 	h.Cfg.CI.Agents = []string{agent.CursorCloudHost}
@@ -79,25 +107,39 @@ func TestCIForkMatrixCursorCloudDoesNotLaunch(t *testing.T) {
 }
 
 func TestCICursorCloudUnknownIdentityDoesNotLaunch(t *testing.T) {
-	h := cloudGateHarness(t)
-	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
-		return ciRepoConfigSource{Config: &config.RepoConfig{
-			CI: config.RepoCIConfig{Host: agent.CursorCloudHost},
-		}}, nil
+	cases := []struct {
+		name     string
+		headRepo string
+		baseRepo string
+	}{
+		{name: "both empty"},
+		{name: "deleted fork", baseRepo: "acme/api"},
+		{name: "base empty", headRepo: "fork/api"},
 	}
-	h.Cfg.CI.Agents = []string{"codex"}
-	h.Cfg.CI.ReviewTypes = []string{"default"}
-	var logs bytes.Buffer
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := cloudGateHarness(t)
+			h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+				return ciRepoConfigSource{Config: &config.RepoConfig{
+					CI: config.RepoCIConfig{Host: agent.CursorCloudHost},
+				}}, nil
+			}
+			h.Cfg.CI.Agents = []string{"codex"}
+			h.Cfg.CI.ReviewTypes = []string{"default"}
+			var logs bytes.Buffer
+			log.SetOutput(&logs)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-	const head = "dddddddddddddddddddddddddddddddddddddddd"
-	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
-		Number: 24, HeadRefOid: head, BaseRefName: "main",
-	}, h.Cfg)
-	require.NoError(t, err)
-	assert.False(t, h.hasPanel(t, "acme/api", 24, head))
-	assert.Contains(t, logs.String(), "head and base repositories are unknown")
+			head := fmt.Sprintf("%040d", i+1)
+			err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+				Number: 24 + i, HeadRefOid: head, BaseRefName: "main",
+				HeadRepo: tc.headRepo, BaseRepo: tc.baseRepo,
+			}, h.Cfg)
+			require.NoError(t, err)
+			assert.False(t, h.hasPanel(t, "acme/api", 24+i, head))
+			assert.Contains(t, logs.String(), "head and base repositories are unknown")
+		})
+	}
 }
 
 func TestCIDeferredRetryOfForkDoesNotLaunchCursorCloud(t *testing.T) {
@@ -133,4 +175,32 @@ func TestCIDeferredRetryOfForkDoesNotLaunchCursorCloud(t *testing.T) {
 	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api", nil, h.Cfg))
 	assert.False(t, h.hasPanel(t, "acme/api", prNum, head))
 	assert.Contains(t, logs.String(), `head repo "fork/api" is not base repo "acme/api"`)
+}
+
+func TestCIPanelPostTargetCarriesRepoIdentities(t *testing.T) {
+	const body = `{
+		"number": 7,
+		"state": "open",
+		"title": "fork",
+		"head": {"ref": "feature", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repo": {"full_name": "fork/api"}},
+		"base": {"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "repo": {"full_name": "acme/api"}},
+		"user": {"login": "alice"}
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/repos/acme/api/pulls/7" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Poller.githubAPIURL = srv.URL + "/"
+	got, err := h.Poller.panelPostTarget(context.Background(), "acme/api", 7)
+	require.NoError(t, err)
+	assert.Equal(t, "fork/api", got.HeadRepo)
+	assert.Equal(t, "acme/api", got.BaseRepo)
+	assert.True(t, got.Open)
 }

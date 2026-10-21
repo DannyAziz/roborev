@@ -1162,8 +1162,8 @@ func ciCursorCloudOptIn(repoCfg *config.RepoConfig) bool {
 }
 
 // ciCursorCloudBlockReason is why a resolved cursor-cloud CI job must not be
-// enqueued. An empty reason means the job may launch. Unknown head or base
-// repository names fail closed. A fork fails closed. Anything else needs the
+// enqueued. An empty reason means the job may launch. An empty head or base
+// repository is fail-closed, the same as a fork. Anything else needs the
 // repository's own [ci] host.
 func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, pr ghPR) string {
 	head := strings.TrimSpace(pr.HeadRepo)
