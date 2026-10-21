@@ -154,7 +154,11 @@ func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bo
 func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted bool, cleanDelay time.Duration) error {
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
-	if noted && agent.SweepAllowsClean(found, row.AgentID != "", seen, since, now, cleanDelay) {
+	// A blank or unusable repo_identity sent the list to the checkout
+	// remote, which need not be the repository the launch was created on.
+	// A miss there does not clean the row.
+	if noted && agent.CursorCloudRepoUsable(row.RepoIdentity) &&
+		agent.SweepAllowsClean(found, row.AgentID != "", seen, since, now, cleanDelay) {
 		return db.MarkCloudLaunchCleanedByToken(row.JobID, row.RepoID, row.Token)
 	}
 	if err := db.NoteCloudLaunchSweep(row.ID); err != nil {
