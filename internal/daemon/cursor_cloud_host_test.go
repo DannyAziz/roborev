@@ -89,6 +89,33 @@ func TestEnqueueCursorCloudRejectsDirtyAndRangeWhenJobTypeSaysReview(t *testing.
 	assert.Empty(t, jobs)
 }
 
+func TestEnqueueFixRangeWithConfigHostStaysLocal(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+	t.Setenv("ROBOREV_DEFAULT_HOST", "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	db, tmpDir := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.MaxWorkers = 0
+	cfg.Host = agent.CursorCloudHost
+	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+	t.Cleanup(func() { _ = server.Close() })
+
+	repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
+	repo.CommitFile("a.txt", "one\n", "one")
+	repo.CommitFile("b.txt", "two\n", "two")
+	created := enqueueViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD~1..HEAD",
+		JobType:  storage.JobTypeFix,
+		Agent:    "test",
+	})
+	assert.Equal(t, "test", created.Agent)
+	stored, err := db.GetJobByID(created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "test", stored.Agent)
+	assert.NotEqual(t, agent.CursorCloudHost, stored.Agent)
+}
+
 func TestResolveSingleAgentCursorCloudRequiresKey(t *testing.T) {
 	t.Setenv("ROBOREV_DEFAULT_HOST", "")
 	t.Setenv(cursorcloud.EnvAPIKey, "")

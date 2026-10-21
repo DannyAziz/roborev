@@ -58,6 +58,13 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 	if cfg != nil {
 		globalHost = cfg.Host
 	}
+	// Fix jobs and goal reviews stay local. A range ref is classified before
+	// the declared job type, so this exemption has to run before the
+	// dirty/range refusal. Otherwise host=cursor-cloud rejects a fix job
+	// whose ref contains "..".
+	if !reviewHostApplies(workflow, reviewType, jobType) {
+		return agent.ReviewHostLocal, nil
+	}
 	// An explicit cursor-cloud host on a dirty or range review is rejected
 	// before agent selection. It is not rewritten to the local backend.
 	if jobType == storage.JobTypeDirty || jobType == storage.JobTypeRange {
@@ -68,9 +75,6 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 			})
 			return "", out
 		}
-	}
-	if !reviewHostApplies(workflow, reviewType, jobType) {
-		return agent.ReviewHostLocal, nil
 	}
 	host, err := agent.ReviewHost(flag, repoHost, globalHost)
 	if err != nil {
