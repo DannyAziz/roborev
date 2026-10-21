@@ -6,10 +6,13 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -357,6 +360,13 @@ func writeExternalDiffSnapshot(repoPath, snapshotRoot, diff string) (string, fun
 	return writeExternalSnapshot(repoPath, snapshotRoot, "roborev-snapshot-content.diff", diff)
 }
 
+// snapshotBeforeCreateForTest runs after the snapshot root is validated and
+// before the snapshot directory is created.
+var snapshotBeforeCreateForTest func()
+
+// writeExternalSnapshot creates the snapshot directory and file through an
+// os.Root at repoPath. A component swapped for a symlink that leaves the
+// repository after validation makes the write fail instead of following it.
 func writeExternalSnapshot(repoPath, snapshotRoot, filename, content string) (string, func(), error) {
 	if err := validateSnapshotRoot(repoPath, snapshotRoot); err != nil {
 		return "", nil, err
@@ -364,50 +374,95 @@ func writeExternalSnapshot(repoPath, snapshotRoot, filename, content string) (st
 	if err := ensureSnapshotRootIgnored(repoPath, snapshotRoot); err != nil {
 		return "", nil, fmt.Errorf("ensure snapshot dir ignored: %w", err)
 	}
-	if err := os.MkdirAll(snapshotRoot, 0o755); err != nil {
+	absRepo, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve repo root: %w", err)
+	}
+	absRoot, err := filepath.Abs(snapshotRoot)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve snapshot root: %w", err)
+	}
+	relRoot, err := filepath.Rel(absRepo, absRoot)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve snapshot root: %w", err)
+	}
+	root, err := os.OpenRoot(absRepo)
+	if err != nil {
+		return "", nil, fmt.Errorf("open repo root: %w", err)
+	}
+	defer root.Close()
+	if err := root.MkdirAll(relRoot, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create snapshot root: %w", err)
 	}
 	if err := validateSnapshotRoot(repoPath, snapshotRoot); err != nil {
 		return "", nil, err
 	}
+	if snapshotBeforeCreateForTest != nil {
+		snapshotBeforeCreateForTest()
+	}
 	snapshotLifecycleMu.Lock()
-	dir, err := os.MkdirTemp(snapshotRoot, "roborev-snapshot-*")
+	relDir, err := mkdirSnapshotTemp(root, relRoot)
 	if err != nil {
 		snapshotLifecycleMu.Unlock()
 		return "", nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
-	if err := writeSnapshotMarker(dir); err != nil {
-		os.RemoveAll(dir)
+	dir := filepath.Join(snapshotRoot, filepath.Base(relDir))
+	remove := func() { removeSnapshotDir(absRepo, relDir) }
+	if err := root.WriteFile(filepath.Join(relDir, snapshotMarkerFile), []byte("roborev snapshot\n"), 0o600); err != nil {
+		remove()
 		snapshotLifecycleMu.Unlock()
 		return "", nil, fmt.Errorf("write snapshot marker: %w", err)
 	}
 	unregister := registerActiveSnapshot(dir)
 	snapshotLifecycleMu.Unlock()
 	snapshotFile := filepath.Join(dir, filename)
-	f, err := os.OpenFile(snapshotFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := root.OpenFile(filepath.Join(relDir, filename), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		unregister()
-		os.RemoveAll(dir)
+		remove()
 		return "", nil, fmt.Errorf("create snapshot: %w", err)
 	}
 	_, writeErr := f.WriteString(content)
 	closeErr := f.Close()
 	if writeErr != nil || closeErr != nil {
 		unregister()
-		os.RemoveAll(dir)
+		remove()
 		if writeErr != nil {
 			return "", nil, fmt.Errorf("write snapshot: %w", writeErr)
 		}
 		return "", nil, fmt.Errorf("close snapshot: %w", closeErr)
 	}
 	return snapshotFile, func() {
-		os.RemoveAll(dir)
+		remove()
 		unregister()
 	}, nil
 }
 
-func writeSnapshotMarker(dir string) error {
-	return os.WriteFile(filepath.Join(dir, snapshotMarkerFile), []byte("roborev snapshot\n"), 0o600)
+// mkdirSnapshotTemp creates a new roborev-snapshot-* directory under relRoot
+// inside root, as os.MkdirTemp does, and returns its root-relative path.
+func mkdirSnapshotTemp(root *os.Root, relRoot string) (string, error) {
+	for range 10000 {
+		relDir := filepath.Join(relRoot, "roborev-snapshot-"+strconv.FormatUint(uint64(rand.Uint32()), 10))
+		err := root.Mkdir(relDir, 0o700)
+		if err == nil {
+			return relDir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("create snapshot dir under %s: %w", relRoot, fs.ErrExist)
+}
+
+// removeSnapshotDir removes relDir through an os.Root at repoPath, so a
+// swapped symlink above it cannot redirect the removal.
+func removeSnapshotDir(repoPath, relDir string) {
+	root, err := os.OpenRoot(repoPath)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	_ = root.RemoveAll(relDir)
 }
 
 func registerActiveSnapshot(dir string) func() {

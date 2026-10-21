@@ -1494,3 +1494,7 @@ func TestBuildCanceledContextFails(t *testing.T) {
 	_, err = b.Build(firstSHA+".."+sha, 1, "test", "", "")
 	require.Error(t, err, "range prompt build must abort on canceled context even with review context enabled")
 }
+
+func writeSnapshotMarker(dir string) error {
+	return os.WriteFile(filepath.Join(dir, snapshotMarkerFile), []byte("roborev snapshot\n"), 0o600)
+}
