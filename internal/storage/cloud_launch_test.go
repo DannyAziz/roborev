@@ -247,3 +247,154 @@ func assertPlannedUpdateRequeues(t *testing.T, db *DB, jobID int64) {
 	require.NoError(t, err)
 	assert.Equal(t, JobStatusQueued, got.Status)
 }
+
+func TestResetStaleJobsFailsUncleanedCloudLaunch(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+
+	repo := createRepo(t, db, t.TempDir())
+	launchJob := enqueueJob(t, db, repo.ID, createCommit(t, db, repo.ID, "sha-launch").ID, "sha-launch")
+	invoked := enqueueJob(t, db, repo.ID, createCommit(t, db, repo.ID, "sha-invoked").ID, "sha-invoked")
+	plain := enqueueJob(t, db, repo.ID, createCommit(t, db, repo.ID, "sha-plain").ID, "sha-plain")
+
+	_, err := db.Exec(`UPDATE review_jobs SET status = 'running', worker_id = ? WHERE id = ?`, "stale-worker", launchJob.ID)
+	require.NoError(t, err)
+	require.NoError(t, db.BeginCloudLaunch(launchJob.ID, "stale-worker", "tok-stale", "https://example.com/acme/repo.git"))
+	_, err = db.Exec(
+		`UPDATE review_jobs SET status = 'running', worker_id = ?, agent = ?, agent_invoked = 1 WHERE id = ?`,
+		"stale-worker", "cursor-cloud", invoked.ID,
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'running', worker_id = ? WHERE id = ?`, "stale-worker", plain.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, db.ResetStaleJobs())
+
+	assertVerifierFailed(t, db, launchJob.ID)
+	assertVerifierFailed(t, db, invoked.ID)
+	requeued, err := db.GetJobByID(plain.ID)
+	require.NoError(t, err)
+	assert.Equal(t, JobStatusQueued, requeued.Status)
+}
+
+func runningLaunchJob(t *testing.T, db *DB, repo *Repo, sha string) *ReviewJob {
+	t.Helper()
+	job := enqueueJob(t, db, repo.ID, createCommit(t, db, repo.ID, sha).ID, sha)
+	_, err := db.Exec(`UPDATE review_jobs SET status = 'running', worker_id = 'w' WHERE id = ?`, job.ID)
+	require.NoError(t, err)
+	job.RepoID = repo.ID
+	return job
+}
+
+func TestBeginCloudLaunchWritesRowWithNote(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	repo := createRepo(t, db, t.TempDir())
+	job := runningLaunchJob(t, db, repo, "sha-begin")
+
+	require.Error(t, db.BeginCloudLaunch(job.ID, "other-worker", "tok-miss", "https://example.com/acme/repo.git"))
+	require.NoError(t, db.BeginCloudLaunch(job.ID, "w", "tok", "https://example.com/acme/repo.git"))
+	require.Error(t, db.BeginCloudLaunch(job.ID, "w", "tok", "https://example.com/acme/repo.git"), "duplicate token")
+
+	rows, err := db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, job.ID, rows[0].JobID)
+	assert.Equal(t, "tok", rows[0].Token)
+	assert.Equal(t, "https://example.com/acme/repo.git", rows[0].RepoIdentity)
+	assert.NotEmpty(t, rows[0].CreatedAt)
+
+	require.Error(t, db.AttachCloudAgent(job.ID, "other-tok", "bc_x"))
+	require.NoError(t, db.AttachCloudAgent(job.ID, "tok", "bc_1"))
+	rows, err = db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	assert.Equal(t, "bc_1", rows[0].AgentID)
+}
+
+// The warning comes only from uncleaned launch rows. It is never written
+// into review_jobs.error, so failing or retrying the job does not touch it
+// and cleaning the row removes it.
+func TestOrphanWarningComesFromUncleanedLaunchRows(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	repo := createRepo(t, db, t.TempDir())
+	job := runningLaunchJob(t, db, repo, "sha-warn")
+	other := runningLaunchJob(t, db, repo, "sha-other")
+	require.NoError(t, db.BeginCloudLaunch(job.ID, "w", "tok-warn", "https://example.com/acme/repo.git"))
+
+	got, err := db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, CloudLaunchPendingNote, got.OrphanWarning)
+	assert.Empty(t, got.Error)
+
+	require.NoError(t, db.NoteCloudLaunchRisk(job.ID, "cursor-cloud orphan risk: delete failed"))
+	_, err = db.FailJob(job.ID, "w", "agent failed")
+	require.NoError(t, err)
+	got, err = db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "agent failed", got.Error)
+	assert.Equal(t, "cursor-cloud orphan risk: delete failed", got.OrphanWarning)
+
+	jobs := []ReviewJob{{ID: job.ID}, {ID: other.ID}}
+	require.NoError(t, db.AttachLaunchOrphanWarnings(jobs))
+	assert.Equal(t, "cursor-cloud orphan risk: delete failed", jobs[0].OrphanWarning)
+	assert.Empty(t, jobs[1].OrphanWarning)
+
+	byID, err := db.GetJobsWithReviewsByIDs([]int64{job.ID, other.ID})
+	require.NoError(t, err)
+	assert.Equal(t, "cursor-cloud orphan risk: delete failed", byID[job.ID].Job.OrphanWarning)
+	assert.Empty(t, byID[other.ID].Job.OrphanWarning)
+
+	rows, err := db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NoError(t, db.MarkCloudLaunchCleaned(rows[0].ID))
+	got, err = db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.OrphanWarning)
+	assert.Equal(t, "agent failed", got.Error)
+}
+
+func TestMarkCloudLaunchCleanedByTokenIsScoped(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	repo := createRepo(t, db, t.TempDir())
+	job := runningLaunchJob(t, db, repo, "sha-a")
+	other := runningLaunchJob(t, db, repo, "sha-b")
+	require.NoError(t, db.BeginCloudLaunch(job.ID, "w", "tok-a", "https://example.com/acme/repo.git"))
+	require.NoError(t, db.BeginCloudLaunch(other.ID, "w", "tok-b", "https://example.com/acme/repo.git"))
+
+	require.Error(t, db.MarkCloudLaunchCleanedByToken(job.ID, repo.ID, "tok-b"))
+	require.Error(t, db.MarkCloudLaunchCleanedByToken(job.ID, repo.ID+1, "tok-a"))
+	require.NoError(t, db.MarkCloudLaunchCleanedByToken(job.ID, repo.ID, "tok-a"))
+
+	rows, err := db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "tok-b", rows[0].Token)
+}
+
+// Repo delete refuses while a launch is uncleaned. A deleted job keeps its
+// launch row so recovery can still find the VM.
+func TestCloudLaunchOutlivesJobAndBlocksRepoDelete(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	repo := createRepo(t, db, t.TempDir())
+	job := runningLaunchJob(t, db, repo, "sha-del")
+	require.NoError(t, db.BeginCloudLaunch(job.ID, "w", "tok-del", "https://example.com/acme/repo.git"))
+
+	require.ErrorIs(t, db.DeleteRepo(repo.ID, true), ErrRepoHasCloudLaunch)
+
+	_, err := db.Exec(`DELETE FROM review_jobs WHERE id = ?`, job.ID)
+	require.NoError(t, err)
+	rows, err := db.ListUncleanedCloudLaunches()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, job.ID, rows[0].JobID)
+	assert.Equal(t, "https://example.com/acme/repo.git", rows[0].RepoIdentity)
+	assert.Empty(t, rows[0].RepoPath)
+
+	require.NoError(t, db.MarkCloudLaunchCleaned(rows[0].ID))
+	require.NoError(t, db.DeleteRepo(repo.ID, true))
+}

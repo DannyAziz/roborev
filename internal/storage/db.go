@@ -1609,51 +1609,25 @@ func (db *DB) migrate() error {
 	return nil
 }
 
-// ensureCloudLaunchTable creates the launch history table and adds columns
-// to one created before repo_identity existed. ALTER on an existing table
-// keeps its rows; a duplicate column means this process already migrated.
+// ensureCloudLaunchTable creates the machine-local cursor-cloud launch
+// table. It has no job foreign key, so deleting a job keeps the launch row.
 func (db *DB) ensureCloudLaunchTable() error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
-		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL,
-		launch_token TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
-		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
-		sweep_seen INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		id INTEGER PRIMARY KEY,
+		job_id INTEGER NOT NULL,
+		launch_token TEXT NOT NULL UNIQUE,
+		agent_id TEXT NOT NULL DEFAULT '',
+		cleaned INTEGER NOT NULL DEFAULT 0,
+		repo_identity TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		orphan_note TEXT NOT NULL DEFAULT '',
+		sweep_seen INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
 		return fmt.Errorf("cloud launch table: %w", err)
 	}
-	for _, stmt := range []string{
-		`ALTER TABLE review_job_cloud_launches ADD COLUMN repo_identity TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE review_job_cloud_launches ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE review_job_cloud_launches ADD COLUMN orphan_note TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE review_job_cloud_launches ADD COLUMN sweep_seen INTEGER NOT NULL DEFAULT 0`,
-	} {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-			return fmt.Errorf("cloud launch column: %w", err)
-		}
-	}
-	// An older table can store NULL. The rebuilt column is NOT NULL, and the
-	// empty-token cleanup must see '' rather than fail the copy.
-	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET launch_token = '' WHERE launch_token IS NULL`); err != nil {
-		return fmt.Errorf("cloud launch token: %w", err)
-	}
-	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now') WHERE created_at = ''`); err != nil {
-		return fmt.Errorf("cloud launch created_at: %w", err)
-	}
-	// Rows written before orphan_note existed come back with an empty marker.
-	// Recovery lists cleaned = 0, and the warning is the marker, so an uncleaned
-	// row has to leave this migration with the note set.
-	if _, err := db.Exec(`UPDATE review_job_cloud_launches SET orphan_note = ?
-		WHERE cleaned = 0 AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
-		return fmt.Errorf("cloud launch orphan note: %w", err)
-	}
-	if err := db.keepCloudLaunchAfterJobDelete(); err != nil {
-		return err
-	}
-	// Blank tokens are the NULL backfill, not launch tokens. More than one
-	// uncleaned blank can exist, and restart leaves those rows uncleaned.
-	// A real token names one launch row.
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_review_job_cloud_launches_token
-		ON review_job_cloud_launches(launch_token) WHERE launch_token != ''`); err != nil {
-		return fmt.Errorf("cloud launch token index: %w", err)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_job_cloud_launches_job
+		ON review_job_cloud_launches(job_id, cleaned)`); err != nil {
+		return fmt.Errorf("cloud launch index: %w", err)
 	}
 	return nil
 }
@@ -2445,10 +2419,10 @@ func (db *DB) ResetStaleJobs() error {
 	// again. The predicate is currentAttemptCloudLaunchSQL.
 	if _, err := db.Exec(`
 		UPDATE review_jobs
-		SET status = 'failed', worker_id = NULL, finished_at = ?, error = `+jobErrorKeepNote("?")+`,
+		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
 		    updated_at = ?, synced_at = NULL
 		WHERE status = 'running' AND (`+currentAttemptCloudLaunchSQL()+`)
-	`, now, CloudLaunchInterruptedError, CloudLaunchInterruptedError, CloudLaunchInterruptedError, now); err != nil {
+	`, now, CloudLaunchInterruptedError, now); err != nil {
 		return err
 	}
 	_, err := db.Exec(`

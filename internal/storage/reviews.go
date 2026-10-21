@@ -63,7 +63,7 @@ func (db *DB) getReviewByJobID(jobID int64, includeFindingCounts bool) (*Review,
 	}
 	jobs := []ReviewJob{job}
 	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
-		return nil, fmt.Errorf("launch orphan warning: %w", err)
+		return nil, err
 	}
 	job = jobs[0]
 
@@ -561,13 +561,17 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 	if err := reviewRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate reviews: %w", err)
 	}
-	for id, entry := range result {
-		warning, err := db.LaunchOrphanWarning(entry.Job.ID)
-		if err != nil {
-			return nil, fmt.Errorf("launch orphan warning: %w", err)
-		}
-		ApplyLaunchOrphanWarning(&entry.Job, warning)
-		result[id] = entry
+	withJobs := make([]ReviewJob, 0, len(result))
+	for _, entry := range result {
+		withJobs = append(withJobs, entry.Job)
+	}
+	if err := db.AttachLaunchOrphanWarnings(withJobs); err != nil {
+		return nil, err
+	}
+	for _, job := range withJobs {
+		entry := result[job.ID]
+		entry.Job = job
+		result[job.ID] = entry
 	}
 
 	return result, nil

@@ -86,9 +86,7 @@ func TestCursorCloudList429ExhaustedNotesOrphan(t *testing.T) {
 		assert.Equal(t, storage.JobStatusFailed, updated.Status)
 		assert.Contains(t, updated.Error, "orphan risk")
 		assert.Contains(t, updated.Error, "pending cleanup")
-		warning, err := tc.DB.LaunchOrphanWarning(job.ID)
-		require.NoError(t, err)
-		assert.Contains(t, warning, "orphan risk")
+		assert.Contains(t, updated.OrphanWarning, "orphan risk")
 		assert.Contains(t, logs.String(), "orphan risk")
 	})
 }

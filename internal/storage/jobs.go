@@ -1414,11 +1414,11 @@ func (db *DB) FailJob(jobID int64, workerID string, errorMsg string) (bool, erro
 	var result sql.Result
 	var err error
 	if workerID != "" {
-		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = `+jobErrorKeepNote("?")+`, updated_at = ? WHERE id = ? AND status = 'running' AND worker_id = ?`,
-			now, errorMsg, errorMsg, errorMsg, now, jobID, workerID)
+		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = ?, updated_at = ? WHERE id = ? AND status = 'running' AND worker_id = ?`,
+			now, errorMsg, now, jobID, workerID)
 	} else {
-		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = `+jobErrorKeepNote("?")+`, updated_at = ? WHERE id = ? AND status = 'running'`,
-			now, errorMsg, errorMsg, errorMsg, now, jobID)
+		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = ?, updated_at = ? WHERE id = ? AND status = 'running'`,
+			now, errorMsg, now, jobID)
 	}
 	if err != nil {
 		return false, err
@@ -1428,40 +1428,6 @@ func (db *DB) FailJob(jobID int64, workerID string, errorMsg string) (bool, erro
 		return false, err
 	}
 	return rows > 0, nil
-}
-
-// FailBackupAgentJob fails the backup attempt that followed a cursor-cloud
-// failover. The orphan-risk note stays while the launch row is uncleaned.
-func (db *DB) FailBackupAgentJob(jobID int64, workerID string, errorMsg string) (bool, error) {
-	now := time.Now().Format(time.RFC3339)
-	var result sql.Result
-	var err error
-	if workerID != "" {
-		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = `+jobErrorKeepNote("?")+`, updated_at = ? WHERE id = ? AND status = 'running' AND worker_id = ?`,
-			now, errorMsg, errorMsg, errorMsg, now, jobID, workerID)
-	} else {
-		result, err = db.Exec(`UPDATE review_jobs SET status = 'failed', finished_at = ?, error = `+jobErrorKeepNote("?")+`, updated_at = ? WHERE id = ? AND status = 'running'`,
-			now, errorMsg, errorMsg, errorMsg, now, jobID)
-	}
-	if err != nil {
-		return false, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
-// UncleanedLaunchAgent reports the job agent and whether an uncleaned launch
-// row still belongs to it.
-func (db *DB) UncleanedLaunchAgent(jobID int64) (agentName string, uncleaned bool, err error) {
-	var n int
-	err = db.QueryRow(`SELECT COALESCE(agent, ''), (
-		SELECT COUNT(*) FROM review_job_cloud_launches
-		WHERE job_id = review_jobs.id AND cleaned = 0
-	) FROM review_jobs WHERE id = ?`, jobID).Scan(&agentName, &n)
-	return agentName, n > 0, err
 }
 
 // CancelJob marks a running or queued job as canceled
@@ -1612,7 +1578,7 @@ func (db *DB) ReenqueueJobWithRequest(
 	// the same reason.
 	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
-		SET status = 'queued', budget_routing_locked = 0, enqueued_at = ?, worker_id = NULL, started_at = NULL, finished_at = NULL, error = `+jobErrorKeepNote("NULL")+`, retry_count = 0, patch = NULL, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL,
+		SET status = 'queued', budget_routing_locked = 0, enqueued_at = ?, worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL,
 		    agent = CASE WHEN ? THEN ? WHEN budget_original_agent != '' THEN budget_original_agent ELSE agent END,
 		    model = ?, provider = ?,
 		    reasoning = CASE WHEN ? THEN ? ELSE reasoning END,
@@ -1794,13 +1760,13 @@ func (db *DB) RetryJob(jobID int64, workerID string, maxRetries int, retryBackof
 	if workerID != "" {
 		result, err = db.Exec(`
 			UPDATE review_jobs
-			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = `+jobErrorKeepNote("NULL")+`, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
+			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
 			WHERE id = ? AND retry_count < ? AND status = 'running' AND worker_id = ?
 		`, notBefore, jobID, maxRetries, workerID)
 	} else {
 		result, err = db.Exec(`
 			UPDATE review_jobs
-			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = `+jobErrorKeepNote("NULL")+`, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
+			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
 			WHERE id = ? AND retry_count < ? AND status = 'running'
 		`, notBefore, jobID, maxRetries)
 	}
@@ -1835,7 +1801,7 @@ func (db *DB) FailoverJob(jobID int64, workerID, backupAgent, backupModel string
 		    worker_id = NULL,
 		    started_at = NULL,
 		    finished_at = NULL,
-		    error = CASE WHEN instr(COALESCE(error, ''), 'orphan risk') > 0 THEN error ELSE NULL END,
+		    error = NULL,
 		    session_id = NULL,
 		    session_resumed = 0,
 		    resume_source_job_uuid = NULL,
@@ -2674,7 +2640,7 @@ func (db *DB) PromoteClassifyToDesignReview(classifyJobID int64, workerID, agent
 		    synced_at = NULL,
 		    prompt = NULL,
 		    prompt_prebuilt = 0,
-		    error = `+jobErrorKeepNote("NULL")+`,
+		    error = NULL,
 		    updated_at = ?
 		WHERE id = ?
 		  AND job_type = 'classify'
@@ -2711,7 +2677,7 @@ func (db *DB) MarkClassifyAsSkippedDesign(classifyJobID int64, workerID, reason,
 		SET job_type = 'review',
 		    status = 'skipped',
 		    skip_reason = ?,
-		    error = `+jobErrorKeepNote("?")+`,
+		    error = ?,
 		    finished_at = ?,
 		    updated_at = ?
 		WHERE id = ?
@@ -2719,7 +2685,7 @@ func (db *DB) MarkClassifyAsSkippedDesign(classifyJobID int64, workerID, reason,
 		  AND source = 'auto_design'
 		  AND status = 'running'
 		  AND worker_id = ?
-	`, sanitizeSkipReason(reason), nullString(errorDetail), nullString(errorDetail), nullString(errorDetail), now, now, classifyJobID, workerID)
+	`, sanitizeSkipReason(reason), nullString(errorDetail), now, now, classifyJobID, workerID)
 	if err != nil {
 		return err
 	}
@@ -2876,7 +2842,7 @@ func (db *DB) GetPanelMembers(panelRunUUID uuid.UUID) ([]ReviewJob, error) {
 		return nil, err
 	}
 	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
-		return nil, fmt.Errorf("launch orphan warning: %w", err)
+		return nil, err
 	}
 	return jobs, nil
 }
@@ -2913,7 +2879,7 @@ func (db *DB) GetSynthesisJob(panelRunUUID uuid.UUID) (*ReviewJob, error) {
 	}
 	jobs := []ReviewJob{j}
 	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
-		return nil, fmt.Errorf("launch orphan warning: %w", err)
+		return nil, err
 	}
 	j = jobs[0]
 	return &j, nil

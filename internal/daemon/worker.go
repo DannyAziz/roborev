@@ -1628,25 +1628,11 @@ func (wp *WorkerPool) finishRunningJob(workerID string, jobID int64) {
 }
 
 func (wp *WorkerPool) failJobAndInvalidateBudget(jobID int64, workerID, errorMsg string) (bool, error) {
-	updated, err := wp.failStoredJob(jobID, workerID, errorMsg)
+	updated, err := wp.db.FailJob(jobID, workerID, errorMsg)
 	if updated {
 		wp.invalidateBudgetSpend()
 	}
 	return updated, err
-}
-
-// failStoredJob sends a backup attempt that still has an uncleaned launch
-// through FailBackupAgentJob. The primary cursor-cloud attempt uses FailJob.
-func (wp *WorkerPool) failStoredJob(jobID int64, workerID, errorMsg string) (bool, error) {
-	name, uncleaned, err := wp.db.UncleanedLaunchAgent(jobID)
-	if err != nil {
-		log.Printf("cursor-cloud: launch agent for job %d: %v", jobID, err)
-		return wp.db.FailJob(jobID, workerID, errorMsg)
-	}
-	if uncleaned && agent.CanonicalName(name) != agent.CursorCloudHost {
-		return wp.db.FailBackupAgentJob(jobID, workerID, errorMsg)
-	}
-	return wp.db.FailJob(jobID, workerID, errorMsg)
 }
 
 func (wp *WorkerPool) autoClosePassingReview(

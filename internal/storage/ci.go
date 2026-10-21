@@ -50,9 +50,9 @@ func (db *DB) CancelJobWithError(jobID int64, errMsg string) error {
 	now := time.Now().Format(time.RFC3339)
 	result, err := db.Exec(`
 		UPDATE review_jobs
-		SET status = 'canceled', error = `+jobErrorKeepNote("?")+`, finished_at = ?, updated_at = ?
+		SET status = 'canceled', error = ?, finished_at = ?, updated_at = ?
 		WHERE id = ? AND status IN ('queued', 'running')
-	`, errMsg, errMsg, errMsg, now, now, jobID)
+	`, errMsg, now, now, jobID)
 	if err != nil {
 		return err
 	}

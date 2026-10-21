@@ -2,11 +2,9 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"go.kenn.io/roborev/internal/agent"
@@ -81,12 +79,6 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 	if err != nil {
 		return err
 	}
-	// Read before this pass writes. A clean with no persisted orphan note
-	// is the saved-id miss: the row would be gone and nothing would record it.
-	noted, err := persistedCleanNote(db, row.JobID)
-	if err != nil {
-		return err
-	}
 	if row.AgentID != "" {
 		log.Printf("cursor-cloud: stop interrupted agent %s for job %d", row.AgentID, row.JobID)
 		if err := agent.StopAndDeleteCursorCloudAgent(client, row.AgentID); err != nil {
@@ -96,12 +88,12 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		// The id delete is not a marker sweep. A VM that still carries this
 		// launch's marker is handled below. This tick does not clean here.
 	}
-	if row.TokenNull || row.Token == "" {
+	if row.Token == "" {
 		// No marker can name a VM, so this pass does not list. The gate is
 		// the same one a later empty sweep uses. One pass does not clean.
 		// The orphan note is written now, including when a later start sees
 		// other agents and the launch is already past the delay.
-		return holdEmptyTokenSweep(db, row, seen, noted, cleanDelay)
+		return holdEmptyTokenSweep(db, row, seen, cleanDelay)
 	}
 	repoURL := row.RepoIdentity
 	if !agent.CursorCloudRepoUsable(repoURL) {
@@ -137,13 +129,13 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		}
 		found = found || again
 	}
-	return holdListedSweep(db, row, found, seen, noted, cleanDelay)
+	return holdListedSweep(db, row, found, seen, cleanDelay)
 }
 
-func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bool, cleanDelay time.Duration) error {
+func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen bool, cleanDelay time.Duration) error {
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
-	if noted && agent.SweepAllowsClean(false, row.AgentID != "", seen, since, now, cleanDelay) {
+	if agent.SweepAllowsClean(false, row.AgentID != "", seen, since, now, cleanDelay) {
 		// A blank token names no launch. Another blank row on this job has
 		// its own saved id and delete result, so only this row is cleaned.
 		return db.MarkCloudLaunchCleaned(row.ID)
@@ -151,10 +143,10 @@ func holdEmptyTokenSweep(db *storage.DB, row storage.CloudLaunch, seen, noted bo
 	return reportCloudLaunchOrphan(db, row, cleanDelay)
 }
 
-func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted bool, cleanDelay time.Duration) error {
+func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen bool, cleanDelay time.Duration) error {
 	now := agent.CursorCloudNow()
 	since, _ := parseCloudLaunchCreated(row.CreatedAt)
-	if noted && agent.SweepAllowsClean(found, row.AgentID != "", seen, since, now, cleanDelay) {
+	if agent.SweepAllowsClean(found, row.AgentID != "", seen, since, now, cleanDelay) {
 		return db.MarkCloudLaunchCleanedByToken(row.JobID, row.RepoID, row.Token)
 	}
 	if err := db.NoteCloudLaunchSweep(row.ID); err != nil {
@@ -174,21 +166,6 @@ func holdListedSweep(db *storage.DB, row storage.CloudLaunch, found, seen, noted
 	return fmt.Errorf("cursor-cloud: launch %d not listed yet", row.ID)
 }
 
-// persistedCleanNote reports whether a previous pass already stored the
-// orphan note on the job. A missing job has nowhere to store it. A clean
-// still requires the separate sweep tick in that case.
-func persistedCleanNote(db *storage.DB, jobID int64) (bool, error) {
-	var text string
-	err := db.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, jobID).Scan(&text)
-	if errors.Is(err, sql.ErrNoRows) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return strings.Contains(text, "orphan risk"), nil
-}
-
 func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
 	created, err := time.ParseInLocation("2006-01-02 15:04:05", createdAt, time.UTC)
 	if err != nil {
@@ -202,19 +179,19 @@ func parseCloudLaunchCreated(createdAt string) (time.Time, bool) {
 func noteRestartClientFailure(db *storage.DB, row storage.CloudLaunch) error {
 	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: no client for launch %d", row.ID)
 	log.Print(msg)
-	return db.RecordUncleanedLaunchNote(row.JobID, msg)
+	return db.NoteCloudLaunchRisk(row.JobID, msg)
 }
 
 func noteRestartListFailure(db *storage.DB, row storage.CloudLaunch, cause error) error {
 	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: list: %v", cause)
 	log.Print(msg)
-	return errors.Join(cause, db.RecordUncleanedLaunchNote(row.JobID, msg))
+	return errors.Join(cause, db.NoteCloudLaunchRisk(row.JobID, msg))
 }
 
 func noteRestartSweepFailure(db *storage.DB, row storage.CloudLaunch, cause error) error {
 	msg := fmt.Sprintf("cursor-cloud orphan risk: pending cleanup: sweep: %v", cause)
 	log.Print(msg)
-	return errors.Join(cause, db.RecordUncleanedLaunchNote(row.JobID, msg))
+	return errors.Join(cause, db.NoteCloudLaunchRisk(row.JobID, msg))
 }
 
 func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bool {
@@ -228,7 +205,7 @@ func cloudLaunchAgedOut(createdAt string, now time.Time, delay time.Duration) bo
 func reportCloudLaunchOrphan(db *storage.DB, row storage.CloudLaunch, delay time.Duration) error {
 	msg := fmt.Sprintf("cursor-cloud orphan risk: job %d launch %d was not listed within cloud_launch_clean_delay_hours (%s)", row.JobID, row.ID, delay)
 	log.Print(msg)
-	if err := db.RecordUncleanedLaunchNote(row.JobID, msg); err != nil {
+	if err := db.NoteCloudLaunchRisk(row.JobID, msg); err != nil {
 		return err
 	}
 	return nil
