@@ -22,15 +22,16 @@ import (
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
-// It stays at 23: backup_auto and explicit_host are local SQLite state, like
-// budget_routing_locked, and are not Postgres columns. Writing 24 would make
-// older binaries refuse the shared database ("schema version 24 is newer").
-const pgSchemaVersion = 23
+// backup_auto and explicit_host are local SQLite state, like
+// budget_routing_locked, and this binary does not sync them. Version 24 is
+// host-backend-r6's: it added review_jobs.backup_auto and no launch table.
+// 25 opens a v23 or that v24 database and never records 24 itself.
+const pgSchemaVersion = 25
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
-//go:embed schemas/postgres_v23.sql
+//go:embed schemas/postgres_v25.sql
 var pgSchemaSQL string
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
@@ -471,6 +472,24 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 			// so every machine can label the review and compose its banner.
 			if _, err = p.pool.Exec(ctx, `ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS non_voting BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
 				return fmt.Errorf("v23 migration (add non_voting): %w", err)
+			}
+		}
+		if currentVersion < 25 {
+			// The schema file creates review_job_cloud_launches. An older
+			// launch table keeps its rows and takes the current columns.
+			// host-backend-r6's review_jobs.backup_auto is left in place;
+			// its default fills the rows this binary writes.
+			for _, stmt := range []string{
+				`ALTER TABLE review_job_cloud_launches ALTER COLUMN job_id DROP NOT NULL`,
+				`ALTER TABLE review_job_cloud_launches ALTER COLUMN job_id TYPE BIGINT`,
+				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS repo_identity TEXT NOT NULL DEFAULT ''`,
+				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`,
+				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS sweep_seen INTEGER NOT NULL DEFAULT 0`,
+			} {
+				if _, err = p.pool.Exec(ctx, stmt); err != nil {
+					return fmt.Errorf("v25 migration (cloud launch table): %w", err)
+				}
 			}
 		}
 		// Update version
@@ -1720,8 +1739,8 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 }
 
 // localCloudLaunchDDL is machine-local. Sync export and import never read it.
-// It has no foreign key, so deleting a job does not drop the note. The schema
-// version stays at 23 because older binaries refuse a newer version.
+// It has no foreign key, so deleting a job does not drop the note. It matches
+// the table in schemas/postgres_v25.sql.
 const localCloudLaunchDDL = `CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
 	id BIGSERIAL PRIMARY KEY,
 	job_id BIGINT,
@@ -1759,7 +1778,7 @@ func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
 	}
 	p.dropCloudLaunchJobFK(ctx)
 	// Blank tokens are the NULL backfill, not launch tokens. A real token
-	// names one launch row. Schema version stays at 23; this table is local.
+	// names one launch row.
 	if _, err := p.pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_review_job_cloud_launches_token
 		ON review_job_cloud_launches (launch_token) WHERE launch_token <> ''`); err != nil {
 		log.Printf("cursor-cloud: launch token index: %v", err)

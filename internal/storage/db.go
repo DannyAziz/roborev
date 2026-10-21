@@ -1132,9 +1132,8 @@ func (db *DB) migrate() error {
 	}
 	// explicit_host records that enqueue saw --host. It is local scheduling
 	// state, like backup_auto: only terminal jobs sync, and the worker that
-	// fails the job over is this daemon. Postgres stays on schema v23 so
-	// older binaries can still open a shared database. Old rows default to
-	// 0 and keep the default failover.
+	// fails the job over is this daemon. It does not sync to Postgres.
+	// Old rows default to 0 and keep the default failover.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'explicit_host'`).Scan(&count)
 	if err == nil && count == 0 {
 		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN explicit_host INTEGER NOT NULL DEFAULT 0`)
@@ -1143,8 +1142,7 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("add explicit_host column: %w", err)
 	}
 	// Local like budget_routing_locked: the backup came from an "auto" pin.
-	// It does not sync. Postgres stays on schema v23 so older binaries can
-	// still open a shared database.
+	// It does not sync to Postgres.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'backup_auto'`).Scan(&count)
 	if err == nil && count == 0 {
 		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN backup_auto INTEGER NOT NULL DEFAULT 0`)

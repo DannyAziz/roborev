@@ -57,6 +57,7 @@ func openTestPgPoolRawAtVersion(t *testing.T, version int) *PgPool {
 		17: postgresV17Schema,
 		18: postgresV18Schema,
 		23: postgresV23Schema,
+		24: postgresV24HostBackendR6Schema,
 	}
 	schemaSQL, ok := schemas[version]
 	require.Truef(t, ok, "openTestPgPoolRawAtVersion: no embedded schema for version %d", version)
@@ -324,26 +325,4 @@ func TestPostgresMigration_BackupColumns(t *testing.T) { //nolint:paralleltest /
 	).Scan(&ba, &bm))
 	require.Empty(t, ba)
 	require.Empty(t, bm)
-}
-
-// TestPostgresMigration_DefaultConfigLeavesSchemaAtV23 proves EnsureSchema,
-// the path a daemon takes for any config including the default, does not
-// advance a v23 database. Older binaries reject a newer schema_version.
-func TestPostgresMigration_DefaultConfigLeavesSchemaAtV23(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
-	openTestPgPoolRawAtVersion(t, 23)
-	ctx := context.Background()
-
-	pg := openTestPgPool(t)
-	defer pg.Close()
-
-	var version int
-	require.NoError(t, pgxPool(pg).QueryRow(ctx, `SELECT MAX(version) FROM roborev.schema_version`).Scan(&version))
-	assert.Equal(t, 23, version)
-
-	var autoCols int
-	require.NoError(t, pgxPool(pg).QueryRow(ctx, `
-		SELECT COUNT(*) FROM information_schema.columns
-		WHERE table_schema = 'roborev' AND table_name = 'review_jobs' AND column_name = 'backup_auto'
-	`).Scan(&autoCols))
-	assert.Equal(t, 0, autoCols)
 }

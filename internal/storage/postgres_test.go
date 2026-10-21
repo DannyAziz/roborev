@@ -53,34 +53,28 @@ func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
 	}
 }
 
-// TestDefaultConfigLeavesPostgresSchemaAtV23 locks the shared-database
-// contract: EnsureSchema writes pgSchemaVersion and does not consult backup
-// or host config, so a default roborev binary must leave the schema at 23.
-// Older binaries refuse anything newer.
-func TestDefaultConfigLeavesPostgresSchemaAtV23(t *testing.T) {
+// TestPostgresSchemaV25 locks the shared-database contract: EnsureSchema
+// writes 25, the schema carries the launch table, and backup_auto and
+// explicit_host stay local SQLite state.
+func TestPostgresSchemaV25(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
-	assert.Equal(23, pgSchemaVersion)
+	assert.Equal(25, pgSchemaVersion)
 	schema := strings.Join(pgSchemaStatements(), "\n")
 	assert.NotContains(schema, "backup_auto")
 	assert.NotContains(schema, "explicit_host")
 	assert.Contains(schema, "non_voting")
-	assert.NotContains(schema, "review_job_cloud_launches")
+	assert.Contains(schema, "CREATE TABLE IF NOT EXISTS roborev.review_job_cloud_launches")
 }
 
 // TestIntegration_LaunchRowSurvivesRepoDelete snapshots every column of
-// roborev.review_job_cloud_launches around a repo delete. v23 has no launch
-// table, so a repo delete cannot drop one; once the table exists the same
-// check compares the row field by field.
+// roborev.review_job_cloud_launches around a repo delete and compares the
+// rows field by field.
 func TestIntegration_LaunchRowSurvivesRepoDelete(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 	cols := pgColumnNames(t, ctx, pool, "review_job_cloud_launches")
-	if len(cols) == 0 {
-		schema := strings.Join(pgSchemaStatements(), "\n")
-		require.NotContains(t, schema, "review_job_cloud_launches")
-		return
-	}
+	require.NotEmpty(t, cols)
 	before := pgTableRows(t, ctx, pool, "review_job_cloud_launches", cols)
 	_, err := pool.Pool().Exec(ctx, `DELETE FROM repos WHERE identity = $1`, "c10c-launch-pin.example")
 	require.NoError(t, err)
