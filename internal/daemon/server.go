@@ -3132,8 +3132,8 @@ func (s *Server) resolveSingleAgent(
 		return resolvedSingleAgent{}, out
 	}
 	agentName := resolution.PreferredAgent
-	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
-		in.repoCfg, agentName, in.cfg, resolution.BackupAgent,
+	resolved, err := agent.GetPreferredOrBackupEligible(
+		in.repoCfg, agentName, in.cfg, autoBackupEligible(in.req.ReviewType), resolution.BackupAgent,
 	)
 	if err != nil {
 		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {

@@ -1258,8 +1258,8 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 			)
 		} else {
-			selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+			selected, err = agent.GetPreferredOrBackupEligible(
+				repoCfg, resolvedAgent, cfg, autoBackupEligible(member.ReviewType), resolution.BackupAgent,
 			)
 		}
 		if err != nil {
@@ -1360,8 +1360,8 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 			)
 		} else {
-			selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+			selected, err = agent.GetPreferredOrBackupEligible(
+				repoCfg, resolvedAgent, cfg, autoBackupEligible(entry.ReviewType), resolution.BackupAgent,
 			)
 		}
 		if err != nil {

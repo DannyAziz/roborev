@@ -714,3 +714,20 @@ func TestRerunRepinsAutoBackup(t *testing.T) {
 		})
 	}
 }
+
+// Enqueue-time "auto" picks skip agents that cannot run the review type, for
+// an auto primary and an auto backup alike.
+func TestEnqueueAutoPickHonorsReviewType(t *testing.T) {
+	noHostMarker(t)
+	stubAgentPath(t, "gemini", "pi")
+	cfg := config.DefaultConfig()
+	eligible := autoBackupEligible("custom")
+
+	a, err := agent.GetPreferredOrBackupEligible(nil, "auto", cfg, eligible)
+	require.NoError(t, err)
+	assert.Equal(t, "pi", a.Name(), "auto primary skips gemini for a custom review")
+
+	a, err = agent.GetPreferredOrBackupEligible(nil, "codex", cfg, eligible, "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "pi", a.Name(), "auto backup skips gemini for a custom review")
+}
