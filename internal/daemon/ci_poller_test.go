@@ -3245,6 +3245,8 @@ func TestCICursorCloudMemberLaunchesAtHead(t *testing.T) {
 		HeadRefOid:  head,
 		HeadRefName: "feature",
 		BaseRefName: "main",
+		HeadRepo:    "acme/api",
+		BaseRepo:    "acme/api",
 	}, h.Cfg)
 	require.NoError(t, err)
 
@@ -3295,6 +3297,7 @@ func TestCICursorCloudMissingRangePromptDoesNotQueue(t *testing.T) {
 			prNumber := 80 + i
 			err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
 				Number: prNumber, HeadRefOid: head, BaseRefName: "main",
+				HeadRepo: "acme/api", BaseRepo: "acme/api",
 			}, h.Cfg)
 			require.ErrorContains(t, err, "cursor-cloud")
 			require.ErrorContains(t, err, tc.wantErr)

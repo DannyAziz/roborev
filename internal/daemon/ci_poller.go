@@ -95,6 +95,8 @@ type panelPostTarget struct {
 	HeadSHA            string
 	HeadRefName        string
 	BaseRefName        string
+	HeadRepo           string
+	BaseRepo           string
 	AuthorLogin        string
 	Labels             []string
 }
@@ -816,7 +818,9 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 
 	// Resolve panel members + synthesis: a configured [ci].panel names a panel,
 	// else the agents x review_types matrix is adapted into members.
-	ciCloud := ciCursorCloudOptIn(repoCfg)
+	// cloudGateCfg is the repo config before personal mode replaces it. The
+	// cursor-cloud gate reads [ci] host from that config.
+	cloudGateCfg := repoCfg
 	executionRepoCfg, executionRaw, executionCfg := repoCfg, rawRepoCfg, cfg
 	if cfg.CI.Personal.Enabled {
 		// The local personal panel is authority; repository definitions cannot
@@ -825,11 +829,6 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		local.CI.Panel = cfg.CI.Personal.Panel
 		executionCfg, executionRepoCfg, executionRaw = &local, nil, nil
 		repoCfg = personalPromptRepoConfig(repoCfg, cfg)
-	}
-	if ciCloud && ciPullRequestFork(pr) {
-		log.Printf("CI poller: refusing cursor-cloud for %s#%d: head repo %q is not base repo %q",
-			ghRepo, pr.Number, pr.HeadRepo, pr.BaseRepo)
-		return false, nil
 	}
 	members, synth, err := p.resolveCIMembers(
 		repo, executionRepoCfg, executionRaw, executionCfg, ghRepo,
@@ -857,6 +856,10 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 	// no member already covers the design review type (F8, F12).
 	if !cfg.CI.Personal.Enabled {
 		members = p.maybeAppendDesignMember(ctx, members, repo, repoCfg, cfg, mergeBase, pr.HeadRefOid)
+	}
+	members, synth, stopCloud := applyCICursorCloudGate(ghRepo, pr, cloudGateCfg, members, synth)
+	if stopCloud {
+		return false, nil
 	}
 
 	memberOpts, synthOpts, err := p.buildPanelOpts(
@@ -1158,16 +1161,63 @@ func ciCursorCloudOptIn(repoCfg *config.RepoConfig) bool {
 	return strings.EqualFold(strings.TrimSpace(repoCfg.CI.Host), agent.CursorCloudHost)
 }
 
-// ciPullRequestFork reports a head repository that is not the base repository.
-// Empty names are not treated as a fork so callers that do not know the
-// repositories keep the same-repo path.
-func ciPullRequestFork(pr ghPR) bool {
-	base := strings.ToLower(strings.TrimSpace(pr.BaseRepo))
-	head := strings.ToLower(strings.TrimSpace(pr.HeadRepo))
-	if base == "" || head == "" {
-		return false
+// ciCursorCloudBlockReason is why a resolved cursor-cloud CI job must not be
+// enqueued. An empty reason means the job may launch. Unknown head or base
+// repository names fail closed. A fork fails closed. Anything else needs the
+// repository's own [ci] host.
+func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, pr ghPR) string {
+	head := strings.TrimSpace(pr.HeadRepo)
+	base := strings.TrimSpace(pr.BaseRepo)
+	if head == "" || base == "" {
+		return "pull request head and base repositories are unknown"
 	}
-	return base != head
+	if !strings.EqualFold(head, base) {
+		return fmt.Sprintf("head repo %q is not base repo %q", pr.HeadRepo, pr.BaseRepo)
+	}
+	if !ciCursorCloudOptIn(repoCfg) {
+		return "repository [ci] host is not cursor-cloud"
+	}
+	return ""
+}
+
+// applyCICursorCloudGate drops cursor-cloud members that the CI gate refuses.
+// It returns stop when a refused cursor-cloud job would still be enqueued,
+// including a cursor-cloud synthesis or a run whose every member was cloud.
+func applyCICursorCloudGate(
+	ghRepo string, pr ghPR, repoCfg *config.RepoConfig,
+	members []config.ResolvedMember, synth config.SynthesisSpec,
+) ([]config.ResolvedMember, config.SynthesisSpec, bool) {
+	if !ciRunUsesCursorCloud(members, synth) {
+		return members, synth, false
+	}
+	reason := ciCursorCloudBlockReason(repoCfg, pr)
+	if reason == "" {
+		return members, synth, false
+	}
+	log.Printf("CI poller: refusing cursor-cloud for %s#%d: %s", ghRepo, pr.Number, reason)
+	kept := make([]config.ResolvedMember, 0, len(members))
+	for _, member := range members {
+		if agent.CanonicalName(member.Agent) == agent.CursorCloudHost {
+			continue
+		}
+		kept = append(kept, member)
+	}
+	if agent.CanonicalName(synth.Agent) == agent.CursorCloudHost || len(kept) == 0 {
+		return nil, synth, true
+	}
+	return kept, synth, false
+}
+
+func ciRunUsesCursorCloud(members []config.ResolvedMember, synth config.SynthesisSpec) bool {
+	if agent.CanonicalName(synth.Agent) == agent.CursorCloudHost {
+		return true
+	}
+	for _, member := range members {
+		if agent.CanonicalName(member.Agent) == agent.CursorCloudHost {
+			return true
+		}
+	}
+	return false
 }
 
 // ciPanelName returns the configured CI panel name (repo [ci].panel over global
@@ -3292,6 +3342,8 @@ func (p *CIPoller) retryAttemptPR(
 		HeadRefOid:  headSHA,
 		HeadRefName: target.HeadRefName,
 		BaseRefName: baseRefName,
+		HeadRepo:    strings.TrimSpace(target.HeadRepo),
+		BaseRepo:    strings.TrimSpace(target.BaseRepo),
 		Labels:      target.Labels,
 		// Preserve the author so kata trust gating in enqueuePanelRun does
 		// not fail closed for trusted authors on the retry path.
@@ -3789,6 +3841,8 @@ func (p *CIPoller) panelPostTarget(
 		HeadSHA:            pr.HeadRefOID,
 		HeadRefName:        pr.HeadRefName,
 		BaseRefName:        pr.BaseRefName,
+		HeadRepo:           pr.HeadRepo,
+		BaseRepo:           pr.BaseRepo,
 		AuthorLogin:        pr.AuthorLogin,
 		Labels:             pr.Labels,
 	}, nil
