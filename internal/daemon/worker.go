@@ -721,7 +721,6 @@ func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.Review
 		return wp.db.BeginCloudLaunch(job.ID, workerID, token, repoURL)
 	}
 	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
-	copied.NoteCleanupFailure = func(msg string) error { return wp.db.NoteCloudLaunchRisk(job.ID, msg) }
 	copied.MarkAgentDeleted = func(token string) error { return wp.db.MarkCloudAgentDeleted(job.ID, token) }
 	copied.MarkLaunchCleaned = func(token string) error {
 		return wp.db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, token)

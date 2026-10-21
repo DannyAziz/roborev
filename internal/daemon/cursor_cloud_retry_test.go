@@ -169,7 +169,7 @@ func TestCursorCloudDeleteForbiddenKeepsOrphanNoteThroughFailover(t *testing.T) 
 
 	queued := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
 	assert.Equal(t, "test", queued.Agent)
-	assert.Contains(t, queued.Error, "orphan risk")
+	assert.Contains(t, queued.OrphanWarning, "orphan risk")
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -178,7 +178,7 @@ func TestCursorCloudDeleteForbiddenKeepsOrphanNoteThroughFailover(t *testing.T) 
 	tc.Pool.processJob(testWorkerID, claimed)
 
 	done := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
-	assert.Contains(t, done.Error, "orphan risk")
+	assert.Contains(t, done.OrphanWarning, "orphan risk")
 }
 
 // TestSynthesisCursorCloudLaunchIsNotRetried pins the non-host synthesis

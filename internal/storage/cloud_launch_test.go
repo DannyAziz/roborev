@@ -328,22 +328,21 @@ func TestOrphanWarningComesFromUncleanedLaunchRows(t *testing.T) {
 	assert.Equal(t, CloudLaunchPendingNote, got.OrphanWarning)
 	assert.Empty(t, got.Error)
 
-	require.NoError(t, db.NoteCloudLaunchRisk(job.ID, "cursor-cloud orphan risk: delete failed"))
 	_, err = db.FailJob(job.ID, "w", "agent failed")
 	require.NoError(t, err)
 	got, err = db.GetJobByID(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "agent failed", got.Error)
-	assert.Equal(t, "cursor-cloud orphan risk: delete failed", got.OrphanWarning)
+	assert.Equal(t, CloudLaunchPendingNote, got.OrphanWarning)
 
 	jobs := []ReviewJob{{ID: job.ID}, {ID: other.ID}}
 	require.NoError(t, db.AttachLaunchOrphanWarnings(jobs))
-	assert.Equal(t, "cursor-cloud orphan risk: delete failed", jobs[0].OrphanWarning)
+	assert.Equal(t, CloudLaunchPendingNote, jobs[0].OrphanWarning)
 	assert.Empty(t, jobs[1].OrphanWarning)
 
 	byID, err := db.GetJobsWithReviewsByIDs([]int64{job.ID, other.ID})
 	require.NoError(t, err)
-	assert.Equal(t, "cursor-cloud orphan risk: delete failed", byID[job.ID].Job.OrphanWarning)
+	assert.Equal(t, CloudLaunchPendingNote, byID[job.ID].Job.OrphanWarning)
 	assert.Empty(t, byID[other.ID].Job.OrphanWarning)
 
 	rows, err := db.ListUncleanedCloudLaunches()

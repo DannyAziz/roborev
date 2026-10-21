@@ -191,9 +191,6 @@ type CursorCloudAgent struct {
 	DaemonID   string
 	BindLaunch func(token, repoURL string) error
 	BindAgent  func(token, id string) error
-	// NoteCleanupFailure records a stop or delete that did not finish.
-	// The launch row stays uncleaned.
-	NoteCleanupFailure func(msg string) error
 	// MarkAgentDeleted records that the delete of the created id was
 	// confirmed, so a restart does not delete it again.
 	MarkAgentDeleted func(token string) error
@@ -324,17 +321,10 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		if recErr := reconcileCursorCloudLaunch(ctx, client, repoURL, reconcileToken, output, func() error {
 			return a.markLaunchCleaned(token)
 		}); recErr != nil {
-			// The list gave up while a VM may still be billing. The job
-			// error is the record; a log line is not enough, and FailJob
-			// replaces whatever NoteCleanupFailure wrote, so the returned
-			// error has to carry the same text.
+			// The list gave up while a VM may still be billing. The launch
+			// row stays uncleaned and keeps its warning.
 			if errors.Is(recErr, errCursorCloudListUnconfirmed) {
 				log.Print(recErr.Error())
-				if a.NoteCleanupFailure != nil {
-					if noteErr := a.NoteCleanupFailure(recErr.Error()); noteErr != nil {
-						recErr = errors.Join(recErr, noteErr)
-					}
-				}
 			}
 			err = errors.Join(err, recErr)
 		}
@@ -355,11 +345,6 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			}
 			if cleanErr := a.markLaunchCleanedAfterDelete(client, repoURL, token, reconcileToken, output); cleanErr != nil {
 				log.Printf("cursor-cloud: launch row left uncleaned after delete: %v", cleanErr)
-				if a.NoteCleanupFailure != nil {
-					if noteErr := a.NoteCleanupFailure(cleanErr.Error()); noteErr != nil {
-						log.Printf("cursor-cloud: orphan note was not stored: %v", noteErr)
-					}
-				}
 			}
 			return
 		}
@@ -367,11 +352,6 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 		// over the job row, so the sentence has to stay in that error.
 		msg := fmt.Errorf("cursor-cloud orphan risk: pending cleanup for agent %s: %w", created.ID, delErr)
 		log.Print(msg.Error())
-		if a.NoteCleanupFailure != nil {
-			if noteErr := a.NoteCleanupFailure(msg.Error()); noteErr != nil {
-				msg = errors.Join(msg, noteErr)
-			}
-		}
 		if err != nil {
 			err = errors.Join(err, msg)
 			return

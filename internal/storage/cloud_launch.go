@@ -12,9 +12,9 @@ const CloudLaunchPendingNote = "cursor-cloud orphan risk: launch pending cleanup
 const CloudLaunchInterruptedError = "cursor-cloud launch interrupted by daemon restart; not relaunched"
 
 type CloudLaunch struct {
-	ID     int64
-	JobID  int64
-	RepoID int64
+	ID      int64
+	JobID   int64
+	RepoID  int64
 	Token   string
 	AgentID string
 	// AgentDeleted means the delete of AgentID was confirmed.

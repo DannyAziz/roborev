@@ -19,14 +19,14 @@ import (
 	"go.kenn.io/roborev/internal/testutil"
 )
 
-func TestBeginCloudLaunchNoteFailureDoesNotPost(t *testing.T) {
+func TestBeginCloudLaunchFailureDoesNotPost(t *testing.T) {
 	tc, _ := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_orphan_note
-		BEFORE UPDATE OF orphan_note ON review_job_cloud_launches
+	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_launch_insert
+		BEFORE INSERT ON review_job_cloud_launches
 		BEGIN
-			SELECT RAISE(ABORT, 'note write failed');
+			SELECT RAISE(ABORT, 'launch insert failed');
 		END`)
 	require.NoError(t, err)
 
@@ -177,7 +177,6 @@ func cursorCloudAssertAPIWarning(t *testing.T, srv *Server, jobID int64, want bo
 	require.Len(t, body.Jobs, 1)
 	if want {
 		assert.Contains(t, body.Jobs[0].OrphanWarning, "orphan risk")
-		assert.Contains(t, body.Jobs[0].Error, "orphan risk")
 		return
 	}
 	assert.Empty(t, body.Jobs[0].OrphanWarning)
@@ -221,7 +220,6 @@ func TestBatchJobStatusShowsLaunchOrphanWarning(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 	assert.Contains(t, resp.Results[job.ID].Job.OrphanWarning, "orphan risk")
-	assert.Contains(t, resp.Results[job.ID].Job.Error, "orphan risk")
 	assert.Empty(t, resp.Results[quiet.ID].Job.OrphanWarning)
 }
 
