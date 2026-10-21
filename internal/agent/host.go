@@ -21,7 +21,7 @@ import (
 
 const (
 	hostAgentName = "host"
-	// HostMarkerEnv attaches a host model; see HostMarker.Allows.
+	// HostMarkerEnv attaches a host model; see HostAllowed.
 	HostMarkerEnv           = "ROBOREV_HOST_AGENT"
 	hostTimeoutEnv          = "ROBOREV_HOST_TIMEOUT"
 	defaultHostTimeout      = 10 * time.Minute
@@ -107,7 +107,7 @@ func hostJobLabel(gitRef string) string {
 func (a *HostAgent) handoff(ctx context.Context, repoPath, gitRef, prompt string, schema jsontext.Value, output io.Writer) (string, error) {
 	timeout, err := a.timeout()
 	if err != nil {
-		return "", err
+		return "", MarkUnavailable(err)
 	}
 	base := a.baseDir()
 	if err := os.MkdirAll(base, 0o700); err != nil {
@@ -191,13 +191,28 @@ func (e *HostTimeoutError) Error() string {
 	return fmt.Sprintf("host agent: host handoff timeout: no answer at %s after %s (%s)", e.AnswerPath, e.Timeout, hostTimeoutEnv)
 }
 
+// waitForHostAnswer polls for answer.md. A host may write the file in place, so
+// an empty file is not ready, and a non-empty one is accepted only once its
+// size and mtime are unchanged across two polls in a row.
 func waitForHostAnswer(ctx context.Context, answerPath string, timeout, poll time.Duration) (string, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
+	var last os.FileInfo
+	check := func() (string, bool, error) {
+		answer, info, err := readHostAnswer(answerPath)
+		if err != nil || info == nil {
+			last = nil
+			return "", false, err
+		}
+		stable := last != nil && os.SameFile(last, info) &&
+			info.Size() == last.Size() && info.ModTime().Equal(last.ModTime())
+		last = info
+		return answer, stable && answer != "", nil
+	}
 	for {
-		answer, ready, err := readHostAnswer(answerPath)
+		answer, ready, err := check()
 		if err != nil {
 			return "", MarkUnavailable(err)
 		}
@@ -208,7 +223,7 @@ func waitForHostAnswer(ctx context.Context, answerPath string, timeout, poll tim
 		case <-ctx.Done():
 			return "", fmt.Errorf("host agent: waiting for %s: %w", answerPath, ctx.Err())
 		case <-deadline.C:
-			if answer, ready, err := readHostAnswer(answerPath); err != nil || ready {
+			if answer, ready, err := check(); err != nil || ready {
 				return answer, MarkUnavailable(err)
 			}
 			return "", MarkUnavailable(&HostTimeoutError{AnswerPath: answerPath, Timeout: timeout})
@@ -217,37 +232,34 @@ func waitForHostAnswer(ctx context.Context, answerPath string, timeout, poll tim
 	}
 }
 
-// readHostAnswer reads answer.md once renamed into place; temp files are never
-// read, and a symlink or other non-regular file is refused, not followed.
-func readHostAnswer(answerPath string) (string, bool, error) {
+// readHostAnswer reads answer.md and returns its file info, or nil info when it
+// does not exist yet. Temp files are never read, and a symlink or other
+// non-regular file is refused, not followed.
+func readHostAnswer(answerPath string) (string, os.FileInfo, error) {
 	info, err := os.Lstat(answerPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
+		return "", nil, nil
 	}
 	if err == nil {
 		err = notRegular(answerPath, info)
 	}
 	if err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	beforeHostAnswerOpen(answerPath)
 	f, opened, err := openRegularFile(answerPath)
 	if err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	defer f.Close()
 	if !os.SameFile(info, opened) {
-		return "", false, fmt.Errorf("host agent: refusing %s: replaced while reading", answerPath)
+		return "", nil, fmt.Errorf("host agent: refusing %s: replaced while reading", answerPath)
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return "", false, fmt.Errorf("host agent: read answer: %w", err)
+		return "", nil, fmt.Errorf("host agent: read answer: %w", err)
 	}
-	answer := stripCodeFence(strings.TrimSpace(string(data)))
-	if answer == "" {
-		return "", false, fmt.Errorf("host agent: %s is empty", answerPath)
-	}
-	return answer, true, nil
+	return stripCodeFence(strings.TrimSpace(string(data))), opened, nil
 }
 
 // beforeHostAnswerOpen is a test seam between the Lstat and the open.
@@ -289,38 +301,15 @@ func stripCodeFence(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// HostMarker says how a host model is attached: Explicit is
-// ROBOREV_HOST_AGENT=1 (or true/yes/on, any case).
-type HostMarker struct {
-	Explicit bool
-	Why      string
-}
-
-// ReadHostMarker reads the host marker from the environment.
-func ReadHostMarker() HostMarker {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))); v {
+// HostAllowed reports whether a host model is attached: ROBOREV_HOST_AGENT is
+// 1, true, yes or on (any case). Automatic agent picks skip host regardless.
+func HostAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(HostMarkerEnv))) {
 	case "1", "true", "yes", "on":
-		return HostMarker{Explicit: true, Why: HostMarkerEnv + "=" + v}
+		return true
 	}
-	return HostMarker{}
+	return false
 }
-
-// HostUse is how a caller would reach host.
-type HostUse int
-
-const (
-	HostNamed  HostUse = iota // the primary agent or a named backup
-	HostListed                // a listing, completion or health check
-	HostAuto                  // auto, auto-selection or a last resort
-)
-
-// Allows is the one rule for when host may answer: always ROBOREV_HOST_AGENT=1.
-func (m HostMarker) Allows(use HostUse) bool {
-	return m.Explicit
-}
-
-// HostAllowed is ReadHostMarker().Allows(use).
-func HostAllowed(use HostUse) bool { return ReadHostMarker().Allows(use) }
 
 // HostUnavailableError: host was requested but no host model is attached.
 // It is deterministic for the environment, so callers must not retry it.
@@ -338,7 +327,7 @@ func IsHostUnavailable(err error) bool {
 
 // requestedHostError fails a request naming host when host is not allowed.
 func requestedHostError(name string) error {
-	if resolveAlias(strings.TrimSpace(name)) != hostAgentName || HostAllowed(HostNamed) {
+	if resolveAlias(strings.TrimSpace(name)) != hostAgentName || HostAllowed() {
 		return nil
 	}
 	return &HostUnavailableError{}
@@ -347,7 +336,7 @@ func requestedHostError(name string) error {
 // ListedAgentNames lists registered agents to offer; host only with ROBOREV_HOST_AGENT=1.
 func ListedAgentNames() []string {
 	names := Available()
-	if HostAllowed(HostListed) {
+	if HostAllowed() {
 		return names
 	}
 	return slices.DeleteFunc(names, func(name string) bool { return name == hostAgentName })
