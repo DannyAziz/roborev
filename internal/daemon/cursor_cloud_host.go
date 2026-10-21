@@ -11,10 +11,14 @@ import (
 )
 
 // reviewHostApplies reports whether this enqueue may leave the local agent
-// backend. Goal classification and fix jobs stay local: cursor-cloud reviews
-// one commit and does not classify or edit.
+// backend. Goal classification stays local. A fix or compact workflow stays
+// local only when the classified job is actually that job: a dirty or range
+// ref with no prompt is a review, and the git ref wins.
 func reviewHostApplies(workflow, reviewType, jobType string) bool {
-	if workflow == "fix" || reviewType == config.ReviewTypeGoal {
+	if reviewType == config.ReviewTypeGoal {
+		return false
+	}
+	if workflow == "fix" && jobType != storage.JobTypeDirty && jobType != storage.JobTypeRange {
 		return false
 	}
 	switch jobType {
@@ -26,19 +30,20 @@ func reviewHostApplies(workflow, reviewType, jobType string) bool {
 }
 
 // enqueueHostJobType is the job type the host guard should see. A custom
-// prompt is a task even when its label looks like a range. Otherwise the git
-// ref wins over a declared job type: job_type "review" with a dirty or range
-// ref is still a dirty or range review. An empty field is classified the same
-// way. A single commit stays empty so storage still infers "review" after
-// the commit id is known.
+// prompt is what the descriptor freezes: fix and compact keep that type, and
+// every other prompt is a task, even when the label contains "..". Without a
+// prompt the git ref wins over a declared job type, so fix, compact, or task
+// on a dirty or range ref is still that review. A single commit stays empty
+// so storage still infers "review" after the commit id is known.
 func enqueueHostJobType(explicit, customPrompt, gitRef string) string {
-	// run and analyze send a custom prompt and put a label in git_ref.
-	// That label is not a commit, even when it contains "..". A task cannot
-	// run on cursor-cloud, so the host guard must see "task" and the
-	// local-agent exemption can keep it off the cloud path.
 	explicit = strings.TrimSpace(explicit)
-	if explicit == storage.JobTypeTask || (explicit == "" && strings.TrimSpace(customPrompt) != "") {
-		return storage.JobTypeTask
+	if strings.TrimSpace(customPrompt) != "" {
+		switch explicit {
+		case storage.JobTypeFix, storage.JobTypeCompact:
+			return explicit
+		default:
+			return storage.JobTypeTask
+		}
 	}
 	switch classifyTarget("", gitRef) {
 	case kindDirty:
@@ -46,17 +51,10 @@ func enqueueHostJobType(explicit, customPrompt, gitRef string) string {
 	case kindRange:
 		return storage.JobTypeRange
 	}
-	if strings.TrimSpace(explicit) != "" {
+	if explicit != "" {
 		return explicit
 	}
-	switch classifyTarget(customPrompt, gitRef) {
-	case kindDirty:
-		return storage.JobTypeDirty
-	case kindRange:
-		return storage.JobTypeRange
-	default:
-		return ""
-	}
+	return ""
 }
 
 func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config.RepoConfig, cfg *config.Config) (string, *RawJSONOutput) {
@@ -67,11 +65,10 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 	if cfg != nil {
 		globalHost = cfg.Host
 	}
-	// Fix jobs and goal reviews stay local. A range ref is classified before
-	// the declared job type, so this exemption has to run before the
-	// dirty/range refusal. Otherwise host=cursor-cloud rejects a fix job
-	// whose ref contains "..".
-	if !reviewHostApplies(workflow, reviewType, jobType) {
+	// Goal reviews stay local. A dirty or range review is refused before the
+	// fix/compact exemption: without a prompt the descriptor stored that
+	// review, and a declared fix, compact, or task does not rewrite it.
+	if reviewType == config.ReviewTypeGoal {
 		return agent.ReviewHostLocal, nil
 	}
 	// An explicit cursor-cloud host on a dirty or range review is rejected
@@ -84,6 +81,9 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 			})
 			return "", out
 		}
+	}
+	if !reviewHostApplies(workflow, reviewType, jobType) {
+		return agent.ReviewHostLocal, nil
 	}
 	host, err := agent.ReviewHost(flag, repoHost, globalHost)
 	if err != nil {

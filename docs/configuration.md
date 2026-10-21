@@ -1209,9 +1209,12 @@ percent-escape, is not sent: the launch is refused. The stored repository
 identity is separate. It drops userinfo from transport URLs, keeps the query and
 the fragment, and stores an unparseable URL unchanged. A dirty or range review
 cannot use `cursor-cloud`. Enqueue refuses it and does
-not rewrite it onto a local agent. Goal reviews and fix jobs stay on the local
-agent. A fix job whose git ref is a range stays local even when `host` is
-`cursor-cloud`. CI launches `cursor-cloud` only when the repository's own
+not rewrite it onto a local agent. A declared fix, compact, or task with no
+prompt and a dirty or range ref is that review, so `cursor-cloud` refuses it.
+Goal reviews stay on the local agent. A custom prompt is the created job: fix
+and compact keep that type, and run or analyze is a task even when the label
+contains `..`. Those stay on the local agent when `host` is `cursor-cloud`.
+CI launches `cursor-cloud` only when the repository's own
 `[ci] host` is `cursor-cloud`. The repository `host`, the global `host`, and
 `ROBOREV_DEFAULT_HOST` never select it for CI. The check runs when a matrix
 member, a named-panel member, or synthesis would enqueue cursor-cloud, not only

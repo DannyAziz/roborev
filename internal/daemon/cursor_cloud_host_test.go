@@ -104,16 +104,19 @@ func TestEnqueueFixRangeWithConfigHostStaysLocal(t *testing.T) {
 	repo.CommitFile("a.txt", "one\n", "one")
 	repo.CommitFile("b.txt", "two\n", "two")
 	for _, tc := range []struct {
-		name string
-		req  EnqueueRequest
+		name    string
+		req     EnqueueRequest
+		jobType string
 	}{
 		{
-			name: "fix range",
+			name: "fix with prompt",
 			req: EnqueueRequest{
-				GitRef:  "HEAD~1..HEAD",
-				JobType: storage.JobTypeFix,
-				Agent:   "test",
+				GitRef:       "HEAD~1..HEAD",
+				JobType:      storage.JobTypeFix,
+				CustomPrompt: "fix the findings",
+				Agent:        "test",
 			},
+			jobType: storage.JobTypeFix,
 		},
 		{
 			name: "task label",
@@ -122,6 +125,7 @@ func TestEnqueueFixRangeWithConfigHostStaysLocal(t *testing.T) {
 				CustomPrompt: "do the labeled task",
 				Agent:        "test",
 			},
+			jobType: storage.JobTypeTask,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,11 +133,76 @@ func TestEnqueueFixRangeWithConfigHostStaysLocal(t *testing.T) {
 			req.RepoPath = repo.Path()
 			created := enqueueViaHTTP(t, server, req)
 			assert.Equal(t, "test", created.Agent)
+			assert.Equal(t, tc.jobType, created.JobType)
 			stored, err := db.GetJobByID(created.ID)
 			require.NoError(t, err)
 			assert.Equal(t, "test", stored.Agent)
+			assert.Equal(t, tc.jobType, stored.JobType)
 			assert.NotEqual(t, agent.CursorCloudHost, stored.Agent)
 		})
+	}
+}
+
+func TestCursorCloudRefusesDeclaredTypeWithoutPromptOnDirtyOrRange(t *testing.T) {
+	jobTypes := []string{
+		storage.JobTypeReview,
+		storage.JobTypeFix,
+		storage.JobTypeCompact,
+		storage.JobTypeTask,
+	}
+	refs := []struct {
+		name string
+		ref  string
+		diff string
+	}{
+		{name: "dirty", ref: "dirty", diff: "diff --git a/a.txt\n"},
+		{name: "range", ref: "HEAD~1..HEAD"},
+	}
+	sources := []struct {
+		name   string
+		config bool
+		flag   bool
+	}{
+		{name: "config host", config: true},
+		{name: "--host", flag: true},
+	}
+	for _, source := range sources {
+		for _, kind := range refs {
+			for _, jobType := range jobTypes {
+				t.Run(jobType+"/"+kind.name+"/"+source.name, func(t *testing.T) {
+					t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+					t.Setenv(agent.EnvDefaultHost, "")
+					t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+					db, tmpDir := testutil.OpenTestDBWithDir(t)
+					cfg := config.DefaultConfig()
+					cfg.MaxWorkers = 0
+					if source.config {
+						cfg.Host = agent.CursorCloudHost
+					}
+					server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+					t.Cleanup(func() { _ = server.Close() })
+					repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
+					repo.CommitFile("a.txt", "one\n", "one")
+					repo.CommitFile("b.txt", "two\n", "two")
+					req := EnqueueRequest{
+						RepoPath:    repo.Path(),
+						GitRef:      kind.ref,
+						JobType:     jobType,
+						Agent:       "test",
+						DiffContent: kind.diff,
+					}
+					if source.flag {
+						req.Host = agent.CursorCloudHost
+					}
+					w := enqueueRaw(t, server, req)
+					require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+					assert.Contains(t, w.Body.String(), "cannot run a "+kind.name+" review")
+					jobs, err := db.ListJobs("", "", 20, 0)
+					require.NoError(t, err)
+					assert.Empty(t, jobs)
+				})
+			}
+		}
 	}
 }
 
