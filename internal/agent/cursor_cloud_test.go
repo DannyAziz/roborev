@@ -840,7 +840,7 @@ func TestCursorCloudCredentialFormsStayOutOfLaunch(t *testing.T) {
 	}
 }
 
-// cloudLaunchShape is one input built from a branch of stripURLCredentials
+// cloudLaunchShape is one input built from a branch of StripURLCredentials
 // or RemoteIdentity. producer is true when repoURL would store the stripped
 // value. identity is true when RemoteIdentity names a repository.
 type cloudLaunchShape struct {
@@ -918,7 +918,7 @@ func TestCursorCloudBindRefusalRefundsHourlySlot(t *testing.T) {
 }
 
 // cloudLaunchShapes builds one raw URL for each branch of the producer
-// (stripURLCredentials, then repoURL's redacted refusal) and of
+// (StripURLCredentials, then repoURL's redacted refusal) and of
 // RemoteIdentity (transport schemes read from that function, empty host,
 // empty path, SCP, protocol-relative, scheme-less path). Duplicate stored
 // values collapse to one row.

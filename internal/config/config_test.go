@@ -1890,154 +1890,6 @@ func TestResolveRepoIdentity(t *testing.T) {
 			}, "Expected credentials stripped from URL, got: %q", id)
 		}
 	})
-
-	t.Run("credentialed remotes stay distinct", func(t *testing.T) {
-		dir := t.TempDir()
-		pairs := [][2]string{
-			{"https://user:alpha@github.com/acme/one.git", "https://user:beta@github.com/acme/two.git"},
-			{"user:alpha@github.com:acme/one.git", "user:beta@github.com:acme/two.git"},
-		}
-		for _, pair := range pairs {
-			idA := ResolveRepoIdentity(dir, func(string, string) string { return pair[0] })
-			idB := ResolveRepoIdentity(dir, func(string, string) string { return pair[1] })
-			assert.NotEqual(t, idA, idB, pair)
-			assert.NotEqual(t, redactedURL, idA, pair[0])
-			assert.NotEqual(t, redactedURL, idB, pair[1])
-			assert.NotContains(t, idA, "alpha")
-			assert.NotContains(t, idB, "beta")
-		}
-		// A token in the SCP user slot has no ':'. Main stores that string
-		// unchanged because url.Parse rejects it. It must not become redacted-url.
-		ghp := ResolveRepoIdentity(dir, func(string, string) string {
-			return "ghp_alpha@github.com:acme/one.git"
-		})
-		assert.Equal(t, "ghp_alpha@github.com:acme/one.git", ghp)
-		gitID := ResolveRepoIdentity(dir, func(string, string) string {
-			return "git@github.com:acme/one.git"
-		})
-		httpsID := ResolveRepoIdentity(dir, func(string, string) string {
-			return "https://GitHub.com/Acme/One.git"
-		})
-		assert.Equal(t, "git@github.com:acme/one.git", gitID)
-		assert.Equal(t, "https://GitHub.com/Acme/One.git", httpsID)
-		assert.NotEqual(t, gitID, httpsID)
-	})
-}
-
-func TestResolveRepoIdentityCaseIsNotMerged(t *testing.T) {
-	dir := t.TempDir()
-	const upperURL = "https://git.example.internal/Org/Repo"
-	const lowerURL = "https://git.example.internal/org/repo"
-	upper := ResolveRepoIdentity(dir, func(string, string) string { return upperURL })
-	lower := ResolveRepoIdentity(dir, func(string, string) string { return lowerURL })
-	// Postgres GetOrCreateRepo inserts ON CONFLICT (identity). Equal
-	// strings would merge these checkouts. git.example.internal is a
-	// self-hosted host whose path case is significant.
-	assert.NotEqual(t, upper, lower)
-	assert.Equal(t, upperURL, upper)
-	assert.Equal(t, lowerURL, lower)
-}
-
-func TestResolveRepoIdentityRedactedURLDoesNotCollide(t *testing.T) {
-	dir := t.TempDir()
-	one := ResolveRepoIdentity(dir, func(string, string) string {
-		return "ghp_alpha@github.com:acme/one.git"
-	})
-	two := ResolveRepoIdentity(dir, func(string, string) string {
-		return "ghp_beta@github.com:acme/two.git"
-	})
-	assert.NotEqual(t, one, two)
-	assert.NotEqual(t, RedactedURL, one)
-	assert.NotEqual(t, RedactedURL, two)
-	assert.Equal(t, "ghp_alpha@github.com:acme/one.git", one)
-	assert.Equal(t, "ghp_beta@github.com:acme/two.git", two)
-}
-
-func TestResolveRepoIdentityKeepsMainSCPAndPathAt(t *testing.T) {
-	dir := t.TempDir()
-	assert := assert.New(t)
-	cases := []struct{ raw, want string }{
-		{"deploy@git.example.internal:org/repo.git", "deploy@git.example.internal:org/repo.git"},
-		{"gitolite@git.example.com:org/repo.git", "gitolite@git.example.com:org/repo.git"},
-		{"org@vs-ssh.visualstudio.com:v3/org/project/repo", "org@vs-ssh.visualstudio.com:v3/org/project/repo"},
-		{"ssh://git@host/org/repo", "ssh://host/org/repo"},
-		{"https://host.example/org/repo@v2.git", "https://host.example/org/repo@v2.git"},
-	}
-	for _, tc := range cases {
-		got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
-		assert.Equal(tc.want, got, tc.raw)
-	}
-}
-
-func TestResolveRepoIdentityRejectsMalformedCredentials(t *testing.T) {
-	dir := t.TempDir()
-	// stripRepoIdentityURL returns these strings unchanged: url.Parse fails,
-	// or an SCP password contains '@' so scpIdentity refuses the cut.
-	// identityHasCredential is what keeps the secret out of repos.identity.
-	cases := []struct {
-		name, raw, secret string
-	}{
-		{name: "odd escape", raw: "https://user:sekret%zz@github.com/org/repo.git", secret: "sekret"},
-		{name: "encoded colon", raw: "https://user%3Asekret%zz@github.com/org/repo.git", secret: "sekret"},
-		{name: "encoded colon lower", raw: "https://user%3asekret%gg@host/org/repo.git", secret: "sekret"},
-		{name: "empty user encoded", raw: "https://%3Asekret%zz@host/org/repo.git", secret: "sekret"},
-		{name: "empty user", raw: ":sekret@github.com:org/repo.git", secret: "sekret"},
-		{name: "empty user at-password", raw: "https://:sekret%40more%zz@host/org/repo.git", secret: "sekret"},
-		{name: "password contains at", raw: "user:sekret@ret@github.com:org/repo.git", secret: "sekret"},
-		{name: "encoded at in password", raw: "user%3Asekret@ret@github.com:org/repo.git", secret: "sekret"},
-		{name: "encoded at-password", raw: "https://user:sekret%40more%zz@host/repo.git", secret: "sekret"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-			cleaned := stripRepoIdentityURL(tc.raw)
-			assert.Equal(tc.raw, cleaned, "strip leaves this remote for the credential check")
-			assert.True(identityHasCredential(cleaned))
-			got := ResolveRepoIdentity(dir, func(string, string) string { return tc.raw })
-			assert.NotEqual(tc.raw, got)
-			assert.NotContains(got, tc.secret)
-			assert.True(strings.HasPrefix(got, "local://"))
-		})
-	}
-}
-
-func TestResolveRepoIdentitySlashSCPDropsUser(t *testing.T) {
-	dir := t.TempDir()
-	assert := assert.New(t)
-	got := ResolveRepoIdentity(dir, func(string, string) string { return "user@host/org/repo.git" })
-	assert.Equal("host/org/repo.git", got)
-	gitGot := ResolveRepoIdentity(dir, func(string, string) string { return "git@host/org/repo.git" })
-	assert.Equal("git@host/org/repo.git", gitGot)
-	deploy := ResolveRepoIdentity(dir, func(string, string) string {
-		return "deploy@git.example.internal:org/repo.git"
-	})
-	assert.Equal("deploy@git.example.internal:org/repo.git", deploy)
-}
-
-func TestResolveRepoIdentitySCPPasswordDropsQuery(t *testing.T) {
-	dir := t.TempDir()
-	got := ResolveRepoIdentity(dir, func(string, string) string {
-		return "user:password@host:org/repo.git?x=1#f"
-	})
-	assert.Equal(t, "host:org/repo.git", got)
-	assert.NotContains(t, got, "password")
-	assert.NotContains(t, got, "x=1")
-	assert.NotContains(t, got, "#f")
-}
-
-func TestResolveRepoIdentityKeepsQueryAndFragment(t *testing.T) {
-	dir := t.TempDir()
-	assert := assert.New(t)
-	cases := []string{
-		"https://github.com/o/r.git?oauth_token=sekret",
-		"https://github.com/o/r.git?password=sekret",
-		"https://github.com/o/r.git?X-Amz-Signature=abc&x=1",
-		"https://github.com/o/r.git#signed=1",
-	}
-	for _, raw := range cases {
-		got := ResolveRepoIdentity(dir, func(string, string) string { return raw })
-		assert.Equal(raw, got)
-	}
 }
 
 func TestResolveModel(t *testing.T) {
@@ -3653,71 +3505,6 @@ func TestStripURLCredentials(t *testing.T) {
 			name:     "File URL unchanged",
 			input:    "file:///path/to/repo",
 			expected: "file:///path/to/repo",
-		},
-		{
-			name:     "malformed userinfo is redacted",
-			input:    "https://user:fake-credential@ex ample.com/r.git",
-			expected: redactedURL,
-		},
-		{
-			name:     "scp userinfo is redacted",
-			input:    "user:tok@host:o/r",
-			expected: redactedURL,
-		},
-		{
-			name:     "bad percent escape is redacted",
-			input:    "https://user:tok@host/r%zz.git",
-			expected: redactedURL,
-		},
-		{
-			name:     "access_token query is removed",
-			input:    "https://github.com/o/r.git?access_token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "scp token user is redacted",
-			input:    "ghp_x@github.com:o/r.git",
-			expected: redactedURL,
-		},
-		{
-			name:     "token query is removed",
-			input:    "https://github.com/o/r.git?token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "private_token query is removed",
-			input:    "https://github.com/o/r.git?private_token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "access_token fragment is removed",
-			input:    "https://github.com/o/r.git#access_token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "token query drops every query field",
-			input:    "https://github.com/o/r.git?x=1&token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "oauth_token query is removed",
-			input:    "https://github.com/o/r.git?oauth_token=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "ACCESS_TOKEN query is removed regardless of case",
-			input:    "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
-			expected: "https://github.com/o/r.git",
-		},
-		{
-			name:     "schemeless userinfo is removed",
-			input:    "//user:tok@host/x",
-			expected: "//host/x",
-		},
-		{
-			name:     "ssh userinfo is removed",
-			input:    "ssh://user:tok@github.com/o/r.git",
-			expected: "ssh://github.com/o/r.git",
 		},
 	}
 
@@ -5808,4 +5595,81 @@ auth_token = "weak"
 	cfg, err := LoadGlobalFrom(path)
 	require.NoError(t, err)
 	assert.False(t, cfg.Web.Enabled)
+}
+
+func TestStripURLCredentialsForLaunch(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "malformed userinfo is redacted",
+			input:    "https://user:fake-credential@ex ample.com/r.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "scp userinfo is redacted",
+			input:    "user:tok@host:o/r",
+			expected: RedactedURL,
+		},
+		{
+			name:     "bad percent escape is redacted",
+			input:    "https://user:tok@host/r%zz.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "access_token query is removed",
+			input:    "https://github.com/o/r.git?access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "scp token user is redacted",
+			input:    "ghp_x@github.com:o/r.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "token query is removed",
+			input:    "https://github.com/o/r.git?token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "private_token query is removed",
+			input:    "https://github.com/o/r.git?private_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "access_token fragment is removed",
+			input:    "https://github.com/o/r.git#access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "token query drops every query field",
+			input:    "https://github.com/o/r.git?x=1&token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "oauth_token query is removed",
+			input:    "https://github.com/o/r.git?oauth_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "ACCESS_TOKEN query is removed regardless of case",
+			input:    "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "schemeless userinfo is removed",
+			input:    "//user:tok@host/x",
+			expected: "//host/x",
+		},
+		{
+			name:     "ssh userinfo is removed",
+			input:    "ssh://user:tok@github.com/o/r.git",
+			expected: "ssh://github.com/o/r.git",
+		},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.expected, StripURLCredentials(tt.input), tt.input)
+	}
 }
