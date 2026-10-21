@@ -1101,6 +1101,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
 | `auth_key` | string | empty | Shared Bearer key for native daemon APIs; see [Daemon authentication](#daemon-authentication) | No |
+| `allowed_hosts` | array | `[]` | Extra Host names the daemon API accepts on a loopback connection, for a local reverse proxy; see [Daemon authentication](#daemon-authentication) | No |
 | `daemon_tls.*` | table | empty | Mutual TLS files for the daemon's TCP listener; see [Transport security](#transport-security) | No |
 | `web.enabled` | bool | true | Serve the embedded browser application on a separate listener | No |
 | `web.listen` | string | 127.0.0.1:0 | Loopback browser listener address. Port 0 selects an available ephemeral port | No |
@@ -1115,6 +1116,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
 | `agent_quota_cooldown` | string | `30m0s` | Maximum daemon-wide cooldown after an agent quota or session-limit error, as a Go duration such as `10m`, `30m`, or `1h` | Yes |
 | `allow_unsafe_agents` | bool | false | Enable agentic mode globally | Yes |
+| `allow_cursor_cloud` | bool | false | Let a repository `.roborev.toml` select `cursor-cloud`; see [Cursor cloud host](#cursor-cloud-host) | Yes |
 | `anthropic_api_key` | string | - | Anthropic API key for Claude Code | Yes |
 | `review_context_count` | int | 3 | Recent reviews to include as context | Yes |
 | `review_guidelines` | string | - | Global reviewer instructions included in review prompts for every repo | Yes |
@@ -1166,6 +1168,19 @@ Enable it in one of these ways:
     repo value wins)
 - `ROBOREV_DEFAULT_HOST=cursor-cloud` in the environment the daemon runs in
 
+A repository `.roborev.toml` cannot start paid cloud reviews on its own. When
+cursor-cloud comes only from repository config (`host`, `agent`,
+`review_agent*`, `backup_agent`, or `[ci] host`), roborev refuses it unless the
+global `~/.roborev/config.toml` sets `allow_cursor_cloud = true`. The error
+names that key. `allow_cursor_cloud` is read only from the global config; a
+repository file cannot set it. `--host`, `--agent`, the global `host`, global
+agent settings, and `ROBOREV_DEFAULT_HOST` do not need it.
+
+```toml
+# ~/.roborev/config.toml
+allow_cursor_cloud = true
+```
+
 `--host` wins over config, and config wins over `ROBOREV_DEFAULT_HOST`. `local`
 keeps today's agent selection. `host` is the attached host model and still
 requires `ROBOREV_HOST_AGENT=1`. An explicit `cursor-cloud` without
@@ -1203,9 +1218,11 @@ range ref is that review, so `cursor-cloud` refuses it. Goal reviews stay on the
 local agent. A custom prompt is the created job: fix and compact keep that type,
 and run or analyze is a task even when the label contains `..`. Those stay on
 the local agent when `host` is `cursor-cloud`. CI launches `cursor-cloud` only
-when the repository's own `[ci] host` is `cursor-cloud`. The repository `host`,
-the global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. The check
-runs when a matrix member, a named-panel member, or synthesis would enqueue
+when the repository's own `[ci] host` is `cursor-cloud` and the global
+`allow_cursor_cloud` is true. If `CURSOR_API_KEY` is missing, the CI poller logs
+one warning when it first sees such a repository. The repository `host`, the
+global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. The check runs
+when a matrix member, a named-panel member, or synthesis would enqueue
 cursor-cloud, not only when `[ci] host` is set. A fork or cross-repo pull
 request is refused on every one of those paths. An empty or unknown head or base
 repository, including a deleted fork, fails closed and does not launch. The
@@ -1515,11 +1532,19 @@ for all native daemon APIs, including reads, shutdown, streaming, profiling, MCP
 and the OpenAPI document. Authentication is disabled when `auth_key` is empty
 (the default). This key is global-only; repo config cannot override it.
 
-With or without a key, a plain HTTP request that reaches the daemon over a
-loopback connection must name `localhost` or a loopback address as its Host.
-This refuses a web page that rebinds its own DNS name to `127.0.0.1`. The TLS
-listener, Unix sockets, and the web UI listener, which has its own host and
-origin checks, are unchanged.
+Without a key, a plain HTTP request that reaches the daemon over a loopback
+connection must name `localhost` or a loopback address as its Host. This refuses
+a web page that rebinds its own DNS name to `127.0.0.1`. The TLS listener, Unix
+sockets, and the web UI listener, which has its own host and origin checks, are
+unchanged. The check is skipped when `auth_key` is set, since a rebound page
+cannot present the key. A local reverse proxy (Tailscale Serve, nginx, Caddy)
+that forwards to `127.0.0.1:7373` with its public Host header needs `auth_key`,
+or its host names in the global `allowed_hosts`:
+
+```toml
+# ~/.roborev/config.toml
+allowed_hosts = ["box.tail1234.ts.net"]
+```
 
 Generate 32 random bytes encoded as 64 lowercase hex characters:
 

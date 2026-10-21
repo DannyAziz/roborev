@@ -84,6 +84,7 @@ func TestCISameRepoCIOptInLaunchesCursorCloud(t *testing.T) {
 		[]byte("[ci]\nhost = \"cursor-cloud\"\n"),
 		0o644,
 	))
+	h.Cfg.AllowCursorCloud = true
 	h.Cfg.CI.Agents = []string{"codex", "gemini"}
 	h.Cfg.CI.ReviewTypes = []string{"security", "default"}
 	h.stubProcessPRGit()
@@ -142,4 +143,33 @@ func TestCIOptInForkRefusesCursorCloud(t *testing.T) {
 	assert.False(t, h.hasPanel(t, "acme/api", 14, head))
 	assert.Contains(t, logs.String(), "refusing cursor-cloud for acme/api#14")
 	assert.Contains(t, logs.String(), `head repo "fork/api" is not base repo "acme/api"`)
+}
+
+func TestCISameRepoCIOptInWithoutAllowCursorCloudDoesNotLaunch(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
+	t.Setenv("ROBOREV_DEFAULT_HOST", "")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(h.RepoPath, ".roborev.toml"),
+		[]byte("[ci]\nhost = \"cursor-cloud\"\n"),
+		0o644,
+	))
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ReviewTypes = []string{"default"}
+	h.stubProcessPRGit()
+	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
+		return "range-prompt", nil
+	}
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	const head = "ffffffffffffffffffffffffffffffffffffffff"
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+		Number: 15, HeadRefOid: head, HeadRefName: "feature", BaseRefName: "main",
+		HeadRepo: "acme/api", BaseRepo: "acme/api",
+	}, h.Cfg)
+	require.NoError(t, err)
+	assert.False(t, h.hasPanel(t, "acme/api", 15, head))
+	assert.Contains(t, logs.String(), "allow_cursor_cloud")
 }

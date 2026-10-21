@@ -366,8 +366,9 @@ func TestNoPromptFixRangeIsRefusedAndDoesNotRun(t *testing.T) {
 		},
 		{
 			name: "repo config host",
-			set: func(t *testing.T, _ *config.Config, repoPath string, _ *EnqueueRequest) {
+			set: func(t *testing.T, cfg *config.Config, repoPath string, _ *EnqueueRequest) {
 				t.Helper()
+				cfg.AllowCursorCloud = true
 				require.NoError(t, os.WriteFile(
 					filepath.Join(repoPath, ".roborev.toml"),
 					[]byte("host = \"cursor-cloud\"\n"),
@@ -438,8 +439,9 @@ func TestPromptlessTaskOnSingleCommitStaysLocal(t *testing.T) {
 		},
 		{
 			name: "repo config host",
-			set: func(t *testing.T, _ *config.Config, repoPath string, _ *EnqueueRequest) {
+			set: func(t *testing.T, cfg *config.Config, repoPath string, _ *EnqueueRequest) {
 				t.Helper()
+				cfg.AllowCursorCloud = true
 				require.NoError(t, os.WriteFile(
 					filepath.Join(repoPath, ".roborev.toml"),
 					[]byte("host = \"cursor-cloud\"\n"),

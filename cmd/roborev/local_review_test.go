@@ -154,11 +154,8 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
 			t.Setenv(agent.EnvDefaultHost, "")
 			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
-			if tc.global != "" {
-				require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(tc.global), 0o600))
-			} else {
-				_ = os.Remove(config.GlobalConfigPath())
-			}
+			// allow_cursor_cloud lets repo routes reach the --local guard.
+			require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(allowCursorCloudTOML+tc.global), 0o600))
 			if tc.env {
 				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
 			}
@@ -171,6 +168,16 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 			assert.Equal(t, int32(0), httpCalls.Load())
 		})
 	}
+}
+
+// allowCursorCloudTOML lets repository config select cursor-cloud, so these
+// tests reach the --local guard instead of the allow_cursor_cloud gate.
+const allowCursorCloudTOML = "allow_cursor_cloud = true\n"
+
+func allowCursorCloudGlobally(t *testing.T) {
+	t.Helper()
+	dataDir := testenv.SetDataDir(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "config.toml"), []byte(allowCursorCloudTOML), 0o600))
 }
 
 // cloudCreateFails is a cursor-cloud endpoint that fails the test if create
@@ -202,6 +209,7 @@ func seedStaleRoborevHook(t *testing.T, repoDir string) (string, []byte) {
 }
 
 func TestLocalReviewRefusesLevelCursorCloudBeforeHooks(t *testing.T) {
+	allowCursorCloudGlobally(t)
 	cloudCreateFails(t)
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
 	t.Setenv(agent.EnvDefaultHost, "")
@@ -218,6 +226,7 @@ func TestLocalReviewRefusesLevelCursorCloudBeforeHooks(t *testing.T) {
 }
 
 func TestRunLocalReviewNameGuardRefusesCursorCloud(t *testing.T) {
+	allowCursorCloudGlobally(t)
 	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/v0/agents" {
@@ -314,11 +323,8 @@ func TestLocalReviewRefusesCursorCloudAgentRoutes(t *testing.T) {
 		{name: "--host cursor-cloud", args: []string{"--host", agent.CursorCloudHost}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.global != "" {
-				require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(tc.global), 0o600))
-			} else {
-				_ = os.Remove(config.GlobalConfigPath())
-			}
+			// allow_cursor_cloud lets repo routes reach the --local guard.
+			require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(allowCursorCloudTOML+tc.global), 0o600))
 			h := newReviewHarness(t)
 			if tc.repo != "" {
 				h.writeConfig(tc.repo)
@@ -350,11 +356,8 @@ func TestGoalLocalReviewRefusesCursorCloudHostSources(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(agent.EnvDefaultHost, "")
-			if tc.global != "" {
-				require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(tc.global), 0o600))
-			} else {
-				_ = os.Remove(config.GlobalConfigPath())
-			}
+			// allow_cursor_cloud lets repo routes reach the --local guard.
+			require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(allowCursorCloudTOML+tc.global), 0o600))
 			if tc.env {
 				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
 			}
@@ -436,9 +439,7 @@ func TestLocalReviewNeverReachesCursorCloud(t *testing.T) {
 			}
 			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
 			dataDir := testenv.SetDataDir(t)
-			if tc.global != "" {
-				require.NoError(t, os.WriteFile(filepath.Join(dataDir, "config.toml"), []byte(tc.global), 0o600))
-			}
+			require.NoError(t, os.WriteFile(filepath.Join(dataDir, "config.toml"), []byte(allowCursorCloudTOML+tc.global), 0o600))
 			h := newReviewHarness(t)
 			// A remote lets a launch past the binding check reach the dial.
 			out, err := exec.Command("git", "-C", h.Dir, "remote", "add", "origin", "https://github.com/example/repo.git").CombinedOutput()

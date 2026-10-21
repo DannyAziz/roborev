@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/cursorcloud"
 	gitpkg "go.kenn.io/roborev/internal/git"
 	ghpkg "go.kenn.io/roborev/internal/github"
 	"go.kenn.io/roborev/internal/procutil"
@@ -110,11 +111,14 @@ const (
 // CIPoller polls GitHub for open PRs and enqueues security reviews.
 // It also listens for review.completed events and posts results as PR comments.
 type CIPoller struct {
-	db            *storage.DB
-	cfgGetter     ConfigGetter
-	broadcaster   Broadcaster
-	tokenProvider *GitHubAppTokenProvider
-	githubAPIURL  string // Startup value; changing hosts requires a daemon restart.
+	// cloudKeyWarning logs once that a repo [ci] host is cursor-cloud and
+	// CURSOR_API_KEY is missing.
+	cloudKeyWarning sync.Once
+	db              *storage.DB
+	cfgGetter       ConfigGetter
+	broadcaster     Broadcaster
+	tokenProvider   *GitHubAppTokenProvider
+	githubAPIURL    string // Startup value; changing hosts requires a daemon restart.
 
 	// Test seams for mocking side effects (gh/git/LLM) in unit tests.
 	// Nil means use the real implementation.
@@ -857,7 +861,13 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 	if !cfg.CI.Personal.Enabled {
 		members = p.maybeAppendDesignMember(ctx, members, repo, repoCfg, cfg, mergeBase, pr.HeadRefOid)
 	}
-	members, synth, stopCloud := applyCICursorCloudGate(ghRepo, pr, cloudGateCfg, members, synth)
+	if ciCursorCloudOptIn(cloudGateCfg) && strings.TrimSpace(os.Getenv(cursorcloud.EnvAPIKey)) == "" {
+		p.cloudKeyWarning.Do(func() {
+			log.Printf("CI poller: %s sets [ci] host = %q but %s is not set in the daemon environment; its cursor-cloud reviews will fail",
+				ghRepo, agent.CursorCloudHost, cursorcloud.EnvAPIKey)
+		})
+	}
+	members, synth, stopCloud := applyCICursorCloudGate(ghRepo, pr, cloudGateCfg, cfg, members, synth)
 	if stopCloud {
 		return false, nil
 	}
@@ -1167,8 +1177,8 @@ func ciCursorCloudOptIn(repoCfg *config.RepoConfig) bool {
 // ciCursorCloudBlockReason is why a resolved cursor-cloud CI job must not be
 // enqueued. An empty reason means the job may launch. An empty head or base
 // repository is fail-closed, the same as a fork. Anything else needs the
-// repository's own [ci] host.
-func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, pr ghPR) string {
+// repository's own [ci] host and the global allow_cursor_cloud.
+func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, cfg *config.Config, pr ghPR) string {
 	head := strings.TrimSpace(pr.HeadRepo)
 	base := strings.TrimSpace(pr.BaseRepo)
 	if head == "" || base == "" {
@@ -1180,6 +1190,9 @@ func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, pr ghPR) string {
 	if !ciCursorCloudOptIn(repoCfg) {
 		return "repository [ci] host is not cursor-cloud"
 	}
+	if cfg == nil || !cfg.AllowCursorCloud {
+		return (&agent.CursorCloudNotAllowedError{Setting: "[ci] host"}).Error()
+	}
 	return ""
 }
 
@@ -1187,13 +1200,13 @@ func ciCursorCloudBlockReason(repoCfg *config.RepoConfig, pr ghPR) string {
 // It returns stop when a refused cursor-cloud job would still be enqueued,
 // including a cursor-cloud synthesis or a run whose every member was cloud.
 func applyCICursorCloudGate(
-	ghRepo string, pr ghPR, repoCfg *config.RepoConfig,
+	ghRepo string, pr ghPR, repoCfg *config.RepoConfig, cfg *config.Config,
 	members []config.ResolvedMember, synth config.SynthesisSpec,
 ) ([]config.ResolvedMember, config.SynthesisSpec, bool) {
 	if !ciRunUsesCursorCloud(members, synth) {
 		return members, synth, false
 	}
-	reason := ciCursorCloudBlockReason(repoCfg, pr)
+	reason := ciCursorCloudBlockReason(repoCfg, cfg, pr)
 	if reason == "" {
 		return members, synth, false
 	}
