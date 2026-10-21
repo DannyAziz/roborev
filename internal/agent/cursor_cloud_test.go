@@ -1170,6 +1170,25 @@ func TestCursorCloudRefusesUnreadablePromptSnapshot(t *testing.T) {
 	assert.Zero(t, createCount(fake))
 }
 
+func TestCursorCloudUnreadableSnapshotDoesNotSpendHourlyLaunch(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	gate := &cursorCloudLaunchGate{maxConcurrent: 4, maxPerHour: 1}
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	agent := &CursorCloudAgent{
+		Client: fake, RepoURL: "https://github.com/acme/api.git", launches: gate,
+	}
+	path := filepath.Join(t.TempDir(), "missing.md")
+	handoff := fmt.Sprintf("Read the complete task prompt from %q and carry out its instructions. Read the file in full before starting.\n", path)
+
+	_, err := agent.Review(context.Background(), t.TempDir(), sha, handoff, nil)
+	require.Error(t, err)
+	assert.Zero(t, createCount(fake))
+
+	_, err = agent.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, createCount(fake))
+}
+
 func TestCursorCloudDialErrorDoesNotReconcile(t *testing.T) {
 	client := &dialFailCloud{}
 	_, err := (&CursorCloudAgent{Client: client, RepoURL: "https://github.com/acme/widgets.git"}).Review(

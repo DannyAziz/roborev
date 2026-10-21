@@ -307,6 +307,13 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	if err != nil {
 		return "", MarkUnavailable(err)
 	}
+	// Read a local snapshot before reserving a launch. An unreadable path
+	// creates nothing, so it must not take the hourly slot either.
+	launchPrompt, err := cursorCloudLaunchPrompt(prompt)
+	if err != nil {
+		return "", MarkUnavailable(err)
+	}
+
 	// Every cloud call runs under a deadline. withTimeout keeps one the
 	// caller already set, and otherwise uses the host handoff bound.
 	ctx, cancel := a.withTimeout(ctx)
@@ -325,11 +332,6 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// still set so the launch record names the review. repoURL is already
 	// stripped of userinfo. The marker lets a create that fails after send
 	// be found by listing agents and reading the conversation.
-	launchPrompt, err := cursorCloudLaunchPrompt(prompt)
-	if err != nil {
-		// Nothing was created. A local path must not be sent to the remote agent.
-		return "", MarkUnavailable(err)
-	}
 	token := newLaunchToken()
 	if err := ctx.Err(); err != nil {
 		// Already done before CreateAgent. The POST was not sent.
