@@ -25,11 +25,18 @@ func reviewHostApplies(workflow, reviewType, jobType string) bool {
 	}
 }
 
-// enqueueHostJobType is the job type the host guard should see. An empty
-// request field is classified the same way classifyTarget reads the git ref:
-// "dirty" and a ".." range. A single commit stays empty so storage still
-// infers "review" after the commit id is known.
+// enqueueHostJobType is the job type the host guard should see. The git ref
+// wins over a declared job type: job_type "review" with a dirty or range ref
+// is still a dirty or range review. An empty field is classified the same
+// way. A single commit stays empty so storage still infers "review" after
+// the commit id is known.
 func enqueueHostJobType(explicit, customPrompt, gitRef string) string {
+	switch classifyTarget("", gitRef) {
+	case kindDirty:
+		return storage.JobTypeDirty
+	case kindRange:
+		return storage.JobTypeRange
+	}
 	if strings.TrimSpace(explicit) != "" {
 		return explicit
 	}
