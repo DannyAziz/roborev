@@ -996,6 +996,9 @@ func CursorCloudRepoUsable(raw string) bool {
 
 // DeleteCursorCloudLaunchByMarker deletes this launch's agents found by
 // marker. It returns the first id it deleted, also alongside a sweep error.
+// A row from a build before the daemon id has a bare token marker. The token
+// is this row's own random value, so that form names only this launch, and a
+// marker with another daemon's id does not contain it.
 func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) (string, error) {
 	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || !CursorCloudRepoUsable(repoURL) {
 		return "", errors.New("cursor-cloud: cleanup marker is incomplete")
@@ -1008,7 +1011,8 @@ func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Cli
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	_, deleted, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, nil, CursorCloudLaunchMarker(daemonID, token))
+	_, deleted, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, nil,
+		CursorCloudLaunchMarker(daemonID, token), CursorCloudLaunchMarker("", token))
 	if err != nil {
 		return deleted, &cursorCloudCleanupError{op: cursorCloudCleanupSweep, err: err}
 	}

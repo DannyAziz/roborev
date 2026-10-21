@@ -49,3 +49,18 @@ func TestCursorCloudRestartNeverFoundStaysUncleaned(t *testing.T) {
 		assert.Equal(t, 1, n)
 	}
 }
+
+// TestCursorCloudRestartDeletesLegacyMarker seeds a VM whose prompt has the
+// bare token marker an older build wrote. Restart finds and deletes it.
+func TestCursorCloudRestartDeletesLegacyMarker(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	const token = "launch-token-legacy-marker"
+	legacy := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker("", token))
+	cursorCloudBeginToken(t, tc, job.ID, token)
+
+	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	_, err := fake.GetAgent(t.Context(), legacy.ID)
+	require.Error(t, err)
+}
