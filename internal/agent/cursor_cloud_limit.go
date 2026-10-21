@@ -33,27 +33,29 @@ type cursorCloudLaunchGate struct {
 	launched      []time.Time
 }
 
-// cursorCloudLaunches is the process-wide cap used when a review has no
-// injected client and no test gate.
+// cursorCloudLaunches is the process-wide cap.
 var cursorCloudLaunches = &cursorCloudLaunchGate{}
 
 func (a *CursorCloudAgent) launchGate() *cursorCloudLaunchGate {
 	if a != nil && a.launches != nil {
 		return a.launches
 	}
-	// An injected client is a test double. It does not share the process cap
-	// unless the test sets launches.
-	if a != nil && a.Client != nil {
-		return nil
-	}
 	return cursorCloudLaunches
 }
 
+// CursorCloudCapError is a launch the cap refused before anything was
+// sent. The worker requeues the job. RetryAt is when the hourly cap frees a
+// slot; it is zero for the concurrent cap, which frees on a release.
+type CursorCloudCapError struct {
+	Reason  string
+	RetryAt time.Time
+}
+
+func (e *CursorCloudCapError) Error() string {
+	return "cursor-cloud: launch refused: " + e.Reason
+}
+
 func (g *cursorCloudLaunchGate) acquire() (func(), func(), error) {
-	noop := func() {}
-	if g == nil {
-		return noop, noop, nil
-	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := time.Now()
@@ -63,10 +65,13 @@ func (g *cursorCloudLaunchGate) acquire() (func(), func(), error) {
 	concurrent, perHour := g.limits()
 	g.prune(now)
 	if g.active >= concurrent {
-		return nil, nil, fmt.Errorf("cursor-cloud: launch refused: %d agents already running (max concurrent %d)", g.active, concurrent)
+		return nil, nil, &CursorCloudCapError{Reason: fmt.Sprintf("%d agents already running (max concurrent %d)", g.active, concurrent)}
 	}
 	if len(g.launched) >= perHour {
-		return nil, nil, fmt.Errorf("cursor-cloud: launch refused: %d launches in the last hour (max %d per hour)", len(g.launched), perHour)
+		return nil, nil, &CursorCloudCapError{
+			Reason:  fmt.Sprintf("%d launches in the last hour (max %d per hour)", len(g.launched), perHour),
+			RetryAt: g.launched[len(g.launched)-perHour].Add(time.Hour),
+		}
 	}
 	g.active++
 	stamp := now

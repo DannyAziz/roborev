@@ -321,8 +321,8 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Reset stale jobs from previous runs. A cursor-cloud launch that may
-	// already exist is failed and its agents are stopped.
-	if err := s.recoverStaleJobs(ctx); err != nil {
+	// already exist is failed, not requeued.
+	if err := s.db.ResetStaleJobs(); err != nil {
 		log.Printf("Warning: failed to reset stale jobs: %v", err)
 	}
 
@@ -376,6 +376,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		serveErrCh <- s.httpServer.Serve(serveListener)
 	}()
+	s.startCloudLaunchRecovery(ctx)
 
 	if err := cleanupStaleCIWorktrees(ctx); err != nil {
 		log.Printf("Warning: failed to clean up stale CI worktrees: %v", err)
@@ -1076,10 +1077,10 @@ func resolveRerunOpts(
 		if job.JobType == storage.JobTypeClassify {
 			model = config.ResolveClassifyModel("", resolutionPath, cfg)
 		}
-		return storage.ReenqueueOpts{
+		return repinAutoBackup(storage.ReenqueueOpts{
 			Agent: storageName,
 			Model: model,
-		}, nil
+		}, job, resolution, storageName), nil
 	}
 
 	backupAgent := resolution.BackupAgent
@@ -1091,12 +1092,29 @@ func resolveRerunOpts(
 	}
 
 	provider := strings.TrimSpace(job.RequestedProvider)
-	if model := strings.TrimSpace(job.RequestedModel); model != "" {
-		return storage.ReenqueueOpts{Agent: rerunAgent, Model: model, Provider: provider}, nil
+	model := strings.TrimSpace(job.RequestedModel)
+	if model == "" {
+		model = resolution.ModelForSelectedAgent(job.Agent, "")
 	}
+	return repinAutoBackup(storage.ReenqueueOpts{
+		Agent: rerunAgent, Model: model, Provider: provider,
+	}, job, resolution, job.Agent), nil
+}
 
-	model := resolution.ModelForSelectedAgent(job.Agent, "")
-	return storage.ReenqueueOpts{Agent: rerunAgent, Model: model, Provider: provider}, nil
+// repinAutoBackup pins the backup of a job queued with an "auto" backup
+// again, against the rerun's primary and the current config, the way enqueue
+// does. Other jobs keep their stored backup.
+func repinAutoBackup(
+	opts storage.ReenqueueOpts, job *storage.ReviewJob,
+	resolution agent.WorkflowConfig, primary string,
+) storage.ReenqueueOpts {
+	if !job.BackupAuto {
+		return opts
+	}
+	opts.RepinBackup = true
+	opts.BackupAuto = agentname.IsAuto(strings.TrimSpace(resolution.BackupAgent))
+	opts.BackupAgent = pinnedAutoBackup(resolution, job.ReviewType, primary)
+	return opts
 }
 
 func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
@@ -3164,8 +3182,8 @@ func (s *Server) resolveSingleAgent(
 		}
 	}
 	agentName := resolution.PreferredAgent
-	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
-		in.repoCfg, agentName, in.cfg, resolution.BackupAgent,
+	resolved, err := agent.GetPreferredOrBackupEligible(
+		in.repoCfg, agentName, in.cfg, autoBackupEligible(in.req.ReviewType), resolution.BackupAgent,
 	)
 	if err != nil {
 		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {

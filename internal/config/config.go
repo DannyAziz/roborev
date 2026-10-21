@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"net"
 	"net/url"
 	"os"
@@ -255,7 +254,6 @@ type Config struct {
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
 	JobTimeoutMinutes          int                             `toml:"job_timeout_minutes"`
-	CloudLaunchCleanDelayHours int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later restart's empty sweep may clean a cursor-cloud launch. A second list in the same pass does not. 0 uses 24. Never under 1."`
 	IsolateReviews             bool                            `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts."`
 	HookTimeoutSeconds         int                             `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
 	AgentQuotaCooldown         string                          `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
@@ -789,7 +787,6 @@ type RepoConfig struct {
 	ReviewMDFallback                *bool                           `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
 	ReviewGuidelinesSupersedeGlobal bool                            `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
 	JobTimeoutMinutes               int                             `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
-	CloudLaunchCleanDelayHours      int                             `toml:"cloud_launch_clean_delay_hours" comment:"Hours before a later restart's empty sweep may clean a cursor-cloud launch in this repo. A value of at least 1 wins over global. 0, negative, or unparseable clamps to 1 and does not inherit global."`
 	IsolateReviews                  *bool                           `toml:"isolate_reviews" comment:"Run committed reviews in daemon-owned detached checkouts for this repo."`
 	HookTimeoutSeconds              int                             `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
 	ExcludedBranches                []string                        `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
@@ -1025,34 +1022,24 @@ unclear, leave it open and ask the user for direction. Then continue the task th
 	// handler's sequential git calls can exceed the non-Windows budget before
 	// it can reply. The default is raised 10x to absorb that overhead. See #916.
 	DefaultHookTimeoutWindows = 30 * time.Second
-	// DefaultCloudLaunchCleanDelayHours is how long a cursor-cloud launch
-	// stays uncleaned before a later, separate empty restart sweep may
-	// mark it cleaned. 24h is the existing bound: a same-day restart can
-	// still see a VM an earlier list missed. It is not a measured listing lag.
-	DefaultCloudLaunchCleanDelayHours = 24
-	// MinCloudLaunchCleanDelayHours is the floor. A repo value of 0, a
-	// negative value, or a value that does not parse clamps here. It does
-	// not mean the wait is already over, and it does not inherit global.
-	MinCloudLaunchCleanDelayHours = 1
 )
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	cfg := &Config{
-		ServerAddr:                 "127.0.0.1:7373",
-		MaxWorkers:                 4,
-		ReviewContextCount:         3,
-		DefaultAgent:               "codex",
-		JobTimeoutMinutes:          30,
-		CloudLaunchCleanDelayHours: DefaultCloudLaunchCleanDelayHours,
-		AgentQuotaCooldown:         DefaultAgentQuotaCooldown.String(),
-		CodexCmd:                   "codex",
-		ClaudeCodeCmd:              "claude",
-		CursorCmd:                  "agent",
-		PiCmd:                      "pi",
-		OpenCodeCmd:                "opencode",
-		GrokCmd:                    "grok",
-		MouseEnabled:               true,
+		ServerAddr:         "127.0.0.1:7373",
+		MaxWorkers:         4,
+		ReviewContextCount: 3,
+		DefaultAgent:       "codex",
+		JobTimeoutMinutes:  30,
+		AgentQuotaCooldown: DefaultAgentQuotaCooldown.String(),
+		CodexCmd:           "codex",
+		ClaudeCodeCmd:      "claude",
+		CursorCmd:          "agent",
+		PiCmd:              "pi",
+		OpenCodeCmd:        "opencode",
+		GrokCmd:            "grok",
+		MouseEnabled:       true,
 		Cost: CostConfig{
 			Timeout: "10s",
 		},
@@ -1830,65 +1817,6 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 	return resolve(30, repoVal, globalVal)
 }
 
-// ResolveCloudLaunchCleanDelay is the minimum age of a cursor-cloud launch
-// before a later independent empty restart sweep may mark it cleaned.
-// A per-repo value of at least MinCloudLaunchCleanDelayHours wins over the
-// global value. A repo value of 0, a negative value, or a value that does
-// not parse clamps to that floor: it does not inherit global and it does
-// not mean the wait is already over. Global 0 or negative is unset and uses
-// DefaultCloudLaunchCleanDelayHours. The result is never under the floor.
-func ResolveCloudLaunchCleanDelay(repoPath string, globalCfg *Config) time.Duration {
-	hours := DefaultCloudLaunchCleanDelayHours
-	if globalCfg != nil && globalCfg.CloudLaunchCleanDelayHours > 0 {
-		hours = globalCfg.CloudLaunchCleanDelayHours
-	}
-	repoHours, repoSet, err := repoCloudLaunchCleanDelayHours(repoPath)
-	switch {
-	case err != nil || (repoSet && repoHours < MinCloudLaunchCleanDelayHours):
-		hours = MinCloudLaunchCleanDelayHours
-	case repoSet:
-		hours = repoHours
-	}
-	if hours < MinCloudLaunchCleanDelayHours {
-		hours = MinCloudLaunchCleanDelayHours
-	}
-	// A larger count overflows into a negative delay, which the cleanup
-	// gate would treat as already elapsed.
-	if maxHours := math.MaxInt64 / int64(time.Hour); int64(hours) > maxHours {
-		return time.Duration(maxHours) * time.Hour
-	}
-	return time.Duration(hours) * time.Hour
-}
-
-// repoCloudLaunchCleanDelayHours reads the per-repo key. set is false when
-// the key is absent. A present value that is not an integer, or a file that
-// does not parse, returns an error so the caller can clamp instead of
-// treating the delay as already elapsed.
-func repoCloudLaunchCleanDelayHours(repoPath string) (int, bool, error) {
-	_, raw, err := LoadRepoConfigWithRaw(repoPath)
-	if err != nil {
-		return 0, false, err
-	}
-	if raw == nil {
-		return 0, false, nil
-	}
-	v, ok := raw["cloud_launch_clean_delay_hours"]
-	if !ok {
-		return 0, false, nil
-	}
-	switch n := v.(type) {
-	case int64:
-		return int(n), true, nil
-	case float64:
-		if n != float64(int64(n)) {
-			return 0, true, fmt.Errorf("config: cloud_launch_clean_delay_hours is not an integer")
-		}
-		return int(n), true, nil
-	default:
-		return 0, true, fmt.Errorf("config: cloud_launch_clean_delay_hours is not an integer")
-	}
-}
-
 // DefaultHookTimeoutForOS returns the platform default post-commit hook
 // timeout. Windows uses a longer default because each git subprocess spawn is
 // costly there (see DefaultHookTimeoutWindows).
@@ -2654,16 +2582,8 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	}
 	remoteURL := getRemoteURL(repoPath, "")
 	if remoteURL != "" {
-		// Keep the historical identity string. RemoteIdentity lowercases,
-		// drops .git, and rewrites ssh to https, so a repo registered
-		// before that change stops matching and Postgres ON CONFLICT
-		// (identity) splits machines. stripURLCredentials collapses
-		// unclean remotes onto one redacted-url. A result that still
-		// carries a credential falls through to local://.
-		cleaned := stripRepoIdentityURL(remoteURL)
-		if cleaned != "" && cleaned != redactedURL && !identityHasCredential(cleaned) {
-			return cleaned
-		}
+		// Strip credentials from URL to avoid persisting secrets
+		return stripURLCredentials(remoteURL)
 	}
 
 	// 4. Fallback to local path
@@ -2674,45 +2594,67 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	return "local://" + absPath
 }
 
-// StripURLCredentials removes credentials from a URL before it is sent or stored.
-// A URL that cannot be stripped safely becomes RedactedURL.
-func StripURLCredentials(rawURL string) string {
-	return stripURLCredentials(rawURL)
-}
-
 // RedactedURL is the fail-closed result of StripURLCredentials. It contains
 // no userinfo, query, or fragment from the input. Callers that would send
 // this value on must refuse instead of treating it as a repository URL.
 const RedactedURL = "redacted-url"
 
-// redactedURL is the same value for in-package callers.
-const redactedURL = RedactedURL
+// stripURLCredentials removes userinfo (username:password) from a URL.
+// For non-URL strings (e.g., SSH URLs like git@github.com:user/repo.git),
+// returns the original string unchanged.
+func stripURLCredentials(rawURL string) string {
+	// Try to parse as a standard URL
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		// Not a valid URL, return as-is
+		return rawURL
+	}
 
-// stripURLCredentials removes userinfo and every query and fragment.
+	// If there's no scheme, it's likely an SCP-style URL (git@host:repo.git).
+	// Strip any credentials (user:pass@host:repo → host:repo).
+	if parsed.Scheme == "" {
+		if _, after, ok := strings.Cut(rawURL, "@"); ok {
+			return after
+		}
+		return rawURL
+	}
+
+	// If there's no userinfo, return as-is
+	if parsed.User == nil {
+		return rawURL
+	}
+
+	// Clear the userinfo
+	parsed.User = nil
+	return parsed.String()
+}
+
+// StripURLCredentials removes userinfo and every query and fragment before a
+// URL is sent to cursor-cloud. It is not the stored repo identity.
 // git@host:path has no password. Its query and fragment are dropped so a
 // credential in either one is not sent, and the launch URL still names the
-// repository. Anything url.Parse rejects, including a token in the SCP user
-// slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is redactedURL.
-// Callers must not launch with that value.
-func stripURLCredentials(rawURL string) string {
+// repository. Anything url.Parse rejects, including a token in the
+// SCP user slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is
+// RedactedURL. Callers must not launch with that value.
+func StripURLCredentials(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return redactedURL
+		return RedactedURL
 	}
 	if _, ok := gitSCP(rawURL); ok {
 		var host, path string
 		if !scpUserPath(rawURL, &host, &path) || host == "" || path == "" {
-			return redactedURL
+			return RedactedURL
 		}
 		return "git@" + host + ":" + path
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return redactedURL
+		return RedactedURL
 	}
 	if strings.HasPrefix(rawURL, "//") {
 		if parsed.Host == "" {
-			return redactedURL
+			return RedactedURL
 		}
 		parsed.User = nil
 		parsed.RawQuery = ""
@@ -2721,7 +2663,7 @@ func stripURLCredentials(rawURL string) string {
 	}
 	if parsed.Scheme == "" && parsed.Host == "" {
 		if strings.Contains(rawURL, "@") {
-			return redactedURL
+			return RedactedURL
 		}
 		return rawURL
 	}
@@ -2733,145 +2675,20 @@ func stripURLCredentials(rawURL string) string {
 		return parsed.String()
 	}
 	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
-		return redactedURL
+		return RedactedURL
 	}
 	parsed.User = nil
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	parsed.RawFragment = ""
 	if parsed.Host == "" {
-		return redactedURL
+		return RedactedURL
 	}
 	return parsed.String()
-}
-
-// stripRepoIdentityURL keeps the historical remote identity. Unlike
-// stripURLCredentials it never collapses two repositories to redacted-url.
-// url.Parse rejects SCP user@host:path, and that whole string is the stored
-// identity, including a non-git user such as deploy@ or org@vs-ssh. A
-// user:password SCP user is the exception: the password is dropped and
-// host:path is kept so two remotes stay distinct. A ?query or #fragment
-// on that password form is dropped with the password. That is not main's
-// query and fragment. user@host/path, a slash path with no colon, drops a
-// non-git user and keeps host/path. Transport URLs lose userinfo only.
-// Their query and fragment are kept, matching main. Case, a trailing .git,
-// and an '@' in the path are left as stored.
-func stripRepoIdentityURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
-		if id, ok := scpIdentity(rawURL); ok {
-			return id
-		}
-		return rawURL
-	}
-	if parsed.User == nil {
-		return rawURL
-	}
-	parsed.User = nil
-	return parsed.String()
-}
-
-// scpIdentity returns an SCP identity. A user without ':' on a colon path
-// is kept, matching main's parse-error path for deploy@, gitolite@, and
-// gitea@. user:password is removed, and any ?query or #fragment on that
-// form is removed with it, leaving host:path. This does not restore
-// main's query and fragment. user@host/path drops a non-git user.
-func scpIdentity(raw string) (string, bool) {
-	if strings.Contains(raw, "://") {
-		return "", false
-	}
-	user, rest, ok := strings.Cut(raw, "@")
-	if !ok || user == "" || rest == "" || strings.Contains(rest, "@") {
-		return "", false
-	}
-	if i := strings.IndexAny(rest, "?#"); i >= 0 {
-		rest = rest[:i]
-	}
-	if rest == "" {
-		return "", false
-	}
-	if strings.Contains(user, ":") {
-		return rest, true
-	}
-	// Slash path, no colon: bd7a0846 stored host/path without the user.
-	// user@host:path has a colon in the path and falls through to raw.
-	if user != "git" && strings.Contains(rest, "/") && !strings.Contains(rest, ":") {
-		return rest, true
-	}
-	return raw, true
-}
-
-// identityHasCredential reports a value that still carries a secret and
-// therefore must not be stored as a repository identity.
-func identityHasCredential(raw string) bool {
-	if raw == "" || raw == redactedURL {
-		return true
-	}
-	return credentialMaterial(raw)
-}
-
-// credentialMaterial reports user:password in the URL authority. An '@' in
-// the path is not userinfo. An SCP user without ':' (deploy@, git@) is not a
-// password.
-func credentialMaterial(raw string) bool {
-	user, ok := authorityUser(raw)
-	if !ok {
-		return false
-	}
-	if strings.Contains(user, ":") {
-		return true
-	}
-	// url.Parse rejects a bad escape and stripRepoIdentityURL then returns
-	// the raw remote. %3A is still the colon in user:password, including an
-	// empty user (%3Asecret) and a password that itself contains '@'.
-	return strings.Contains(strings.ToLower(user), "%3a")
-}
-
-// SameRepoIdentity reports whether a stored repos.identity and a freshly
-// resolved identity name the same remote. Exact string equality is the
-// stored form. RemoteIdentity is the stack-built canonical form
-// (lowercased github.com path, .git dropped, ssh rewritten to https).
-// A case-sensitive host stays unequal because RemoteIdentity keeps its path case.
-func SameRepoIdentity(stored, resolved string) bool {
-	if stored == resolved {
-		return true
-	}
-	left := RemoteIdentity(stored)
-	right := RemoteIdentity(resolved)
-	return left != "" && left == right
-}
-
-// IdentityCarriesQuery reports an identity with a ?query or #fragment. Main
-// stores such a remote as is, so it may hold a token. Code that rewrites an
-// existing identity must not write one.
-func IdentityCarriesQuery(identity string) bool {
-	return strings.ContainsAny(identity, "?#")
-}
-
-// authorityUser returns the userinfo in the authority, before the path.
-// It does not look at '@' inside the path.
-func authorityUser(raw string) (string, bool) {
-	rest := raw
-	if i := strings.Index(rest, "://"); i >= 0 {
-		rest = rest[i+len("://"):]
-	}
-	authority := rest
-	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
-		authority = authority[:i]
-	}
-	user, _, ok := strings.Cut(authority, "@")
-	if !ok || user == "" {
-		return "", false
-	}
-	return user, true
 }
 
 // RemoteIdentity compares cursor-cloud repository URLs. It is not the stored
-// repo identity; ResolveRepoIdentity keeps the historical string and does not
-// lowercase paths. Userinfo, query, and fragment are dropped. A trailing
+// repo identity. Userinfo, query, and fragment are dropped. A trailing
 // .git is ignored, and git@host:path matches https://host/path. The host is
 // lowercased because DNS names are case-insensitive. The path is lowercased
 // only for github.com, whose owner and repository names are case-insensitive

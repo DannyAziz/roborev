@@ -3,12 +3,9 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"errors"
 	"log"
 	"net/http"
-	"os"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"uuid"
@@ -17,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/agent"
-	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/cursorcloud/cursorcloudtest"
 	"go.kenn.io/roborev/internal/storage"
@@ -26,1022 +22,182 @@ import (
 
 const cursorCloudRestartRepo = "https://example.com/acme/repo.git"
 
-// TestCursorCloudRestartStopsPersistedAgent is the crash pin: agent A is
-// created, the daemon dies with the row still running, and restart must
-// stop and delete A, create nothing else, and fail the job for good.
+// TestCursorCloudRestartStopsPersistedAgent: the daemon died with a saved
+// agent id. Restart fails the job without relaunching, deletes the id, and
+// cleans the row in the same pass once the marker list is empty.
 func TestCursorCloudRestartStopsPersistedAgent(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	local := tc.createJobWithAgent(t, sha, "codex")
-	_, err := tc.DB.Exec(`UPDATE review_jobs SET status = 'running' WHERE id = ?`, local.ID)
-	require.NoError(t, err)
 	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-a", true)
-	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
-	logLine := "cursor-cloud: created agent " + created.ID + "\n"
-	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte(logLine), 0o600))
-	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.ErrorContains(t, recoverStaleJobs(t.Context(), tc.DB, fake), "not listed yet")
+	require.NoError(t, cursorCloudRecover(t, tc, fake))
 	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
 
 	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop))
 	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	body, err := os.ReadFile(JobLogPath(job.ID))
-	require.NoError(t, err)
-	assert.Equal(t, logLine, string(body))
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
 	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-	assert.Equal(t, 0, updated.RetryCount)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-		},
-	}
-	require.NoError(t, recoverStaleJobs(t.Context(), tc.DB, fake))
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 0, n)
-	claimed, err := tc.DB.ClaimJob(testWorkerID + "-again")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, local.ID, claimed.ID)
+	assert.Equal(t, 0, cursorCloudUncleaned(t, tc, job.ID))
 }
 
-// TestCursorCloudRestartSweepsMarkerWithoutID is the crash between the
-// create POST and persisting the agent id. The launch token is already
-// stored, and the marker sweep must delete A.
+// TestCursorCloudRestartSweepsMarkerWithoutID: the crash fell between the
+// create and saving the id. The marker sweep deletes the VM and that sweep
+// cleans the row. Agents with another daemon or token are left alone.
 func TestCursorCloudRestartSweepsMarkerWithoutID(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-no-id", false)
-
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
-
-	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop))
-	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	_, err := fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-	assert.Equal(t, 0, updated.RetryCount)
-}
-
-// TestCursorCloudRestartLeavesForeignMarker is the negative pin. A sweep
-// may stop or delete only the agent whose marker is this daemon and this
-// job's launch token. Removing that scope deletes a foreign agent and
-// this test fails.
-func TestCursorCloudRestartLeavesForeignMarker(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 	machineID, err := tc.DB.GetMachineID()
 	require.NoError(t, err)
-	const token = "launch-token-scope"
-	ours := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token))                       //nolint:forbidigo // launch marker is prompt text
-	otherDaemon := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(uuid.New().String(), token))               //nolint:forbidigo // foreign daemon id in the marker
-	otherToken := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), "someone-elses-token")) //nolint:forbidigo // launch marker is prompt text
-	require.NoError(t, tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, cursorCloudRestartRepo))
+	otherDaemon := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(uuid.New().String(), "launch-token-no-id")) //nolint:forbidigo // foreign daemon id in the marker
+	otherToken := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), "someone-elses-token"))  //nolint:forbidigo // launch marker is prompt text
 
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
+	require.NoError(t, cursorCloudRecover(t, tc, fake))
 
-	assert.Equal(t, []string{ours.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop))
-	assert.Equal(t, []string{ours.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	_, err = fake.GetAgent(t.Context(), ours.ID)
-	require.Error(t, err)
-	for _, id := range []string{otherDaemon.ID, otherToken.ID} {
-		got, getErr := fake.GetAgent(t.Context(), id)
-		require.NoError(t, getErr)
-		assert.Equal(t, id, got.ID)
-	}
-}
-
-// TestCursorCloudRestartKeepsEveryAttempt crashes on A, restarts into a
-// cleanup that does not confirm the delete, then crashes again on attempt
-// B. The final restart stops and deletes both. A single overwritten column
-// loses A and this test fails.
-func TestCursorCloudRestartKeepsEveryAttempt(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	agentA := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-a", true)
-	fake.DeleteFailures = 3
-
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	_, err := fake.GetAgent(t.Context(), agentA.ID)
-	require.NoError(t, err)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n, "failed delete must not mark cleanup done")
-
-	_, err = tc.DB.Exec(
-		`UPDATE review_jobs SET status = 'running', worker_id = ? WHERE id = ?`,
-		testWorkerID, job.ID,
-	)
-	require.NoError(t, err)
-	agentB := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-b", true)
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 2, n)
-	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
-
-	creates = cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
-	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
-	for _, id := range []string{agentA.ID, agentB.ID} {
-		assert.Contains(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop), id)
-		assert.Contains(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete), id)
-		_, getErr := fake.GetAgent(t.Context(), id)
-		require.Error(t, getErr)
-	}
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 2, n)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-		},
-	}
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 0, n)
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-}
-
-// TestCursorCloudRestartDeleteFailureNotesJob is a restart delete that is
-// refused. The failure is not only a log line: the job error keeps the
-// orphan risk and the launch stays uncleaned.
-func TestCursorCloudRestartDeleteFailureNotesJob(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-restart-403", true)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusForbidden, Message: "forbidden",
-		},
-	}
-
-	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Contains(t, updated.Error, "orphan risk")
-}
-
-// TestCursorCloudRestartRetires404 marks cleanup done when delete reports
-// the agent is already gone, and not when delete fails.
-func TestCursorCloudRestartRetires404(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-404", true)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-		},
-	}
-
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.NoError(t, err, "404 means the server already dropped the agent; cleanup must not invent a second delete")
-}
-
-// TestCursorCloudRestartKeepsUnlistedToken is lag 1. The first restart lists
-// before the token-only agent exists, so the row stays uncleaned. The next
-// restart sees it and deletes it, and does not create another agent.
-func TestCursorCloudRestartKeepsUnlistedToken(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-lag"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-
-	created := cursorCloudShowToken(t, tc, fake, sha, token)
-	creates = cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	cursorCloudAssertNoRelaunch(t, tc, job.ID, fake, creates)
 	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-}
-
-// TestCursorCloudRestartKeepsTokenAcrossTwoLags is lag 2. Two restarts both
-// miss the token-only agent. The row stays uncleaned, then the list catches
-// up and that same row is deleted.
-func TestCursorCloudRestartKeepsTokenAcrossTwoLags(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-two-lags"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-
-	for range 2 {
-		require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
+	for _, id := range []string{otherDaemon.ID, otherToken.ID} {
+		_, getErr := fake.GetAgent(t.Context(), id)
+		require.NoError(t, getErr)
 	}
-
-	created := cursorCloudShowToken(t, tc, fake, sha, token)
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	_, err := fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, 0, cursorCloudUncleaned(t, tc, job.ID))
 }
 
-// TestCursorCloudRestartReportsUnlistedOrphan ages a token-only miss past
-// the sweep window. The row stays uncleaned. A young miss already writes the
-// orphan warning on the job; the age-out line is what the log adds later.
-func TestCursorCloudRestartReportsUnlistedOrphan(t *testing.T) {
+// TestCursorCloudRestartUnlistedAmbiguousCreate: no id and no listed VM.
+// A launch younger than the reconcile window may not be listed yet and
+// stays uncleaned. An older one was never created and is cleaned.
+func TestCursorCloudRestartUnlistedAmbiguousCreate(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudBeginToken(t, tc, job.ID, "launch-token-bound")
-	logs := cursorCloudCaptureLog(t)
+	cursorCloudBeginToken(t, tc, job.ID, "launch-token-unlisted")
 
-	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.NotContains(t, logs.String(), "orphan risk")
-	var young string
-	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&young))
-	assert.Contains(t, young, "orphan risk")
+	require.NoError(t, cursorCloudRecover(t, tc, fake))
+	assert.Equal(t, 1, cursorCloudUncleaned(t, tc, job.ID))
 
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
+	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-1 hour') WHERE job_id = ?`, job.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.Contains(t, logs.String(), "orphan risk")
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Contains(t, updated.Error, "orphan risk")
-	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
+	require.NoError(t, cursorCloudRecover(t, tc, fake))
+	assert.Equal(t, 0, cursorCloudUncleaned(t, tc, job.ID))
+	assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
 }
 
-// TestCursorCloudRestartAgesCrashBeforePost is a token saved before the
-// create POST. There is no VM. Once the row is older than the sweep window,
-// restart reports the orphan risk and does not mark it cleaned.
-func TestCursorCloudRestartAgesCrashBeforePost(t *testing.T) {
+// TestCursorCloudRestartSkipsConfirmedDelete: the in-process delete of the
+// id was confirmed but its marker list failed. Restart does not delete the
+// id again; it sweeps the marker and cleans.
+func TestCursorCloudRestartSkipsConfirmedDelete(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudBeginToken(t, tc, job.ID, "launch-token-no-post")
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	logs := cursorCloudCaptureLog(t)
+	cursorCloudBeginToken(t, tc, job.ID, "launch-token-deleted")
+	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, "launch-token-deleted", "bc_gone"))
+	require.NoError(t, tc.DB.MarkCloudAgentDeleted(job.ID, "launch-token-deleted"))
 
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
+	require.NoError(t, cursorCloudRecover(t, tc, fake))
+
 	assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodStop))
 	assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.Contains(t, logs.String(), "orphan risk")
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Contains(t, updated.Error, "orphan risk")
+	assert.Equal(t, 0, cursorCloudUncleaned(t, tc, job.ID))
 }
 
-// TestCursorCloudRestartKeepsEmptyToken is the empty-token pin. Restart
-// must not mark a ” or NULL token cleaned. The orphan warning stays, and
-// no delete runs, because there is no marker that can prove the VM is gone.
-func TestCursorCloudRestartKeepsEmptyToken(t *testing.T) {
-	for _, tokenNull := range []bool{false, true} {
-		name := "empty"
-		if tokenNull {
-			name = "null"
-		}
-		t.Run(name, func(t *testing.T) {
-			tc, fake := cursorCloudRestartFixture(t)
-			sha := testutil.GetHeadSHA(t, tc.TmpDir)
-			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-			if tokenNull {
-				cursorCloudAllowNullToken(t, tc.DB)
-				_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
-					(job_id, launch_token, repo_identity, created_at)
-					VALUES (?, NULL, ?, datetime('now'))`, job.ID, cursorCloudRestartRepo)
-				require.NoError(t, err)
-			} else {
-				// BeginCloudLaunch refuses an empty token because the pending
-				// note is keyed by token. The row is inserted the way a NULL
-				// token is: already stored, with nothing to sweep.
-				_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
-					(job_id, launch_token, repo_identity, created_at)
-					VALUES (?, '', ?, datetime('now'))`, job.ID, cursorCloudRestartRepo)
-				require.NoError(t, err)
-				_, err = tc.DB.Exec(`UPDATE review_jobs SET agent_invoked = 1 WHERE id = ?`, job.ID)
-				require.NoError(t, err)
-			}
-			logs := cursorCloudCaptureLog(t)
+// TestCursorCloudRestartListsOncePerRepo: several rows in one repository
+// share one agent list.
+func TestCursorCloudRestartListsOncePerRepo(t *testing.T) {
+	tc, fake := cursorCloudRestartFixture(t)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	var jobs []int64
+	for _, token := range []string{"launch-token-1", "launch-token-2", "launch-token-3"} {
+		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+		cursorCloudPersistAttempt(t, tc, fake, job.ID, token, false)
+		jobs = append(jobs, job.ID)
+	}
+	counting := &countListCloud{Fake: fake}
 
-			require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-			n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-			require.NoError(t, err)
-			assert.Equal(t, 1, n)
-			assert.Contains(t, logs.String(), "orphan risk")
-			assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-			updated, err := tc.DB.GetJobByID(job.ID)
-			require.NoError(t, err)
-			assert.Contains(t, updated.Error, "orphan risk")
+	require.NoError(t, cursorCloudRecover(t, tc, counting))
 
-			var stored sql.NullString
-			var cleaned int
-			require.NoError(t, tc.DB.QueryRow(
-				`SELECT launch_token, cleaned FROM review_job_cloud_launches WHERE job_id = ?`, job.ID,
-			).Scan(&stored, &cleaned))
-			assert.Equal(t, 0, cleaned)
-			assert.Equal(t, !tokenNull, stored.Valid)
-			if stored.Valid {
-				assert.Empty(t, stored.String)
-			}
-		})
+	assert.Equal(t, int32(1), counting.lists.Load())
+	assert.Len(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete), 3)
+	for _, id := range jobs {
+		assert.Equal(t, 0, cursorCloudUncleaned(t, tc, id))
 	}
 }
 
-// cursorCloudAllowNullToken rebuilds the launch table in this test database
-// so a NULL token can be inserted. Production migration of that column is
-// not this test's job.
-func cursorCloudAllowNullToken(t *testing.T, db *storage.DB) {
-	t.Helper()
-	_, err := db.Exec(`CREATE TABLE review_job_cloud_launches_nullable (
-		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, launch_token TEXT,
-		agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
-		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
-		orphan_note TEXT NOT NULL DEFAULT '', sweep_seen INTEGER NOT NULL DEFAULT 0)`)
-	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO review_job_cloud_launches_nullable
-		(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen)
-		SELECT id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen
-		FROM review_job_cloud_launches`)
-	require.NoError(t, err)
-	_, err = db.Exec(`DROP TABLE review_job_cloud_launches`)
-	require.NoError(t, err)
-	_, err = db.Exec(`ALTER TABLE review_job_cloud_launches_nullable RENAME TO review_job_cloud_launches`)
-	require.NoError(t, err)
-}
-
-// TestCursorCloudRestartUsesStoredRepoIdentity changes origin after the
-// launch row is written. Cleanup still deletes the agent from the create-time
-// repository and leaves an agent on the new remote alone.
-func TestCursorCloudRestartUsesStoredRepoIdentity(t *testing.T) {
+// TestCursorCloudRestartDeleteFailureStaysUncleaned: a delete that does not
+// finish leaves the row for the next start.
+func TestCursorCloudRestartDeleteFailureStaysUncleaned(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-repo"
-	const moved = "https://example.com/acme/moved.git"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	marker := agent.CursorCloudLaunchMarker(machineID.String(), token) //nolint:forbidigo // launch marker is prompt text
-	ours := cursorCloudSeedAgent(t, fake, sha, marker)
-	tc.GitRepo.Run("remote", "set-url", "origin", moved)
-	decoy, err := fake.CreateAgent(t.Context(), cursorcloud.CreateAgentRequest{
-		Repo: moved, Ref: sha, Prompt: "review\n" + marker + "\n",
-	})
-	require.NoError(t, err)
+	cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-refused", true)
+	fake.MethodErrors = map[string]error{cursorcloudtest.MethodDelete: &cursorcloud.APIError{
+		Op: "delete agent", StatusCode: http.StatusForbidden, Message: "forbidden",
+	}}
 
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	_, err = fake.GetAgent(t.Context(), ours.ID)
-	require.Error(t, err)
-	got, err := fake.GetAgent(t.Context(), decoy.ID)
-	require.NoError(t, err)
-	assert.Equal(t, decoy.ID, got.ID)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	require.Error(t, cursorCloudRecover(t, tc, fake))
+	assert.Equal(t, 1, cursorCloudUncleaned(t, tc, job.ID))
 }
 
-type cursorCloudPanicWriter struct{}
-
-func (cursorCloudPanicWriter) Write([]byte) (int, error) { panic("output exploded") }
-
-// TestCursorCloudPanicDeleteFailureLeavesLaunch is the c7 pin. Cleanup output
-// panics and the delete fails. The delete note is still logged, and the
-// launch row is not marked cleaned.
-func TestCursorCloudPanicDeleteFailureLeavesLaunch(t *testing.T) {
+// TestServerCloudLaunchRecoveryRunsInBackground: startup only reads the
+// rows. The sweep runs after the call returns.
+func TestServerCloudLaunchRecoveryRunsInBackground(t *testing.T) {
 	tc, fake := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodStop: errors.New("stop exploded"),
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusBadRequest, Message: "delete refused",
-		},
-	}
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	cloud.DaemonID = machineID.String() //nolint:forbidigo // launch marker is prompt text
-	cloud.BindLaunch = func(token, repoURL string) error {
-		return tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, repoURL)
-	}
-	cloud.BindAgent = func(token, id string) error {
-		return tc.DB.AttachCloudAgent(job.ID, token, id)
-	}
+	cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-server", true)
+	block := make(chan struct{})
+	srv := &Server{db: tc.DB, cloudLaunchClient: &blockListCloud{Fake: fake, block: block}}
 
-	var logs bytes.Buffer
-	prev := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(prev) })
+	srv.startCloudLaunchRecovery(t.Context())
+	assert.Equal(t, 1, cursorCloudUncleaned(t, tc, job.ID))
+	close(block)
 
-	require.PanicsWithValue(t, "output exploded", func() {
-		_, _ = cloud.Review(context.Background(), tc.TmpDir, sha, "prompt", cursorCloudPanicWriter{})
-	})
-
-	assert.Contains(t, logs.String(), "cursor-cloud: delete agent")
-	assert.Equal(t, 1, cursorCloudCallCount(fake, cursorcloudtest.MethodDelete))
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	ids := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
-	require.NotEmpty(t, ids)
-	_, err = fake.GetAgent(t.Context(), ids[0])
-	require.NoError(t, err)
+	// The sweep writes SQLite from its own goroutine.
+	assert.Eventually(t, func() bool {
+		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
+		return err == nil && n == 0
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
-type cursorCloudStopPanicWriter struct{}
-
-func (cursorCloudStopPanicWriter) Write(p []byte) (int, error) {
-	if bytes.Contains(p, []byte("stop agent")) {
-		panic("output exploded")
-	}
-	return len(p), nil
-}
-
-// TestCursorCloudStopErrorWritePanicStillDeletes panics at the stop-error
-// note, after delete. The status line is written and does not panic.
-func TestCursorCloudStopErrorWritePanicStillDeletes(t *testing.T) {
-	fake := &cursorcloudtest.Fake{
-		CreateStatus: cursorcloud.StatusFinished,
-		Final:        "ok",
-		MethodErrors: map[string]error{cursorcloudtest.MethodStop: errors.New("stop exploded")},
-	}
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	sha := "0123456789abcdef0123456789abcdef01234567"
-	var panicked any
-	func() {
-		defer func() { panicked = recover() }()
-		_, _ = cloud.Review(context.Background(), t.TempDir(), sha, "prompt", cursorCloudStopPanicWriter{})
-	}()
-	assert.Equal(t, "output exploded", panicked)
-	assert.Equal(t, 1, cursorCloudCallCount(fake, cursorcloudtest.MethodDelete))
-}
-
-// TestCursorCloudDeleteFailureSurfacesOrphanRisk is a delete that fails all
-// of its attempts. The launch stays uncleaned and the job error and log show
-// the orphan risk in this process, not on a later start.
-func TestCursorCloudDeleteFailureSurfacesOrphanRisk(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	fake.CreateStatus = cursorcloud.StatusFinished
-	fake.Final = "ok"
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable",
-		},
-	}
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	bound := tc.Pool.bindCursorCloudLaunch(testWorkerID, job, cloud)
-	logs := cursorCloudCaptureLog(t)
-
-	_, err := bound.Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
-	require.Error(t, err)
-	assert.Equal(t, 3, cursorCloudCallCount(fake, cursorcloudtest.MethodDelete))
-	assert.Contains(t, logs.String(), "orphan risk")
-	assert.Contains(t, logs.String(), "pending cleanup")
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Contains(t, updated.Error, "orphan risk")
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-}
-
-// TestCursorCloudRestartFailsSynthesisBackupLaunch crashes a synthesis job
-// whose backup is cursor-cloud. Restart fails it, does not create again, and
-// keeps the log.
-func TestCursorCloudRestartFailsSynthesisBackupLaunch(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	_, _, synth := enqueuePanelRun(t, tc, "cloud-backup", []memberSpec{{name: "m0", agent: "test"}})
-	_, err := tc.DB.Exec(
-		`UPDATE review_jobs SET status = 'running', worker_id = ?, agent = ?, backup_agent = ? WHERE id = ?`,
-		testWorkerID, "test", agent.CursorCloudHost, synth.ID,
-	)
-	require.NoError(t, err)
-	cursorCloudPersistAttempt(t, tc, fake, synth.ID, "launch-token-synth", true)
-	cursorCloudAgeLaunchPastLag(t, tc.DB, synth.ID)
-	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
-	const logLine = "cursor-cloud: created agent bc_synth\n"
-	require.NoError(t, os.WriteFile(JobLogPath(synth.ID), []byte(logLine), 0o600))
-
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "not listed yet")
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
-	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-	body, err := os.ReadFile(JobLogPath(synth.ID))
-	require.NoError(t, err)
-	assert.Equal(t, logLine, string(body))
-	claimed, err := tc.DB.ClaimJob(testWorkerID + "-synth")
-	require.NoError(t, err)
-	if claimed != nil {
-		assert.NotEqual(t, synth.ID, claimed.ID)
-	}
-}
-
-func TestCursorCloudUnboundLaunchIsRefused(t *testing.T) {
-	_, err := (&agent.CursorCloudAgent{}).Review(
-		context.Background(), t.TempDir(),
-		"0123456789abcdef0123456789abcdef01234567", "prompt", nil,
-	)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "launch binding")
-}
-
-// TestCursorCloudRestartUsesStoredIdentityWithoutRemote removes origin after
-// the token-only row is stored. Recovery deletes that agent with the stored
-// repository and does not sweep redacted-url.
-func TestCursorCloudRestartUsesStoredIdentityWithoutRemote(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-no-remote"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	marker := agent.CursorCloudLaunchMarker(machineID.String(), token) //nolint:forbidigo // launch marker is prompt text
-	ours := cursorCloudSeedAgent(t, fake, sha, marker)
-	tc.GitRepo.Run("remote", "remove", "origin")
-
-	lists := cursorCloudCallCount(fake, cursorcloudtest.MethodList)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	_, err = fake.GetAgent(t.Context(), ours.ID)
-	require.Error(t, err)
-	_, err = agent.DeleteCursorCloudLaunchByMarker(
-		context.Background(), fake, machineID.String(), token, config.RedactedURL, //nolint:forbidigo // launch marker is prompt text
-	)
-	require.Error(t, err)
-	assert.Equal(t, lists+1, cursorCloudCallCount(fake, cursorcloudtest.MethodList), "redacted-url must not start another sweep")
-}
-
-// TestCursorCloudRestartNotesLegacyGoneRemote is the pin for a token-only
-// row stored before repo_identity existed. The checkout remote is gone, so
-// recovery cannot list. Every start surfaces the orphan marker and leaves
-// the row uncleaned. A silent success, or a sweep error with no marker,
-// fails this test.
-func TestCursorCloudRestartNotesLegacyGoneRemote(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudLegacyToken(t, tc, job.ID, "launch-token-legacy-gone")
-	tc.GitRepo.Run("remote", "remove", "origin")
-	logs := cursorCloudCaptureLog(t)
-
-	cursorCloudAssertLegacySweepOrphan(t, tc, fake, job.ID, logs)
-}
-
-// TestCursorCloudRestartNotesLegacyUnusableRepo is the same pin when the
-// stored checkout itself cannot be read. repo_identity is empty and the
-// repo path is not a git checkout, so there is still nothing to list.
-func TestCursorCloudRestartNotesLegacyUnusableRepo(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudLegacyToken(t, tc, job.ID, "launch-token-legacy-unusable")
-	_, err := tc.DB.Exec(`UPDATE repos SET root_path = ? WHERE id = ?`, t.TempDir(), job.RepoID)
-	require.NoError(t, err)
-	logs := cursorCloudCaptureLog(t)
-
-	cursorCloudAssertLegacySweepOrphan(t, tc, fake, job.ID, logs)
-}
-
-// TestCursorCloudRestartDeletesLegacyRowWithLiveRemote is the delete half of
-// the legacy pin. repo_identity is empty, and origin still names the
-// repository the agent was launched on. Restart deletes that agent. A second
-// start leaves it cleaned. Skipping the row leaves the agent in place.
-func TestCursorCloudRestartDeletesLegacyRowWithLiveRemote(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-legacy-live"
-	cursorCloudLegacyToken(t, tc, job.ID, token)
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	created := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
-
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-
-	err = recoverStaleJobs(context.Background(), tc.DB, fake)
-	require.ErrorContains(t, err, "not listed yet")
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-}
-
-// TestCursorCloudRestartDeletesAcceptedFileHostLaunch is the round trip for
-// an odd shape both validators accept. The launch POSTs file://localhost/...,
-// and the restart sweep deletes that agent from the stored identity.
-func TestCursorCloudRestartDeletesAcceptedFileHostLaunch(t *testing.T) {
-	const raw = "file://localhost/tmp/repo.git"
-	cleaned := config.StripURLCredentials(raw)
-	require.NotEqual(t, config.RedactedURL, cleaned)
-	require.NotEmpty(t, config.RemoteIdentity(cleaned))
-	require.True(t, agent.CursorCloudRepoUsable(cleaned))
-
-	tc, _ := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	fake := &cursorcloudtest.Fake{
-		CreateStatus: cursorcloud.StatusFinished,
-		Final:        "ok",
-		MethodErrors: map[string]error{
-			cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-				Op: "delete agent", StatusCode: http.StatusBadRequest, Message: "refused",
-			},
-		},
-	}
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: raw}
-	cloud.DaemonID = machineID.String() //nolint:forbidigo // launch marker is prompt text
-	cloud.BindLaunch = func(token, repoURL string) error {
-		return tc.DB.BeginCloudLaunch(job.ID, testWorkerID, token, repoURL)
-	}
-
-	_, err = cloud.Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
-	require.Error(t, err)
-	assert.Equal(t, 1, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	listed, err := fake.ListAgents(t.Context())
-	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	assert.Equal(t, cleaned, listed[0].SourceRepository)
-	var stored string
-	require.NoError(t, tc.DB.QueryRow(`SELECT repo_identity FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&stored))
-	assert.Equal(t, cleaned, stored)
-
-	fake.MethodErrors = nil
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-	_, err = fake.GetAgent(t.Context(), listed[0].ID)
-	require.Error(t, err)
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-}
-
-func TestCursorCloudUpdateInterruptDoesNotRelaunch(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-update", true)
-	tc.Pool.InterruptJobsForUpdate([]int64{job.ID})
-
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	handled := tc.Pool.handleUpdateInterruption(context.Background(), testWorkerID, job)
-	assert.True(t, handled)
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	claimed, err := tc.DB.ClaimJob(testWorkerID + "-update")
-	require.NoError(t, err)
-	if claimed != nil {
-		assert.NotEqual(t, job.ID, claimed.ID)
-	}
-}
-
-// TestDoneContextPersistsNoCloudLaunch pins the order of the pre-create
-// checks. A context that is already done must not insert a launch row and
-// must not call create. Moving the context check to after BindLaunch leaves
-// a row and this test fails.
-func TestDoneContextPersistsNoCloudLaunch(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	bound := tc.Pool.bindCursorCloudLaunch(testWorkerID, job, cloud)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	before := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	_, err := bound.Review(ctx, tc.TmpDir, sha, "review the commit", nil)
-	require.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, before, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	n, nerr := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, nerr)
-	assert.Equal(t, 0, n)
-}
-
-// TestCursorCloudRestartReaps429Create is a create that stores an agent and
-// then returns 429. The in-process reconcile retries that list and still
-// stops while every attempt is 429, so the agent is still there. The
-// startup sweep lists again: a list 429 leaves the token row uncleaned. A
-// later miss keeps the row. The next list deletes the agent and does not
-// create another.
-func TestCursorCloudRestartReaps429Create(t *testing.T) {
-	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
-	tc, fake := cursorCloudRestartFixture(t)
-	provider := &create429Cloud{Fake: fake}
-	provider.setListErr(&cursorcloud.APIError{
-		Op: "list agents", StatusCode: http.StatusTooManyRequests, Message: "too many requests",
-		HasRetryAfter: true, RetryAfter: time.Millisecond,
-	})
-	prev, err := agent.Get(agent.CursorCloudHost)
-	require.NoError(t, err)
-	cloud := &agent.CursorCloudAgent{Client: provider, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	agent.Register(cloud)
-	t.Cleanup(func() { agent.Register(prev) })
-
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	tc.Pool.processJob(testWorkerID, job)
-
-	require.NotEmpty(t, provider.createdID)
-	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
-	assert.Equal(t, 1, creates)
-	_, err = fake.GetAgent(t.Context(), provider.createdID)
-	require.NoError(t, err, "a 429 create that stored an agent must still be reachable before restart")
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n, "token-only row stays uncleaned until its marked agent is found and deleted")
-
-	err = recoverStaleJobs(context.Background(), tc.DB, provider)
-	require.Error(t, err)
-	require.ErrorContains(t, err, "too many requests")
-	assert.Equal(t, 4, provider.listCalls(), "in-process list retries three times, then the startup sweep lists once")
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n, "a list 429 leaves the token row uncleaned")
-
-	provider.setListErr(nil)
-	provider.setHide(true)
-	require.Error(t, recoverStaleJobs(context.Background(), tc.DB, provider))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	_, err = fake.GetAgent(t.Context(), provider.createdID)
-	require.NoError(t, err)
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n, "a later list that misses the agent keeps the token row uncleaned")
-
-	provider.setHide(false)
-	require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, provider))
-	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
-	_, err = fake.GetAgent(t.Context(), provider.createdID)
-	require.Error(t, err)
-	n, err = tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-}
-
-// create429Cloud stores the launch, then answers 429. listErr withholds the
-// agent from the in-process reconcile. hide is a later list that does not
-// contain it.
-type create429Cloud struct {
+type countListCloud struct {
 	*cursorcloudtest.Fake
-	mu        sync.Mutex
-	listErr   error
-	hide      bool
-	createdID string
-	lists     int
+	lists atomic.Int32
 }
 
-func (c *create429Cloud) listCalls() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lists
-}
-
-func (c *create429Cloud) setListErr(err error) {
-	c.mu.Lock()
-	c.listErr = err
-	c.mu.Unlock()
-}
-
-func (c *create429Cloud) setHide(hide bool) {
-	c.mu.Lock()
-	c.hide = hide
-	c.mu.Unlock()
-}
-
-func (c *create429Cloud) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
-	created, err := c.Fake.CreateAgent(ctx, req)
-	if err != nil {
-		return cursorcloud.Agent{}, err
-	}
-	c.mu.Lock()
-	c.createdID = created.ID
-	c.mu.Unlock()
-	return cursorcloud.Agent{}, &cursorcloud.APIError{
-		Op: "create agent", StatusCode: http.StatusTooManyRequests, Message: "too many requests",
-	}
-}
-
-func (c *create429Cloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
-	c.mu.Lock()
-	c.lists++
-	listErr := c.listErr
-	hide := c.hide
-	c.mu.Unlock()
-	if listErr != nil {
-		return nil, listErr
-	}
-	if hide {
-		return nil, nil
-	}
+func (c *countListCloud) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
+	c.lists.Add(1)
 	return c.Fake.ListAgents(ctx)
 }
 
-func TestCursorCloudRecoveryCleansLaunchAfterJobDelete(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-deleted-job"
-	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, token, true)
-	cursorCloudAgeLaunchPastLag(t, tc.DB, job.ID)
-	conn, err := tc.DB.Conn(t.Context())
-	require.NoError(t, err)
-	defer conn.Close()
-	_, err = conn.ExecContext(t.Context(), `PRAGMA foreign_keys = OFF`)
-	require.NoError(t, err)
-	_, err = conn.ExecContext(t.Context(), `DELETE FROM review_jobs WHERE id = ?`, job.ID)
-	require.NoError(t, err)
-
-	require.ErrorContains(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil), "not listed yet")
-	var cleaned int
-	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = ?`, token).Scan(&cleaned))
-	assert.Equal(t, 0, cleaned)
-
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-		},
-	}
-	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil))
-
-	_, err = fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned FROM review_job_cloud_launches WHERE launch_token = ?`, token).Scan(&cleaned))
-	assert.Equal(t, 1, cleaned)
+type blockListCloud struct {
+	*cursorcloudtest.Fake
+	block chan struct{}
 }
 
-func TestWorkerDeleteFailureKeepsVMAliveText(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	fake.CreateStatus = cursorcloud.StatusFinished
-	fake.Final = "ok"
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusInternalServerError, Message: "unavailable",
-		},
-	}
-	cloud := &agent.CursorCloudAgent{Client: fake, RepoURL: cursorCloudRestartRepo}
-	cloud.SetLaunchLimitsForTest(4, 20)
-	bound := tc.Pool.bindCursorCloudLaunch(testWorkerID, job, cloud)
-
-	_, err := bound.Review(context.Background(), tc.TmpDir, sha, "prompt", nil)
-	require.Error(t, err)
-	tc.Pool.failCursorCloudWithoutRetry(testWorkerID, job, agent.CursorCloudHost, err)
-
-	var text string
-	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&text))
-	t.Logf("user-visible error: %s", text)
-	assert.Contains(t, text, "orphan risk")
-	assert.Contains(t, text, "pending cleanup")
-	assert.Contains(t, text, "delete agent")
+func (c *blockListCloud) StopAgent(ctx context.Context, id string) error {
+	<-c.block
+	return c.Fake.StopAgent(ctx, id)
 }
 
-func TestEmptyTokenUpgradeStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	_, err := tc.DB.Exec(`INSERT INTO review_job_cloud_launches
-		(job_id, launch_token, agent_id, repo_identity, orphan_note, cleaned)
-		VALUES (?, '', '', ?, ?, 0)`, job.ID, cursorCloudRestartRepo, storage.CloudLaunchPendingNote)
-	require.NoError(t, err)
-
-	require.NoError(t, recoverCloudLaunches(context.Background(), tc.DB, fake, nil))
-
-	var cleaned int
-	var note string
-	require.NoError(t, tc.DB.QueryRow(`SELECT cleaned, orphan_note FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&cleaned, &note))
-	assert.Equal(t, 0, cleaned)
-	assert.Contains(t, note, "orphan risk")
-	assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-}
-
-// TestCursorCloudRestartByTokenCleansSharedToken is the restart success
-// path. Two uncleaned rows share one token. The marker sweep deletes that
-// VM once, and both rows are cleaned. Cleaning only the swept row id leaves
-// the other row uncleaned.
-func TestCursorCloudRestartByTokenCleansSharedToken(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-bytoken-success"
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
-	created := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
-	// c10n's unique token index rejects a second row. The clean-both-rows
-	// pin needs that pair, so this test drops the index the way the storage
-	// shared-token pin does. The index itself is pinned separately.
-	_, err = tc.DB.Exec(`DROP INDEX IF EXISTS idx_review_job_cloud_launches_token`)
-	require.NoError(t, err)
-	_, err = tc.DB.Exec(`INSERT INTO review_job_cloud_launches
-		(job_id, launch_token, agent_id, repo_identity, orphan_note, cleaned, created_at)
-		VALUES
-		(?, ?, ?, ?, 'cursor-cloud orphan risk: one', 0, datetime('now')),
-		(?, ?, '', ?, 'cursor-cloud orphan risk: two', 0, datetime('now'))`,
-		job.ID, token, created.ID, cursorCloudRestartRepo,
-		job.ID, token, cursorCloudRestartRepo)
-	require.NoError(t, err)
-	var uncleaned int
-	require.NoError(t, tc.DB.QueryRow(
-		`SELECT COUNT(*) FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 0`, token,
-	).Scan(&uncleaned))
-	require.Equal(t, 2, uncleaned)
+// cursorCloudRecover runs what a daemon start runs: stale jobs are reset,
+// then the uncleaned launches are swept.
+func cursorCloudRecover(t *testing.T, tc *workerTestContext, client cursorcloud.Client) error {
+	t.Helper()
+	require.NoError(t, tc.DB.ResetStaleJobs())
 	rows, err := tc.DB.ListUncleanedCloudLaunches()
 	require.NoError(t, err)
-	var row storage.CloudLaunch
-	for _, candidate := range rows {
-		if candidate.AgentID == created.ID {
-			row = candidate
-			break
-		}
+	if len(rows) == 0 {
+		return nil
 	}
-	require.Equal(t, token, row.Token)
+	return recoverCloudLaunches(t.Context(), tc.DB, client, rows)
+}
 
-	err = recoverOneCloudLaunch(context.Background(), tc.DB, fake, machineID.String(), row, nil) //nolint:forbidigo // launch marker is prompt text
-	require.Error(t, err)
-	assert.Equal(t, []string{created.ID}, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-	require.NoError(t, tc.DB.QueryRow(
-		`SELECT COUNT(*) FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 0`, token,
-	).Scan(&uncleaned))
-	assert.Equal(t, 2, uncleaned)
-
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	rows, err = tc.DB.ListUncleanedCloudLaunches()
+func cursorCloudUncleaned(t *testing.T, tc *workerTestContext, jobID int64) int {
+	t.Helper()
+	n, err := tc.DB.CountUncleanedCloudLaunches(jobID)
 	require.NoError(t, err)
-	for _, candidate := range rows {
-		if candidate.ID == row.ID {
-			row = candidate
-		}
-	}
-	require.NoError(t, recoverOneCloudLaunch(context.Background(), tc.DB, fake, machineID.String(), row, nil)) //nolint:forbidigo // launch marker is prompt text
-	var cleaned int
-	require.NoError(t, tc.DB.QueryRow(
-		`SELECT COUNT(*) FROM review_job_cloud_launches WHERE launch_token = ? AND cleaned = 1`, token,
-	).Scan(&cleaned))
-	assert.Equal(t, 2, cleaned)
+	return n
 }
 
 func cursorCloudRestartFixture(t *testing.T) (*workerTestContext, *cursorcloudtest.Fake) {
@@ -1060,13 +216,9 @@ func cursorCloudRestartFixture(t *testing.T) (*workerTestContext, *cursorcloudte
 
 func cursorCloudPersistAttempt(t *testing.T, tc *workerTestContext, fake *cursorcloudtest.Fake, jobID int64, token string, withID bool) cursorcloud.Agent {
 	t.Helper()
-	machineID, err := tc.DB.GetMachineID()
-	require.NoError(t, err)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	created := cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
-	require.NoError(t, tc.DB.BeginCloudLaunch(jobID, testWorkerID, token, cursorCloudRestartRepo))
-	_, err = tc.DB.Exec(`UPDATE review_jobs SET agent_invoked = 1 WHERE id = ?`, jobID)
-	require.NoError(t, err)
+	created := cursorCloudShowToken(t, tc, fake, sha, token)
+	cursorCloudBeginToken(t, tc, jobID, token)
 	if withID {
 		require.NoError(t, tc.DB.AttachCloudAgent(jobID, token, created.ID))
 	}
@@ -1097,189 +249,17 @@ func cursorCloudAssertNoRelaunch(t *testing.T, tc *workerTestContext, jobID int6
 }
 
 func cursorCloudCallCount(fake *cursorcloudtest.Fake, method string) int {
-	n := 0
+	return len(cursorCloudCallIDs(fake, method))
+}
+
+func cursorCloudCallIDs(fake *cursorcloudtest.Fake, method string) []string {
+	var ids []string
 	for _, call := range fake.Calls() {
 		if call.Method == method {
-			n++
+			ids = append(ids, call.ID)
 		}
 	}
-	return n
-}
-
-func cursorCloudLegacyToken(t *testing.T, tc *workerTestContext, jobID int64, token string) {
-	t.Helper()
-	cursorCloudBeginToken(t, tc, jobID, token)
-	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = '' WHERE job_id = ?`, jobID)
-	require.NoError(t, err)
-}
-
-func cursorCloudAssertLegacySweepOrphan(t *testing.T, tc *workerTestContext, fake *cursorcloudtest.Fake, jobID int64, logs *bytes.Buffer) {
-	t.Helper()
-	assert := assert.New(t)
-	for range 2 {
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(jobID)
-		require.NoError(t, err)
-		assert.Equal(1, n)
-		updated, err := tc.DB.GetJobByID(jobID)
-		require.NoError(t, err)
-		assert.Equal(storage.JobStatusFailed, updated.Status)
-		assert.Contains(updated.Error, "orphan risk")
-		assert.Contains(updated.Error, storage.CloudLaunchInterruptedError)
-	}
-	assert.Contains(logs.String(), "orphan risk")
-	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
-	assert.Empty(cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-}
-
-// TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged is the saved-id
-// miss on an unusable repository. Nothing is listed and nothing is
-// cleaned. Once the launch is aged out the orphan note is written. Dropping that note because
-// the saved id was deleted, which is what the old unusable-repo branch did,
-// fails this test.
-func TestUnconfirmedDeleteNoteMatrix(t *testing.T) {
-	for _, savedID := range []bool{false, true} {
-		for _, usable := range []bool{false, true} {
-			for _, noted := range []bool{false, true} {
-				name := "no-id"
-				if savedID {
-					name = "saved-id"
-				}
-				if usable {
-					name += "/usable"
-				} else {
-					name += "/unusable"
-				}
-				if noted {
-					name += "/note-set"
-				} else {
-					name += "/note-empty"
-				}
-				t.Run(name, func(t *testing.T) {
-					tc, fake := cursorCloudRestartFixture(t)
-					sha := testutil.GetHeadSHA(t, tc.TmpDir)
-					job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-					const token = "launch-token-unconfirmed"
-					cursorCloudBeginToken(t, tc, job.ID, token)
-					if savedID {
-						require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, "bc_unconfirmed"))
-						fake.MethodErrors = map[string]error{
-							cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-								Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-							},
-						}
-					}
-					if !usable {
-						_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ? WHERE job_id = ?`, "file:///", job.ID)
-						require.NoError(t, err)
-						tc.GitRepo.Run("remote", "remove", "origin")
-					}
-					if !noted {
-						_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET orphan_note = '' WHERE job_id = ?`, job.ID)
-						require.NoError(t, err)
-					}
-
-					_ = recoverStaleJobs(context.Background(), tc.DB, fake)
-					n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-					require.NoError(t, err)
-					assert.Equal(t, 1, n)
-					var jobErr string
-					require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
-					assert.Contains(t, jobErr, "orphan risk")
-					var rowNote string
-					require.NoError(t, tc.DB.QueryRow(`SELECT orphan_note FROM review_job_cloud_launches WHERE job_id = ?`, job.ID).Scan(&rowNote))
-					if noted || !usable {
-						// An unusable repository reports the orphan onto
-						// the row.
-						assert.Contains(t, rowNote, "orphan risk")
-					} else {
-						assert.Empty(t, rowNote)
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestCursorCloudRestartUnusableSavedIDMissNotesWhenAged(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	const token = "launch-token-unusable-saved-miss"
-	cursorCloudBeginToken(t, tc, job.ID, token)
-	require.NoError(t, tc.DB.AttachCloudAgent(job.ID, token, "bc_saved_miss"))
-	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ? WHERE job_id = ?`, "file:///", job.ID)
-	require.NoError(t, err)
-	tc.GitRepo.Run("remote", "remove", "origin")
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	fake.MethodErrors = map[string]error{
-		cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-			Op: "delete agent", StatusCode: http.StatusNotFound, Message: "not found",
-		},
-	}
-
-	require.ErrorContains(t, recoverStaleJobs(context.Background(), tc.DB, fake), "has no repository to sweep")
-	n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	var jobErr string
-	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
-	assert.Contains(t, jobErr, "was not listed within")
-}
-
-// TestCursorCloudRestartUnusableRepoNeverCleans is the unusable-repo pin.
-// The saved id was deleted, an earlier pass already listed the launch and
-// noted the orphan, and the launch is past the delay. Without a repository
-// the row still stays uncleaned, the orphan is reported, and recovery
-// returns the sweep error. Cleaning by token on this path fails this test.
-func TestCursorCloudRestartUnusableRepoNeverCleans(t *testing.T) {
-	tc, fake, job := cursorCloudUnusableConfirmingSweep(t, "launch-token-unusable-never-clean")
-
-	for range 2 {
-		err := recoverStaleJobs(context.Background(), tc.DB, fake)
-		require.ErrorContains(t, err, "has no repository to sweep")
-		assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
-	}
-	var jobErr string
-	require.NoError(t, tc.DB.QueryRow(`SELECT COALESCE(error, '') FROM review_jobs WHERE id = ?`, job.ID).Scan(&jobErr))
-	assert.Contains(t, jobErr, "orphan risk")
-}
-
-// TestCursorCloudRestartUnusableRepoNoteWriteFailureReturnsError pins the
-// orphan report on the unusable-repo path. A trigger aborts the job note
-// write. Recovery returns that error and the row stays uncleaned. Cleaning
-// instead of writing the note, or dropping the write error, fails this test.
-func TestCursorCloudRestartUnusableRepoNoteWriteFailureReturnsError(t *testing.T) {
-	tc, fake, job := cursorCloudUnusableConfirmingSweep(t, "launch-token-unusable-note-fail")
-	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_unusable_note
-		BEFORE UPDATE OF error ON review_jobs
-		WHEN NEW.error LIKE '%orphan risk%'
-		BEGIN
-			SELECT RAISE(ABORT, 'note write failed');
-		END`)
-	require.NoError(t, err)
-
-	err = recoverCloudLaunches(context.Background(), tc.DB, fake, nil)
-	require.ErrorContains(t, err, "note write failed")
-	assert.Equal(t, 0, cursorCloudCleanedFlag(t, tc, job.ID))
-}
-
-// cursorCloudUnusableConfirmingSweep sets up a saved-id launch whose
-// repository cannot be listed, in the state where a usable repository's
-// empty sweep would clean: aged out, already listed, and already noted.
-func cursorCloudUnusableConfirmingSweep(t *testing.T, token string) (*workerTestContext, *cursorcloudtest.Fake, *storage.ReviewJob) {
-	t.Helper()
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	cursorCloudPersistAttempt(t, tc, fake, job.ID, token, true)
-	_, err := tc.DB.Exec(`UPDATE review_job_cloud_launches SET repo_identity = ?, sweep_seen = 1 WHERE job_id = ?`, "file:///", job.ID)
-	require.NoError(t, err)
-	tc.GitRepo.Run("remote", "remove", "origin")
-	_, err = tc.DB.Exec(`UPDATE review_jobs SET error = ? WHERE id = ?`, agent.CursorCloudPendingOrphanNote(), job.ID)
-	require.NoError(t, err)
-	cursorCloudAgeLaunch(t, tc.DB, job.ID)
-	return tc, fake, job
+	return ids
 }
 
 func cursorCloudBeginToken(t *testing.T, tc *workerTestContext, jobID int64, token string) {
@@ -1296,18 +276,6 @@ func cursorCloudShowToken(t *testing.T, tc *workerTestContext, fake *cursorcloud
 	return cursorCloudSeedAgent(t, fake, sha, agent.CursorCloudLaunchMarker(machineID.String(), token)) //nolint:forbidigo // launch marker is prompt text
 }
 
-func cursorCloudAgeLaunch(t *testing.T, db *storage.DB, jobID int64) {
-	t.Helper()
-	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-25 hours') WHERE job_id = ?`, jobID)
-	require.NoError(t, err)
-}
-
-func cursorCloudAgeLaunchPastLag(t *testing.T, db *storage.DB, jobID int64) {
-	t.Helper()
-	_, err := db.Exec(`UPDATE review_job_cloud_launches SET created_at = datetime('now', '-25 hours') WHERE job_id = ?`, jobID)
-	require.NoError(t, err)
-}
-
 func cursorCloudCaptureLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var logs bytes.Buffer
@@ -1315,14 +283,4 @@ func cursorCloudCaptureLog(t *testing.T) *bytes.Buffer {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(prev) })
 	return &logs
-}
-
-func cursorCloudCallIDs(fake *cursorcloudtest.Fake, method string) []string {
-	var ids []string
-	for _, call := range fake.Calls() {
-		if call.Method == method {
-			ids = append(ids, call.ID)
-		}
-	}
-	return ids
 }

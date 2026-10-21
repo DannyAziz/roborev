@@ -116,10 +116,9 @@ type WorkerPool struct {
 	retryBackoff time.Duration
 
 	// Test hooks for deterministic synchronization (nil in production)
-	testHookAfterSecondCheck    func()                  // Called after second runningJobs check, before second DB lookup
-	testHookCooldownLockUpgrade func()                  // Called between RUnlock and Lock in isAgentCoolingDown
-	goalReviewRunner            goalReviewRunner        // Test-only schema adapter; nil in production.
-	goalReviewAdmit             func(agent.Agent) error // Test-only stand-in for goalreview.ValidateAgent.
+	testHookAfterSecondCheck    func()           // Called after second runningJobs check, before second DB lookup
+	testHookCooldownLockUpgrade func()           // Called between RUnlock and Lock in isAgentCoolingDown
+	goalReviewRunner            goalReviewRunner // Test-only schema adapter; nil in production.
 }
 
 // NewWorkerPool creates a new worker pool
@@ -739,7 +738,7 @@ func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.Review
 		return wp.db.BeginCloudLaunch(job.ID, workerID, token, repoURL)
 	}
 	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
-	copied.NoteCleanupFailure = func(msg string) error { return wp.db.NoteCloudLaunchRisk(job.ID, msg) }
+	copied.MarkAgentDeleted = func(token string) error { return wp.db.MarkCloudAgentDeleted(job.ID, token) }
 	copied.MarkLaunchCleaned = func(token string) error {
 		return wp.db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, token)
 	}
@@ -1652,25 +1651,11 @@ func (wp *WorkerPool) finishRunningJob(workerID string, jobID int64) {
 }
 
 func (wp *WorkerPool) failJobAndInvalidateBudget(jobID int64, workerID, errorMsg string) (bool, error) {
-	updated, err := wp.failStoredJob(jobID, workerID, errorMsg)
+	updated, err := wp.db.FailJob(jobID, workerID, errorMsg)
 	if updated {
 		wp.invalidateBudgetSpend()
 	}
 	return updated, err
-}
-
-// failStoredJob sends a backup attempt that still has an uncleaned launch
-// through FailBackupAgentJob. The primary cursor-cloud attempt uses FailJob.
-func (wp *WorkerPool) failStoredJob(jobID int64, workerID, errorMsg string) (bool, error) {
-	name, uncleaned, err := wp.db.UncleanedLaunchAgent(jobID)
-	if err != nil {
-		log.Printf("cursor-cloud: launch agent for job %d: %v", jobID, err)
-		return wp.db.FailJob(jobID, workerID, errorMsg)
-	}
-	if uncleaned && agent.CanonicalName(name) != agent.CursorCloudHost {
-		return wp.db.FailBackupAgentJob(jobID, workerID, errorMsg)
-	}
-	return wp.db.FailJob(jobID, workerID, errorMsg)
 }
 
 func (wp *WorkerPool) autoClosePassingReview(
@@ -1788,6 +1773,10 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	agentName string,
 	executionErr error,
 ) {
+	if capErr, ok := errors.AsType[*agent.CursorCloudCapError](executionErr); ok {
+		wp.requeueCursorCloudCap(workerID, job, capErr)
+		return
+	}
 	// Same sentinel as the processJob deadline branch. A 429 is classified
 	// as transient from its text and would reach RetryJob if this ran only
 	// when the classification is LimitKindNone.
@@ -1814,9 +1803,8 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	if !attached {
 		classification = wp.classify(agent.CanonicalName(agentName), errorMsg)
 	}
-	// A cap refusal or other pre-launch unavailable error with no backup is
-	// permanent: failover has nowhere to go, and retrying cursor-cloud would
-	// only hit the same cap.
+	// A pre-launch unavailable error with no backup is permanent: failover
+	// has nowhere to go.
 	if classification.Kind == agent.LimitKindNone && agent.IsUnavailable(executionErr) {
 		wp.failoverOrFailNonRetryableAgentContext(
 			ctx, workerID, job, agentName, review.UnavailableError(errorMsg),
@@ -1931,7 +1919,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 	} else {
 		// Retries exhausted -- attempt failover to backup agent if this is an agent error
 		if agentError {
-			backupAgent := wp.resolveBackupAgent(job)
+			backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 			if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 				backupModel := wp.resolveBackupModel(job)
 				failedOver, foErr := wp.db.FailoverJob(job.ID, workerID, backupAgent, backupModel)
@@ -1944,7 +1932,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 					return
 				}
 			}
-			errorMsg += wp.skippedHostBackupNote(job)
+			errorMsg += skipNote
 		}
 
 		// No backup or failover failed -- mark as failed
@@ -1962,6 +1950,25 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
 		}
 	}
+}
+
+// requeueCursorCloudCap puts a job the launch cap refused back in the
+// queue. Nothing was launched, so no retry is spent. The job waits until
+// the hourly cap frees a slot, or the usual retry backoff for the
+// concurrent cap.
+func (wp *WorkerPool) requeueCursorCloudCap(workerID string, job *storage.ReviewJob, capErr *agent.CursorCloudCapError) {
+	notBefore := capErr.RetryAt
+	if notBefore.IsZero() {
+		notBefore = time.Now().Add(wp.retryBackoff)
+	}
+	wp.runAttemptTransition(workerID, job, func() {
+		requeued, err := wp.db.RequeueJobNotBefore(job.ID, workerID, notBefore)
+		if err != nil || !requeued {
+			log.Printf("[%s] cursor-cloud cap requeue for job %d failed: %v", workerID, job.ID, err)
+			return
+		}
+		log.Printf("[%s] %v; job %d requeued until %s", workerID, capErr, job.ID, notBefore.Format(time.RFC3339))
+	})
 }
 
 // failFixAfterRunContext fails a fix whose agent already returned. A
@@ -2012,7 +2019,7 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentContext(
 func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 	workerID string, job *storage.ReviewJob, agentName, errorMsg string,
 ) {
-	backupAgent := wp.resolveBackupAgent(job)
+	backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 	if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 		backupModel := wp.resolveBackupModel(job)
 		failedOver, err := wp.db.FailoverJob(job.ID, workerID, backupAgent, backupModel)
@@ -2026,7 +2033,7 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 			return
 		}
 	}
-	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job))
+	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+skipNote)
 }
 
 func (wp *WorkerPool) failWithoutRetryLocked(
@@ -2061,22 +2068,29 @@ func failoverWorkflow(job *storage.ReviewJob) string {
 // Personal CI jobs use only a stored, locally resolved backup. Ordinary jobs
 // retain the workflow-config fallback.
 func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
-	backup := wp.resolveConfiguredBackupAgent(job)
-	// A fix never fails over to cursor-cloud: it cannot leave a local patch.
-	if job != nil && job.IsFixJob() && agent.IsCursorCloudAgent(backup) {
-		return ""
-	}
+	backup, _ := wp.resolveBackupAgentWithSkip(job)
 	return backup
 }
 
-func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) string {
+// resolveBackupAgentWithSkip is resolveBackupAgent plus a note naming the
+// marker when the backup is host and this daemon has no host model.
+func (wp *WorkerPool) resolveBackupAgentWithSkip(job *storage.ReviewJob) (string, string) {
+	backup, note := wp.resolveConfiguredBackupAgent(job)
+	// A fix never fails over to cursor-cloud: it cannot leave a local patch.
+	if job.IsFixJob() && agent.IsCursorCloudAgent(backup) {
+		return "", note
+	}
+	return backup, note
+}
+
+func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) (string, string) {
 	// --host cursor-cloud is stored on the job. That job never fails over,
 	// including to the workflow backup resolved below: a launch refused
 	// before create and a launch that failed after send both fail the job.
 	// A config host or ROBOREV_DEFAULT_HOST leaves the bit unset and may
 	// still fail over to a non-cloud backup.
-	if job != nil && job.ExplicitHost && agent.CanonicalName(job.Agent) == agent.CursorCloudHost {
-		return ""
+	if job.ExplicitHost && agent.CanonicalName(job.Agent) == agent.CursorCloudHost {
+		return "", ""
 	}
 	// An explicit per-job backup wins, for reliability: the enqueuer (e.g. a CI
 	// panel synthesis) chose this failover deliberately. Canonicalize the alias
@@ -2085,32 +2099,30 @@ func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) strin
 	// Note: agent.Get resolves from the registry, not PATH, so this does not
 	// require local installation.
 	if job.FrozenExperimentPlan != nil && job.BackupAgent == "" {
-		return ""
+		return "", ""
 	}
-	if job.BackupAuto && (job.BackupAgent == "" ||
-		agent.CanonicalName(job.BackupAgent) == "host" && !agent.HostAllowed(agent.HostAuto)) {
-		// An "auto" pin is final, even an empty one. A host that auto pinned
-		// under ROBOREV_HOST_AGENT=1 runs only while that marker is still
-		// set: a Cursor cloud agent alone never makes host an automatic pick.
-		return ""
+	if job.BackupAuto && job.BackupAgent == "" {
+		// An "auto" pin is final, even an empty one.
+		return "", fmt.Sprintf("\nbackup %q found no available agent when the job was queued", agentname.Auto)
 	}
 	if agentname.IsAuto(job.BackupAgent) {
-		return wp.resolveAutoBackupAgent(job)
+		return wp.resolveAutoBackupAgentWithNote(job)
 	}
 	if job.BackupAgent != "" {
-		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
-			return ""
+		// A host pinned by "auto" runs only while ROBOREV_HOST_AGENT=1 is set.
+		if note := agent.SkippedHostBackupNote(job.BackupAgent); note != "" {
+			return "", note
 		}
 		if resolved, err := agent.Get(job.BackupAgent); err == nil {
-			return resolved.Name()
+			return resolved.Name(), ""
 		}
-		return job.BackupAgent
+		return job.BackupAgent, ""
 	}
 	if policy, err := personalJobPolicy(job); err != nil || policy != nil {
-		return ""
+		return "", ""
 	}
 	if job.JobType == storage.JobTypeSynthesis {
-		return ""
+		return "", ""
 	}
 	cfg := wp.cfgGetter.Config()
 	configRoot := job.RepoPath
@@ -2121,54 +2133,41 @@ func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) strin
 		"", configRoot, cfg, failoverWorkflow(job), "",
 	)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	backup := resolution.BackupAgent
 	if backup == "" {
-		return ""
+		return "", ""
+	}
+	if note := agent.SkippedHostBackupNote(backup); note != "" {
+		return "", note
 	}
 	if agentname.IsAuto(backup) {
-		return wp.resolveAutoBackupAgent(job)
+		return wp.resolveAutoBackupAgentWithNote(job)
 	}
 	// Resolve exactly the configured backup using the config-aware path so
 	// command overrides and configured ACP aliases participate in failover
 	// without falling through to unrelated agents.
 	resolved, err := agent.GetAvailableExactWithConfig(configRoot, backup, cfg)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	if job.IsGoalReviewJob() && goalreview.ValidateAgent(resolved) != nil {
-		return ""
+		return "", ""
 	}
 	if resolution.AgentMatches(resolved.Name(), job.Agent) {
-		return ""
+		return "", ""
 	}
-	return resolved.Name()
+	return resolved.Name(), ""
 }
 
-// skippedHostBackupNote explains a missing backup on the final error: a
-// stored or workflow host backup this daemon cannot run, or an "auto" backup
-// that found no agent.
-func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
-	if job.BackupAuto && job.BackupAgent == "" {
-		return fmt.Sprintf("\nbackup %q found no available agent when the job was queued", agentname.Auto)
+// resolveAutoBackupAgentWithNote is resolveAutoBackupAgent plus a note when
+// "auto" found no agent.
+func (wp *WorkerPool) resolveAutoBackupAgentWithNote(job *storage.ReviewJob) (string, string) {
+	if backup := wp.resolveAutoBackupAgent(job); backup != "" || job.BudgetRoutingLocked {
+		return backup, ""
 	}
-	backup := job.BackupAgent
-	if backup == "" && job.FrozenExperimentPlan == nil {
-		configRoot := job.RepoPath
-		if job.IsGoalReviewJob() {
-			configRoot = GoalReviewConfigRepoPath(job)
-		}
-		if res, err := agent.ResolveWorkflowConfig("", configRoot, wp.cfgGetter.Config(), failoverWorkflow(job), ""); err == nil {
-			backup = res.BackupAgent
-		}
-	}
-	if agentname.IsAuto(backup) && !job.BudgetRoutingLocked {
-		if wp.resolveAutoBackupAgent(job) == "" {
-			return agent.AutoBackupNotFound()
-		}
-	}
-	return agent.SkippedHostBackupNote(backup)
+	return "", agent.AutoBackupNotFound()
 }
 
 // resolveAutoBackupAgent resolves an "auto" backup to a concrete agent other
@@ -2576,7 +2575,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
 	workerID string, job *storage.ReviewJob,
 	agentName, errorMsg, prefix, label string,
 ) {
-	backupAgent := wp.resolveBackupAgent(job)
+	backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 	if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 		backupModel := wp.resolveBackupModel(job)
 		failedOver, err := wp.db.FailoverJob(
@@ -2593,7 +2592,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
 		}
 	}
 
-	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job), prefix, label)
+	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+skipNote, prefix, label)
 }
 
 func (wp *WorkerPool) failJobWithPrefixLocked(

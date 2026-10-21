@@ -17,21 +17,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"go.kenn.io/roborev/internal/config"
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
-// backup_auto and explicit_host are local SQLite state, like
-// budget_routing_locked, and this binary does not sync them. Version 24 is
-// host-backend-r6's: it added review_jobs.backup_auto and no launch table.
-// 25 opens a v23 or that v24 database and never records 24 itself.
-const pgSchemaVersion = 25
+const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
-//go:embed schemas/postgres_v25.sql
+//go:embed schemas/postgres_v23.sql
 var pgSchemaSQL string
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
@@ -474,24 +468,6 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 				return fmt.Errorf("v23 migration (add non_voting): %w", err)
 			}
 		}
-		if currentVersion < 25 {
-			// The schema file creates review_job_cloud_launches. An older
-			// launch table keeps its rows and takes the current columns.
-			// host-backend-r6's review_jobs.backup_auto is left in place;
-			// its default fills the rows this binary writes.
-			for _, stmt := range []string{
-				`ALTER TABLE review_job_cloud_launches ALTER COLUMN job_id DROP NOT NULL`,
-				`ALTER TABLE review_job_cloud_launches ALTER COLUMN job_id TYPE BIGINT`,
-				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS repo_identity TEXT NOT NULL DEFAULT ''`,
-				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
-				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`,
-				`ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS sweep_seen INTEGER NOT NULL DEFAULT 0`,
-			} {
-				if _, err = p.pool.Exec(ctx, stmt); err != nil {
-					return fmt.Errorf("v25 migration (cloud launch table): %w", err)
-				}
-			}
-		}
 		// Update version
 		_, err = p.pool.Exec(ctx, `INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, pgSchemaVersion)
 		if err != nil {
@@ -551,7 +527,6 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 	}
 
 	p.ensureSearchVectorsSchema(ctx)
-	p.ensureLocalCloudLaunchTable(ctx)
 
 	if err := p.migrateLegacyReviews(ctx); err != nil {
 		return err
@@ -756,9 +731,6 @@ func (p *PgPool) RegisterMachine(ctx context.Context, machineID uuid.UUID, name 
 
 // GetOrCreateRepo finds or creates a repo by identity, returns the PostgreSQL ID
 func (p *PgPool) GetOrCreateRepo(ctx context.Context, identity string) (int64, error) {
-	if id, ok, err := p.adoptCanonicalRepoIdentity(ctx, identity); err != nil || ok {
-		return id, err
-	}
 	var id int64
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO repos (identity)
@@ -770,60 +742,6 @@ func (p *PgPool) GetOrCreateRepo(ctx context.Context, identity string) (int64, e
 		return 0, fmt.Errorf("get or create repo: %w", err)
 	}
 	return id, nil
-}
-
-// repoIdentityDB is the slice of a pool adoptCanonicalRepoIdentity needs.
-// Tests drive the zero-row update race without PostgreSQL.
-type repoIdentityDB interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
-}
-
-// adoptCanonicalRepoIdentity rewrites one stack-built canonical row to the
-// stored form when RemoteIdentity says they are the same remote. An exact
-// row is returned unchanged. An identity with a query or fragment, which
-// may hold a token, is never written over the canonical row.
-func (p *PgPool) adoptCanonicalRepoIdentity(ctx context.Context, identity string) (int64, bool, error) {
-	return adoptCanonicalRepoIdentity(ctx, p.pool, identity)
-}
-
-func adoptCanonicalRepoIdentity(ctx context.Context, q repoIdentityDB, identity string) (int64, bool, error) {
-	var id int64
-	err := q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, identity).Scan(&id)
-	if err == nil {
-		return id, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, fmt.Errorf("lookup repo identity: %w", err)
-	}
-	canonical := config.RemoteIdentity(identity)
-	if canonical == "" || canonical == identity || config.IdentityCarriesQuery(identity) {
-		return 0, false, nil
-	}
-	err = q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("lookup canonical repo identity: %w", err)
-	}
-	tag, err := q.Exec(ctx, `UPDATE repos SET identity = $1 WHERE id = $2 AND identity = $3`, identity, id, canonical)
-	if err != nil {
-		return 0, false, fmt.Errorf("rewrite canonical repo identity: %w", err)
-	}
-	if tag.RowsAffected() > 0 {
-		return id, true, nil
-	}
-	// The row we read was rewritten by someone else. Returning that id
-	// would point at a row that no longer has the canonical identity.
-	err = q.QueryRow(ctx, `SELECT id FROM repos WHERE identity = $1`, canonical).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("lookup canonical repo identity: %w", err)
-	}
-	return id, true, nil
 }
 
 // GetOrCreateCommit finds or creates a commit, returns the PostgreSQL ID
@@ -1684,8 +1602,6 @@ func (p *PgPool) upsertJobsIndividually(ctx context.Context, jobs []JobWithPgIDs
 	return success, firstErr
 }
 
-// queueJobUpsert queues one job upsert. backup_auto is not a column here:
-// the flag stays in SQLite, so the batch path and UpsertJob both omit it.
 func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 	j := jw.Job
 	dirtyFilesJSON, err := encodeDirtyFiles(j.DirtyFiles)
@@ -1736,136 +1652,4 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
 		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return nil
-}
-
-// localCloudLaunchDDL is machine-local. Sync export and import never read it.
-// It has no foreign key, so deleting a job does not drop the note. It matches
-// the table in schemas/postgres_v25.sql.
-const localCloudLaunchDDL = `CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
-	id BIGSERIAL PRIMARY KEY,
-	job_id BIGINT,
-	launch_token TEXT NOT NULL,
-	agent_id TEXT NOT NULL DEFAULT '',
-	cleaned BOOLEAN NOT NULL DEFAULT FALSE,
-	repo_identity TEXT NOT NULL DEFAULT '',
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	orphan_note TEXT NOT NULL DEFAULT '',
-	sweep_seen INTEGER NOT NULL DEFAULT 0
-)`
-
-func (p *PgPool) ensureLocalCloudLaunchTable(ctx context.Context) {
-	if _, err := p.pool.Exec(ctx, localCloudLaunchDDL); err != nil {
-		log.Printf("cursor-cloud: local launch table: %v", err)
-		return
-	}
-	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS orphan_note TEXT NOT NULL DEFAULT ''`); err != nil {
-		log.Printf("cursor-cloud: orphan_note: %v", err)
-	}
-	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ADD COLUMN IF NOT EXISTS sweep_seen INTEGER NOT NULL DEFAULT 0`); err != nil {
-		log.Printf("cursor-cloud: sweep_seen: %v", err)
-	}
-	// DEFAULT '' let an older insert omit the token and store a blank.
-	// New writes must pass a token. Existing blanks stay blank and uncleaned.
-	if _, err := p.pool.Exec(ctx, `ALTER TABLE review_job_cloud_launches ALTER COLUMN launch_token DROP DEFAULT`); err != nil {
-		log.Printf("cursor-cloud: launch token default: %v", err)
-	}
-	if _, err := p.pool.Exec(ctx, `UPDATE review_job_cloud_launches SET launch_token = '' WHERE launch_token IS NULL`); err != nil {
-		log.Printf("cursor-cloud: launch token null: %v", err)
-	}
-	if _, err := p.pool.Exec(ctx, `UPDATE review_job_cloud_launches SET orphan_note = $1
-		WHERE NOT cleaned AND orphan_note = ''`, CloudLaunchPendingNote); err != nil {
-		log.Printf("cursor-cloud: orphan note backfill: %v", err)
-	}
-	p.dropCloudLaunchJobFK(ctx)
-	// Blank tokens are the NULL backfill, not launch tokens. A real token
-	// names one launch row.
-	if _, err := p.pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_review_job_cloud_launches_token
-		ON review_job_cloud_launches (launch_token) WHERE launch_token <> ''`); err != nil {
-		log.Printf("cursor-cloud: launch token index: %v", err)
-	}
-}
-
-// dropCloudLaunchJobFK removes a job foreign key left by an older
-// CREATE TABLE ... ON DELETE CASCADE. CREATE TABLE IF NOT EXISTS does not
-// alter that constraint, so deleting the job would drop the launch row.
-func (p *PgPool) dropCloudLaunchJobFK(ctx context.Context) {
-	rows, err := p.pool.Query(ctx, `
-		SELECT c.conname
-		FROM pg_constraint c
-		JOIN pg_class t ON t.oid = c.conrelid
-		JOIN pg_namespace n ON n.oid = t.relnamespace
-		WHERE n.nspname = $1
-		  AND t.relname = 'review_job_cloud_launches'
-		  AND c.contype = 'f'`, pgSchemaName)
-	if err != nil {
-		log.Printf("cursor-cloud: launch foreign key: %v", err)
-		return
-	}
-	defer rows.Close()
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			log.Printf("cursor-cloud: launch foreign key: %v", err)
-			return
-		}
-		names = append(names, name)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("cursor-cloud: launch foreign key: %v", err)
-		return
-	}
-	table := pgx.Identifier{pgSchemaName, "review_job_cloud_launches"}.Sanitize()
-	for _, name := range names {
-		stmt := "ALTER TABLE " + table + " DROP CONSTRAINT " + pgx.Identifier{name}.Sanitize()
-		if _, err := p.pool.Exec(ctx, stmt); err != nil {
-			log.Printf("cursor-cloud: drop launch foreign key: %v", err)
-		}
-	}
-}
-
-// DeleteRepo removes a mirrored repository. An uncleaned launch row blocks
-// the delete on every path. Cascade deletes jobs and does not delete launch rows.
-func (p *PgPool) DeleteRepo(ctx context.Context, repoID int64, cascade bool) error {
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	var jobCount int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM review_jobs WHERE repo_id = $1`, repoID).Scan(&jobCount); err != nil {
-		return err
-	}
-	var liveLaunches int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM review_job_cloud_launches
-		WHERE NOT cleaned AND job_id IN (SELECT id FROM review_jobs WHERE repo_id = $1)`, repoID).Scan(&liveLaunches); err != nil {
-		return err
-	}
-	if liveLaunches > 0 {
-		return ErrRepoHasCloudLaunch
-	}
-	if !cascade && jobCount > 0 {
-		return ErrRepoHasJobs
-	}
-	if cascade {
-		for _, stmt := range []string{
-			`DELETE FROM responses WHERE job_uuid IN (SELECT uuid FROM review_jobs WHERE repo_id = $1)`,
-			`DELETE FROM reviews WHERE job_uuid IN (SELECT uuid FROM review_jobs WHERE repo_id = $1)`,
-			`DELETE FROM review_jobs WHERE repo_id = $1`,
-			`DELETE FROM commits WHERE repo_id = $1`,
-		} {
-			if _, err := tx.Exec(ctx, stmt, repoID); err != nil {
-				return err
-			}
-		}
-	}
-	tag, err := tx.Exec(ctx, `DELETE FROM repos WHERE id = $1`, repoID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return tx.Commit(ctx)
 }

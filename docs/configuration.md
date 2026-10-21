@@ -258,7 +258,6 @@ max_chars = 50000
 | `post_commit_review` | string | Post-commit hook behavior: `"commit"` (default) or `"branch"` |
 | `post_commit_batch_size` | int | Number of commits to accumulate before an automatic post-commit review. Values below `2` review every commit |
 | `hook_timeout_seconds` | int | Override the post-commit hook request timeout for this repo, in seconds. Useful for large repos where the daemon's enqueue git calls are slow. Read filesystem-only from this checkout's `.roborev.toml` (a linked worktree without its own file does not inherit the main checkout's value). Zero or negative values inherit the global / platform default |
-| `cloud_launch_clean_delay_hours` | int | Hours before a later restart's empty sweep may clean a cursor-cloud launch. A value of at least 1 hour wins over the global value. 0, a negative value, or a value that is not an integer clamps to 1 hour: it does not inherit global and it does not mean the wait is over. The confirming sweep is a separate restart, not a second list in the same pass |
 | `auto_close_passing_reviews` | bool | Automatically close reviews that pass, including reviews whose findings all fall below `review_min_severity` |
 | `review_reasoning` | string | Reasoning level for reviews. See [Reasoning Levels](#reasoning-levels) |
 | `refine_reasoning` | string | Reasoning level for refine. See [Reasoning Levels](#reasoning-levels) |
@@ -1076,7 +1075,6 @@ default_backup_model = "claude-sonnet-4-20250514"  # Model paired with default_b
 server_addr = "127.0.0.1:7373"
 max_workers = 4
 job_timeout_minutes = 30          # Per-job timeout in minutes; plan-first background fixes add an equal planning budget
-cloud_launch_clean_delay_hours = 24  # Hours before a later restart's empty sweep may clean a cursor-cloud launch. Minimum 1. A valid repo value wins.
 hook_timeout_seconds = 30         # Post-commit hook request timeout (0 = platform default: 3, 30 on Windows)
 agent_quota_cooldown = "30m"      # Maximum quota cooldown after agent limits
 review_guidelines = "Global review instructions for every repo."
@@ -1097,8 +1095,8 @@ filter_branch = false             # Show all branches on startup (default: curre
 
 | Option | Type | Default | Description | Hot-Reload |
 |--------|------|---------|-------------|------------|
-| `default_agent` | string | auto-detect | Default AI agent to use. `auto` uses the availability order (with `host` as the last resort only under `ROBOREV_HOST_AGENT=1`) and pairs `default_model` only when it lands on `default_agent` (a workflow model beside `auto` is never paired). `host` hands reviews to an attached host model and runs only when named here or as a backup with `ROBOREV_HOST_AGENT=1`; detection of a Cursor cloud agent never substitutes for the marker; listings show it only with `ROBOREV_HOST_AGENT=1` | Yes |
-| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `auto` picks the first available agent, other than the primary, that can run the job, with no model; `host` is that last resort only under `ROBOREV_HOST_AGENT=1`. Ordinary enqueue, CI, panel, fix and goal reviews pin an `auto` backup when queued and keep it, even when nothing was found. A named backup on an ordinary review is resolved at failover unless an experiment freezes it | Yes |
+| `default_agent` | string | auto-detect | Default AI agent to use. `auto` uses the availability order and pairs `default_model` only when it lands on `default_agent` (a workflow model beside `auto` is never paired). `host` needs `ROBOREV_HOST_AGENT=1`; see [Host Model Handoff](agents/index.md#host-model-handoff) | Yes |
+| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `auto` picks the first available agent, other than the primary, that can run the job, with no model. Ordinary enqueue, CI, panel, fix and goal reviews pin an `auto` backup when queued and keep it, even when nothing was found; a rerun pins it again. A named backup on an ordinary review is resolved at failover unless an experiment freezes it. A `host` backup is skipped without `ROBOREV_HOST_AGENT=1` | Yes |
 | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
@@ -1113,7 +1111,6 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `web.auth_token_file` | string | - | Host-local file containing the browser token; mutually exclusive with `web.auth_token` | No |
 | `max_workers` | int | 4 | Number of parallel review workers | No |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes; plan-first background fixes add an equal planning budget | Yes |
-| `cloud_launch_clean_delay_hours` | int | 24 | Hours before a later restart's empty sweep may clean a cursor-cloud launch. The confirming sweep is a separate restart, not a second list in the same pass. Until then the row stays uncleaned and the job keeps the orphan note. Global 0 uses 24. A valid per-repo value of at least 1 hour wins over this global value. A per-repo 0, negative, or unparseable value clamps to 1 hour and does not inherit global. The delay is never under 1 hour | Yes |
 | `isolate_reviews` | bool | false | Run committed reviews in daemon-owned detached checkouts; see [Isolated Review Checkouts](#isolated-review-checkouts) | Yes |
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
 | `agent_quota_cooldown` | string | `30m0s` | Maximum daemon-wide cooldown after an agent quota or session-limit error, as a Go duration such as `10m`, `30m`, or `1h` | Yes |
@@ -1156,23 +1153,6 @@ filter_branch = false             # Show all branches on startup (default: curre
     used automatically. No action is required, but new configs should use the new
     name.
 
-Host as an automatic pick: `host` is auto-eligible (an `auto` agent or backup, a
-CI or fix pin, the last resort of a failover) only with the explicit marker
-`ROBOREV_HOST_AGENT=1`. Detecting a Cursor cloud agent (`CURSOR_AGENT=1` plus a
-`CLOUD_AGENT_*` variable) never substitutes for the marker: named host,
-listings, and automatic picks all require `ROBOREV_HOST_AGENT=1`. Without the
-marker, an explicit host is an error, failover skips `host` and tries the next
-agent, and when none is left the error names `ROBOREV_HOST_AGENT`.
-
-`host` ignores agentic mode and `allow_unsafe_agents`. It does not run a shell
-agent, so those settings do not give it tools. The handoff is a prompt-injection
-surface: `prompt.md` contains the review prompt, including the change under
-review, and the attached model is asked to follow it. A commit can put
-instructions in that change. Anyone who can write the handoff directory can also
-replace `prompt.md` or plant `answer.md`, which roborev reads as the review.
-Point `ROBOREV_HOST_DIR` at a directory only the daemon's user can write.
-roborev logs a warning when that directory is group- or world-writable.
-
 ### Cursor cloud host
 
 Ordinary reviews stay on the local agent. `cursor-cloud` is off unless you
@@ -1195,7 +1175,7 @@ explicit `host` without `ROBOREV_HOST_AGENT=1` is the same kind of error.
 `--host cursor-cloud` is stored on the job, and that job never runs on a local
 agent: budget routing does not substitute one, and the job never falls back to
 one, including a workflow backup. A launch refused before the create is sent (a
-bad ref, a missing remote, or the hourly launch limit) and a launch that fails
+bad ref or a missing remote) and a launch that fails
 after the create is sent both fail the job. When `host = "cursor-cloud"` in
 config or `ROBOREV_DEFAULT_HOST` selects cursor-cloud, a configured non-cloud
 backup may still run.
@@ -1246,8 +1226,8 @@ launched at the head commit. The adapter still refuses a ref that is empty,
 
 Launch limits are checked before the agent is created. The defaults are 4
 concurrent launches and 60 launches in a rolling hour. 4 matches the default
-worker count. 60 is one launch a minute. A launch past either limit returns an
-error and creates no agent. A finished review frees its concurrent slot after
+worker count. 60 is one launch a minute. A launch past either limit creates no
+agent and the job waits in the queue until a slot frees. A finished review frees its concurrent slot after
 the agent is deleted. A launch stops counting one hour after it started.
 
 Set `ROBOREV_CURSOR_CLOUD_MAX_CONCURRENT` and

@@ -14,8 +14,7 @@ import (
 )
 
 // An unavailable pi with review_backup_agent=auto must hop to Claude, not
-// pick Codex and then fail ValidateAgent. Mutant pin: if ResolveAgent still
-// calls GetPreferredOrBackup without the goal-capable filter, this fails.
+// pick Codex and then fail ValidateAgent.
 func TestResolveAgentAutoBackupSkipsIncapableAgents(t *testing.T) {
 	repo := testutil.NewTestRepoWithCommit(t)
 	require.NoError(t, os.WriteFile(filepath.Join(repo.Path(), ".roborev.toml"), []byte(

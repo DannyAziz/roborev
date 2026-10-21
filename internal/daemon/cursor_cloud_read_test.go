@@ -61,7 +61,6 @@ func TestReviewProjectionKeepsLaunchOrphanNote(t *testing.T) {
 	var projection ReviewProjection
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &projection))
 	assert.Contains(t, projection.Job.OrphanWarning, "orphan risk", "web projection dropped the orphan warning")
-	assert.Contains(t, projection.Job.Error, "orphan risk", "web projection dropped the orphan warning")
 }
 
 func TestReviewProjectionContextualKeepsLaunchOrphanNote(t *testing.T) {
@@ -79,7 +78,6 @@ func TestReviewProjectionContextualKeepsLaunchOrphanNote(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &projection))
 	assert.Equal(t, job.ID, projection.Job.ID)
 	assert.Contains(t, projection.Job.OrphanWarning, "orphan risk", "contextual projection dropped the orphan warning")
-	assert.Contains(t, projection.Job.Error, "orphan risk", "contextual projection dropped the orphan warning")
 }
 
 func TestReviewProjectionPanelKeepsLaunchOrphanNote(t *testing.T) {
@@ -101,7 +99,6 @@ func TestReviewProjectionPanelKeepsLaunchOrphanNote(t *testing.T) {
 	require.Len(t, projection.PanelMembers, 1)
 	assert.Equal(t, member.ID, projection.PanelMembers[0].ID)
 	assert.Contains(t, projection.PanelMembers[0].OrphanWarning, "orphan risk", "panel projection dropped the orphan warning")
-	assert.Contains(t, projection.PanelMembers[0].Error, "orphan risk", "panel projection dropped the orphan warning")
 }
 
 func TestBrowserProjectionKeepsLaunchOrphanNote(t *testing.T) {
@@ -112,7 +109,6 @@ func TestBrowserProjectionKeepsLaunchOrphanNote(t *testing.T) {
 	}
 	projected := projectBrowserReviewJob(job)
 	assert.Contains(t, projected.OrphanWarning, "orphan risk", "browser projection dropped the orphan warning")
-	assert.Contains(t, projected.Error, "orphan risk", "browser projection dropped the orphan warning")
 }
 
 func insertReadLaunch(t *testing.T, db *storage.DB, jobID int64, token string) {

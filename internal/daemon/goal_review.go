@@ -152,15 +152,10 @@ func (wp *WorkerPool) processGoalReview(ctx context.Context, workerID string, jo
 			a = pi.WithProvider(job.Provider)
 		}
 	}
-	admit := wp.goalReviewAdmit
-	if admit == nil {
-		admit = goalreview.ValidateAgent
-	}
-	if err := admit(a); err != nil {
+	if err := goalreview.ValidateAgent(a); err != nil {
 		fail(err)
 		return
 	}
-	a = wp.bindCursorCloudLaunch(workerID, job, a)
 	event := Event{Type: "goal_review.started", TS: time.Now(), JobID: job.ID, JobUUID: job.UUID, Repo: job.RepoPath, RepoName: job.RepoName, SHA: job.GitRef, Branch: job.Branch, Agent: a.Name(), WorktreePath: job.WorktreePath}
 	wp.broadcaster.Broadcast(event)
 	wp.markAgentInvoked(workerID, job, a)

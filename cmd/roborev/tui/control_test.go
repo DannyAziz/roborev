@@ -844,9 +844,9 @@ func TestHandleCtrlRerunJob_KeepsOrphanNote(t *testing.T) {
 	updated, resp, _ := m.handleCtrlRerunJob(params)
 	require.True(t, resp.OK, "expected OK, got error: %s", resp.Error)
 	assert.Equal(t, storage.JobStatusQueued, updated.jobs[0].Status)
-	assert.Contains(t, updated.jobs[0].Error, "cursor-cloud orphan risk: keep-this-token",
+	assert.Equal(t, "cursor-cloud orphan risk: keep-this-token", updated.jobs[0].OrphanWarning,
 		"tui rerun dropped the orphan note")
-	assert.NotContains(t, updated.jobs[0].Error, "disk failed")
+	assert.Empty(t, updated.jobs[0].Error)
 }
 
 func TestHandleCtrlRerunJob_WrongStatus(t *testing.T) {

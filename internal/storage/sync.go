@@ -284,55 +284,8 @@ func (db *DB) BackfillRepoIdentities() (int, error) {
 		}
 		backfilled++
 	}
-	scrubbed, err := db.ScrubCanonicalRepoIdentities()
-	if err != nil {
-		return backfilled, err
-	}
-	return backfilled + scrubbed, nil
-}
 
-// ScrubCanonicalRepoIdentities rewrites a stack-built canonical identity to
-// the current stored form when both name the same remote. It is idempotent:
-// once the row matches ResolveRepoIdentity, SameRepoIdentity is exact and
-// the row is left alone. A case-sensitive host is not rewritten, and
-// neither is an identity whose query or fragment may hold a token.
-func (db *DB) ScrubCanonicalRepoIdentities() (int, error) {
-	rows, err := db.Query(`SELECT id, root_path, identity FROM repos WHERE identity IS NOT NULL AND identity != ''`)
-	if err != nil {
-		return 0, fmt.Errorf("query repo identities: %w", err)
-	}
-	defer rows.Close()
-	type row struct {
-		id       int64
-		path     string
-		identity string
-	}
-	var repos []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.path, &r.identity); err != nil {
-			return 0, fmt.Errorf("scan repo identity: %w", err)
-		}
-		repos = append(repos, r)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	scrubbed := 0
-	for _, r := range repos {
-		resolved := config.ResolveRepoIdentity(r.path, nil)
-		if resolved == "" || resolved == r.identity {
-			continue
-		}
-		if !config.SameRepoIdentity(r.identity, resolved) || config.IdentityCarriesQuery(resolved) {
-			continue
-		}
-		if err := db.SetRepoIdentity(r.id, resolved); err != nil {
-			return scrubbed, err
-		}
-		scrubbed++
-	}
-	return scrubbed, nil
+	return backfilled, nil
 }
 
 // SetRepoIdentity sets the identity for a repo.
@@ -519,7 +472,6 @@ type SyncableJob struct {
 
 // GetJobsToSync returns terminal jobs that need to be pushed to PostgreSQL.
 // These are jobs created locally that haven't been synced or were updated since last sync.
-// backup_auto is not selected: it is local scheduling state and has no Postgres column.
 func (db *DB) GetJobsToSync(machineID uuid.UUID, limit int) ([]SyncableJob, error) {
 	rows, err := db.Query(`
 		SELECT
@@ -933,7 +885,7 @@ func (db *DB) upsertPulledJob(j PulledJob, repoID int64, commitID *int64) (bool,
 		ON CONFLICT(uuid) DO UPDATE SET
 			status = excluded.status,
 			finished_at = excluded.finished_at,
-			error = `+jobErrorKeepNote("excluded.error")+`,
+			error = excluded.error,
 			model = excluded.model,
 			provider = excluded.provider,
 			requested_model = excluded.requested_model,

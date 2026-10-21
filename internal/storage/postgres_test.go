@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"context"
 	"crypto/rand"
 	_ "embed"
 	"fmt"
@@ -51,84 +50,6 @@ func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
 	for _, required := range requiredStatements {
 		assert.Contains(t, allStatements, required)
 	}
-}
-
-// TestPostgresSchemaV25 locks the shared-database contract: EnsureSchema
-// writes 25, the schema carries the launch table, and backup_auto and
-// explicit_host stay local SQLite state.
-func TestPostgresSchemaV25(t *testing.T) {
-	t.Parallel()
-	assert := assert.New(t)
-	assert.Equal(25, pgSchemaVersion)
-	schema := strings.Join(pgSchemaStatements(), "\n")
-	assert.NotContains(schema, "backup_auto")
-	assert.NotContains(schema, "explicit_host")
-	assert.Contains(schema, "non_voting")
-	assert.Contains(schema, "CREATE TABLE IF NOT EXISTS roborev.review_job_cloud_launches")
-}
-
-// TestIntegration_LaunchRowSurvivesRepoDelete snapshots every column of
-// roborev.review_job_cloud_launches around a repo delete and compares the
-// rows field by field.
-func TestIntegration_LaunchRowSurvivesRepoDelete(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
-	pool := openTestPgPool(t)
-	ctx := t.Context()
-	cols := pgColumnNames(t, ctx, pool, "review_job_cloud_launches")
-	require.NotEmpty(t, cols)
-	before := pgTableRows(t, ctx, pool, "review_job_cloud_launches", cols)
-	_, err := pool.Pool().Exec(ctx, `DELETE FROM repos WHERE identity = $1`, "c10c-launch-pin.example")
-	require.NoError(t, err)
-	assert.Equal(t, before, pgTableRows(t, ctx, pool, "review_job_cloud_launches", cols))
-}
-
-func pgColumnNames(t *testing.T, ctx context.Context, pool *PgPool, table string) []string {
-	t.Helper()
-	rows, err := pool.Pool().Query(ctx, `
-		SELECT column_name FROM information_schema.columns
-		WHERE table_schema = 'roborev' AND table_name = $1
-		ORDER BY ordinal_position`, table)
-	require.NoError(t, err)
-	defer rows.Close()
-	var cols []string
-	for rows.Next() {
-		var name string
-		require.NoError(t, rows.Scan(&name))
-		cols = append(cols, name)
-	}
-	require.NoError(t, rows.Err())
-	return cols
-}
-
-func pgTableRows(t *testing.T, ctx context.Context, pool *PgPool, table string, cols []string) []map[string]string {
-	t.Helper()
-	quoted := make([]string, len(cols))
-	for i, name := range cols {
-		quoted[i] = `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-	}
-	query := `SELECT ` + strings.Join(quoted, ", ") + ` FROM roborev."` + strings.ReplaceAll(table, `"`, `""`) + `" ORDER BY 1`
-	rows, err := pool.Pool().Query(ctx, query)
-	require.NoError(t, err)
-	defer rows.Close()
-	var out []map[string]string
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		dest := make([]any, len(cols))
-		for i := range vals {
-			dest[i] = &vals[i]
-		}
-		require.NoError(t, rows.Scan(dest...))
-		row := make(map[string]string, len(cols))
-		for i, name := range cols {
-			if vals[i] == nil {
-				row[name] = ""
-				continue
-			}
-			row[name] = fmt.Sprint(vals[i])
-		}
-		out = append(out, row)
-	}
-	require.NoError(t, rows.Err())
-	return out
 }
 
 func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {

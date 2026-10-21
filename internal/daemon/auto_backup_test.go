@@ -147,8 +147,7 @@ func TestRerunSelectedAutoIsPinned(t *testing.T) {
 
 // Rerun --agent auto must resolve the model as enqueue --agent auto does:
 // keep PreferredAgent as the auto keyword so Claude does not inherit the
-// configured Codex review_model. Mutant pin: pinning the name without
-// updating resolution.PreferredAgent leaves the workflow model in place.
+// configured Codex review_model.
 func TestRerunSelectedAutoDoesNotInheritWorkflowModel(t *testing.T) {
 	noHostMarker(t)
 	stubAgentPath(t, "claude")
@@ -195,9 +194,7 @@ func TestFixJobPinsAutoBackup(t *testing.T) {
 }
 
 // Ordinary /api/enqueue pins an "auto" backup and the worker honors that
-// pin. Mutant pin: if BackupAgent/BackupAuto are only set when
-// experiment != nil, these jobs store BackupAuto false and failover
-// re-resolves auto from workflow config.
+// pin.
 func TestOrdinaryEnqueuePinsAutoBackup(t *testing.T) {
 	t.Run("stores and uses a concrete pin", func(t *testing.T) {
 		noHostMarker(t)
@@ -332,27 +329,19 @@ func TestCIMatrixPinsAutoBackup(t *testing.T) {
 }
 
 type daemonHostMode struct {
-	name            string
-	set             func(*testing.T) string
-	named, explicit bool
+	name string
+	set  func(*testing.T) string
+	on   bool
 }
 
 var daemonHostModes = []daemonHostMode{
-	{name: "neither", set: noHostMarker},
+	{name: "no marker", set: noHostMarker},
 	{name: "marker 0", set: func(t *testing.T) string {
 		dir := noHostMarker(t)
 		t.Setenv(agent.HostMarkerEnv, "0")
-		t.Setenv("CURSOR_AGENT", "1")
-		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
 		return dir
 	}},
-	{name: "detected only", set: func(t *testing.T) string {
-		dir := noHostMarker(t)
-		t.Setenv("CURSOR_AGENT", "1")
-		t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
-		return dir
-	}},
-	{name: "explicit marker", named: true, explicit: true, set: func(t *testing.T) string {
+	{name: "explicit marker", on: true, set: func(t *testing.T) string {
 		dir := noHostMarker(t)
 		t.Setenv(agent.HostMarkerEnv, "1")
 		return dir
@@ -362,8 +351,7 @@ var daemonHostModes = []daemonHostMode{
 // The host ruling, end to end at the daemon: host runs where it is named
 // (primary or named backup) only with ROBOREV_HOST_AGENT=1, and is an
 // automatic pick (the auto primary, a CI blank agent, an auto backup
-// resolved at failover) only with that same marker. Detection of a Cursor
-// cloud agent never substitutes for it. Strict enqueue with an auto backup
+// resolved at failover) only with that same marker. Strict enqueue with an auto backup
 // never takes host. No agent CLI is on PATH, and no handoff dir is created.
 func TestHostRulingByMarkerMode(t *testing.T) {
 	for _, mode := range daemonHostModes {
@@ -371,10 +359,10 @@ func TestHostRulingByMarkerMode(t *testing.T) {
 			hostDir := mode.set(t)
 			stubAgentPathWithGit(t)
 			named, auto := "", ""
-			if mode.named {
+			if mode.on {
 				named = "host"
 			}
-			if mode.explicit {
+			if mode.on {
 				auto = "host"
 			}
 			for _, row := range []struct {
@@ -430,7 +418,7 @@ func TestHostRulingByMarkerMode(t *testing.T) {
 					ReviewType: config.ReviewTypeDefault, RepoPath: t.TempDir(),
 				}
 				opts, err := resolveRerunOpts(job, config.DefaultConfig(), nil, "auto")
-				if err == nil && !mode.explicit {
+				if err == nil && !mode.on {
 					assert.NotEqual(t, "host", opts.Agent)
 				}
 			})
@@ -482,10 +470,10 @@ func TestHostFailoverByMarkerMode(t *testing.T) {
 				switch {
 				case want != "" || tc.backupAuto:
 				case agentNameIsHost(tc.stored) || agentNameIsHost(tc.workflow):
-					if mode.named {
+					if mode.on {
 						want = "host"
 					}
-				case mode.explicit:
+				case mode.on:
 					want = "host"
 				}
 				wtc := newWorkerTestContext(t, 1)
@@ -540,9 +528,8 @@ func TestEmptyAutoPinIsFrozen(t *testing.T) {
 }
 
 // A host backup that auto pinned under ROBOREV_HOST_AGENT=1 runs after a
-// restart only while that marker is still set: a Cursor cloud agent alone
-// never makes host an automatic pick. A named host backup is honored only
-// with ROBOREV_HOST_AGENT=1.
+// restart only while that marker is still set. A named host backup is honored
+// only with ROBOREV_HOST_AGENT=1.
 func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
 	for _, mode := range daemonHostModes {
 		t.Run(mode.name, func(t *testing.T) {
@@ -550,10 +537,10 @@ func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
 			wtc := newWorkerTestContext(t, 1)
 			stubAgentPath(t)
 			wantAuto, wantNamed := "", ""
-			if mode.explicit {
+			if mode.on {
 				wantAuto = "host"
 			}
-			if mode.named {
+			if mode.on {
 				wantNamed = "host"
 			}
 			auto := &storage.ReviewJob{Agent: "codex", BackupAgent: "host", BackupAuto: true}
@@ -565,44 +552,8 @@ func TestAutoPinnedHostIsRecheckedOnRestart(t *testing.T) {
 	}
 }
 
-// After a restart in a detected Cursor cloud env without ROBOREV_HOST_AGENT=1,
-// a stored host primary and a stored named-host backup must not run host.
-// Detection never substitutes for the marker. This fails on r5, where
-// HostNamed allowed Detected.
-func TestDetectedRestartDoesNotRunHost(t *testing.T) {
-	hostDir := noHostMarker(t)
-	t.Setenv("CURSOR_AGENT", "1")
-	t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
-	t.Setenv("ROBOREV_HOST_TIMEOUT", "50ms")
-
-	t.Run("primary", func(t *testing.T) {
-		tc := newWorkerTestContext(t, 1)
-		sha := testutil.GetHeadSHA(t, tc.TmpDir)
-		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "host")
-		tc.Pool.processJob(testWorkerID, job)
-		updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-		assert.Equal(t, "host", updated.Agent, "does not silently swap the primary")
-		assert.Equal(t, 0, updated.RetryCount)
-		assert.Contains(t, updated.Error, agent.HostMarkerEnv)
-		assert.NoDirExists(t, hostDir)
-	})
-
-	t.Run("named backup", func(t *testing.T) {
-		wtc := newWorkerTestContext(t, 1)
-		job := enqueueCodexJob(t, wtc, "host", false)
-		wtc.Pool.failoverOrFailNonRetryableAgentLocked(testWorkerID, job, job.Agent, "codex broke")
-		final, err := wtc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, storage.JobStatusFailed, final.Status)
-		assert.Equal(t, "codex", final.Agent, "does not hop to host")
-		assert.Contains(t, final.Error, agent.SkippedHostBackupNote("host"))
-		assert.NoDirExists(t, hostDir)
-	})
-}
-
-// When a host backup is skipped, both final-error paths must carry the
-// skipped-host note. Mutants that drop skippedHostBackupNote at the retries-
-// exhausted path or the quota/prefix path turn these red.
+// When a host backup is skipped, the retries-exhausted and quota-prefix
+// final errors both carry the skipped-host note.
 func TestSkippedHostNoteOnFinalErrorPaths(t *testing.T) {
 	note := agent.SkippedHostBackupNote("host")
 	require.NotEmpty(t, note)
@@ -722,4 +673,58 @@ func TestWorkerAutoBackupHonorsReviewType(t *testing.T) {
 			assert.Equal(t, tc.want, wtc.Pool.resolveBackupAgent(job))
 		})
 	}
+}
+
+// A rerun pins an "auto" backup again against the rerun's primary and the
+// current agents: an empty pin picks up an agent installed since, and a pin
+// that matches the newly selected primary moves to another agent.
+func TestRerunRepinsAutoBackup(t *testing.T) {
+	for _, tc := range []struct {
+		name, pinned, selected      string
+		wantAgent, wantBackupPinned string
+	}{
+		{name: "empty pin", pinned: "", selected: "", wantAgent: "codex", wantBackupPinned: "claude-code"},
+		{name: "pin equals new primary", pinned: "claude-code", selected: "claude", wantAgent: "claude-code", wantBackupPinned: "codex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noHostMarker(t)
+			wtc := newWorkerTestContext(t, 1)
+			cfg := config.DefaultConfig()
+			cfg.DefaultBackupAgent = "auto"
+			wtc.reconfigurePool(cfg)
+			job := enqueueCodexJob(t, wtc, tc.pinned, true)
+			_, err := wtc.DB.Exec(`UPDATE review_jobs SET status = 'failed' WHERE id = ?`, job.ID)
+			require.NoError(t, err)
+			stubAgentPath(t, "codex", "claude")
+
+			job, err = wtc.DB.GetJobByID(job.ID)
+			require.NoError(t, err)
+			opts, err := resolveRerunOpts(job, cfg, nil, tc.selected)
+			require.NoError(t, err)
+			require.NoError(t, wtc.DB.ReenqueueJob(job.ID, opts))
+
+			rerun, err := wtc.DB.GetJobByID(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAgent, rerun.Agent)
+			assert.Equal(t, tc.wantBackupPinned, rerun.BackupAgent)
+			assert.True(t, rerun.BackupAuto)
+		})
+	}
+}
+
+// Enqueue-time "auto" picks skip agents that cannot run the review type, for
+// an auto primary and an auto backup alike.
+func TestEnqueueAutoPickHonorsReviewType(t *testing.T) {
+	noHostMarker(t)
+	stubAgentPath(t, "gemini", "pi")
+	cfg := config.DefaultConfig()
+	eligible := autoBackupEligible("custom")
+
+	a, err := agent.GetPreferredOrBackupEligible(nil, "auto", cfg, eligible)
+	require.NoError(t, err)
+	assert.Equal(t, "pi", a.Name(), "auto primary skips gemini for a custom review")
+
+	a, err = agent.GetPreferredOrBackupEligible(nil, "codex", cfg, eligible, "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "pi", a.Name(), "auto backup skips gemini for a custom review")
 }
