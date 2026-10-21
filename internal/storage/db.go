@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   skip_reason TEXT,
   source TEXT,
   backup_agent TEXT NOT NULL DEFAULT '',
-  backup_model TEXT NOT NULL DEFAULT ''
+  backup_model TEXT NOT NULL DEFAULT '',
+  explicit_host INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
@@ -1129,6 +1130,16 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("add budget_routing_locked column: %w", err)
 		}
 	}
+	// explicit_host records that enqueue saw --host. Like backup_auto, it is
+	// local scheduling state and is not synced. Old rows default to 0 and
+	// keep the default failover.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'explicit_host'`).Scan(&count)
+	if err == nil && count == 0 {
+		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN explicit_host INTEGER NOT NULL DEFAULT 0`)
+	}
+	if err != nil {
+		return fmt.Errorf("add explicit_host column: %w", err)
+	}
 	// backup_auto marks a backup pinned from "auto". Like
 	// budget_routing_locked, it is local scheduling state and is not synced.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'backup_auto'`).Scan(&count)
@@ -1604,7 +1615,32 @@ func (db *DB) migrate() error {
 	if err := db.migrateRepoNames(); err != nil {
 		return fmt.Errorf("migrate repository names: %w", err)
 	}
+	if err := db.ensureCloudLaunchTable(); err != nil {
+		return err
+	}
+	return nil
+}
 
+// ensureCloudLaunchTable creates the machine-local cursor-cloud launch
+// table. It has no job foreign key, so deleting a job keeps the launch row.
+func (db *DB) ensureCloudLaunchTable() error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS review_job_cloud_launches (
+		id INTEGER PRIMARY KEY,
+		job_id INTEGER NOT NULL,
+		launch_token TEXT NOT NULL UNIQUE,
+		agent_id TEXT NOT NULL DEFAULT '',
+		cleaned INTEGER NOT NULL DEFAULT 0,
+		repo_identity TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		orphan_note TEXT NOT NULL DEFAULT '',
+		agent_deleted INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		return fmt.Errorf("cloud launch table: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_job_cloud_launches_job
+		ON review_job_cloud_launches(job_id, cleaned)`); err != nil {
+		return fmt.Errorf("cloud launch index: %w", err)
+	}
 	return nil
 }
 
@@ -2388,6 +2424,17 @@ func (db *DB) ResetStaleJobs() error {
 		SET worker_id = NULL
 		WHERE status != 'running' AND worker_id IS NOT NULL
 	`); err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	// A cursor-cloud create recorded on this attempt must not be queued
+	// again. The predicate is currentAttemptCloudLaunchSQL.
+	if _, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'failed', worker_id = NULL, finished_at = ?, error = ?,
+		    updated_at = ?, synced_at = NULL
+		WHERE status = 'running' AND (`+currentAttemptCloudLaunchSQL()+`)
+	`, now, CloudLaunchInterruptedError, now); err != nil {
 		return err
 	}
 	_, err := db.Exec(`

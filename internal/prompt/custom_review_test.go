@@ -248,3 +248,104 @@ func TestReconcileStructuredOutputInstruction(t *testing.T) {
 		"a prose agent never sees the JSON instruction")
 	assert.Equal(prose, ReconcileStructuredOutputInstruction(prose, false))
 }
+
+// TestCustomReviewOutsideRepoFileRefusedOnlyForCursorCloud pins that a
+// cursor-cloud prompt refuses every custom review file that names or
+// resolves outside the repository, on the working tree and at a configured
+// ref, while a local agent still reads the same file.
+func TestCustomReviewOutsideRepoFileRefusedOnlyForCursorCloud(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliably available on Windows")
+	}
+	const secret = "Outside rubric secret."
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "leak.md"), []byte(secret), 0o644))
+	for _, tc := range []struct {
+		name    string
+		atRef   bool
+		include bool
+		spec    func(repo *testRepo, outside string) string
+	}{
+		{name: "absolute", spec: func(_ *testRepo, outside string) string { return outside }},
+		{name: "home", spec: func(*testRepo, string) string { return "~/leak.md" }},
+		{name: "dot-dot", spec: func(repo *testRepo, outside string) string {
+			rel, err := filepath.Rel(repo.dir, outside)
+			require.NoError(t, err)
+			return rel
+		}},
+		{name: "absolute include", include: true, spec: func(_ *testRepo, outside string) string { return outside }},
+		{name: "symlink", spec: func(repo *testRepo, outside string) string {
+			require.NoError(t, os.Symlink(outside, filepath.Join(repo.dir, "link.md")))
+			return "link.md"
+		}},
+		{name: "symlink at ref", atRef: true, spec: func(repo *testRepo, outside string) string {
+			require.NoError(t, os.Symlink(outside, filepath.Join(repo.dir, "link.md")))
+			return "link.md"
+		}},
+		{name: "relative symlink at ref", atRef: true, spec: func(repo *testRepo, outside string) string {
+			rel, err := filepath.Rel(repo.dir, outside)
+			require.NoError(t, err)
+			require.NoError(t, os.Symlink(rel, filepath.Join(repo.dir, "link.md")))
+			return "link.md"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newTestRepo(t)
+			outside := filepath.Join(t.TempDir(), "leak.md")
+			require.NoError(t, os.WriteFile(outside, []byte(secret), 0o644))
+			spec := config.ReviewTypeSpec{Template: tc.spec(repo, outside)}
+			if tc.include {
+				repo.writeFile("r.tmpl", `{{ index .Includes "rubric" }}`)
+				spec = config.ReviewTypeSpec{Template: "r.tmpl", Includes: map[string]string{"rubric": spec.Template}}
+			}
+			ref := ""
+			if tc.atRef {
+				repo.git("add", "-A")
+				repo.git("commit", "-m", "link")
+				ref = repo.git("rev-parse", "HEAD")
+			}
+			repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+				Types: map[string]config.ReviewTypeSpec{"custom": spec},
+			}}
+			builder := NewBuilder(nil).ForRepo(repo.dir, 0).WithRepoConfig(repoCfg, ref)
+
+			got, _, err := builder.resolveSystemPrompt("cursor-cloud", "custom", "custom")
+			require.ErrorContains(t, err, "outside the repository")
+			assert.NotContains(t, got, secret)
+
+			got, _, err = builder.resolveSystemPrompt("codex", "custom", "custom")
+			require.NoError(t, err)
+			assert.Contains(t, got, secret)
+		})
+	}
+}
+
+// TestCustomReviewInsideRepoFileReadForCursorCloud guards that repository
+// files, including through an in-repository symlink, still render for
+// cursor-cloud on the working tree and at a configured ref.
+func TestCustomReviewInsideRepoFileReadForCursorCloud(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliably available on Windows")
+	}
+	repo := newTestRepo(t)
+	require.NoError(t, os.Mkdir(filepath.Join(repo.dir, "reviews"), 0o755))
+	repo.writeFile("reviews/r.tmpl", `Inside template. {{ index .Includes "rubric" }}`)
+	repo.writeFile("reviews/rubric.md", "Inside rubric.")
+	require.NoError(t, os.Symlink("rubric.md", filepath.Join(repo.dir, "reviews", "link.md")))
+	repo.git("add", "-A")
+	repo.git("commit", "-m", "rubric")
+	repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+		Types: map[string]config.ReviewTypeSpec{"custom": {
+			Template: "reviews/r.tmpl",
+			Includes: map[string]string{"rubric": "./reviews/link.md"},
+		}},
+	}}
+	for _, ref := range []string{"", repo.git("rev-parse", "HEAD")} {
+		got, _, err := NewBuilder(nil).ForRepo(repo.dir, 0).
+			WithRepoConfig(repoCfg, ref).
+			resolveSystemPrompt("cursor-cloud", "custom", "custom")
+		require.NoError(t, err, "ref %q", ref)
+		assert.Contains(t, got, "Inside template. Inside rubric.", "ref %q", ref)
+	}
+}

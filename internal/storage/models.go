@@ -94,6 +94,7 @@ type ReviewJob struct {
 	FinishedAt          *time.Time `json:"finished_at,omitempty"`
 	WorkerID            string     `json:"worker_id,omitempty"`
 	Error               string     `json:"error,omitempty"`
+	OrphanWarning       string     `json:"orphan_warning,omitempty"` // Uncleaned launch note; not a review_jobs column.
 	Prompt              string     `json:"prompt,omitempty"`
 	RetryCount          int        `json:"retry_count"`
 	DiffContent         *string    `json:"diff_content,omitempty"`  // For dirty reviews (uncommitted changes)
@@ -157,6 +158,7 @@ type ReviewJob struct {
 
 	BudgetRoutingLocked       bool   `json:"-"` // Local retry/failover scheduling guard
 	BackupAuto                bool   `json:"-"` // BackupAgent is an "auto" pin, even if empty
+	ExplicitHost              bool   `json:"-"` // Enqueue --host selected this job's host
 	BudgetOriginalAgent       string `json:"-"` // Pre-budget choice restored on manual rerun
 	BudgetOriginalBackupAgent string `json:"-"`
 	BudgetOriginalBackupModel string `json:"-"`

@@ -238,7 +238,7 @@ func (h *remoteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		remoteError(w, 408, "remote request canceled")
 		return
 	}
-	h.server.httpServer.Handler.ServeHTTP(w, clone)
+	h.server.apiHandler.ServeHTTP(w, clone)
 }
 
 func (h *remoteHandler) authorize(r *http.Request, q url.Values, g remoteGrant) bool {

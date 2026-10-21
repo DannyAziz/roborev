@@ -32,6 +32,7 @@ export interface EnqueueCreatedResponse {
   min_severity?: string;
   model?: string;
   non_voting?: boolean;
+  orphan_warning?: string;
   output_prefix?: string;
   panel_member_config_json?: string;
   panel_member_index?: number;

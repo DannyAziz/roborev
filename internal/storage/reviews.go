@@ -61,6 +61,11 @@ func (db *DB) getReviewByJobID(jobID int64, includeFindingCounts bool) (*Review,
 	if includeFindingCounts {
 		applyJobFindingCounts(&job, reviewFields.StructuredOutput)
 	}
+	jobs := []ReviewJob{job}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, err
+	}
+	job = jobs[0]
 
 	r.Job = &job
 
@@ -555,6 +560,18 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 	}
 	if err := reviewRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate reviews: %w", err)
+	}
+	withJobs := make([]ReviewJob, 0, len(result))
+	for _, entry := range result {
+		withJobs = append(withJobs, entry.Job)
+	}
+	if err := db.AttachLaunchOrphanWarnings(withJobs); err != nil {
+		return nil, err
+	}
+	for _, job := range withJobs {
+		entry := result[job.ID]
+		entry.Job = job
+		result[job.ID] = entry
 	}
 
 	return result, nil

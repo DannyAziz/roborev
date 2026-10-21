@@ -207,6 +207,7 @@ type browserReviewJob struct {
 	JobType          string                `json:"job_type"`
 	Status           storage.JobStatus     `json:"status"`
 	Error            string                `json:"error,omitempty"`
+	OrphanWarning    string                `json:"orphan_warning,omitempty"`
 	EnqueuedAt       time.Time             `json:"enqueued_at"`
 	StartedAt        *time.Time            `json:"started_at,omitempty"`
 	FinishedAt       *time.Time            `json:"finished_at,omitempty"`
@@ -284,7 +285,8 @@ func projectBrowserReviewJob(job storage.ReviewJob) browserReviewJob {
 		GitRef: job.GitRef, Branch: job.Branch, Agent: job.Agent,
 		Model: job.Model, Provider: job.Provider, Reasoning: job.Reasoning,
 		JobType: job.JobType, Status: job.Status, Error: errorMessage,
-		EnqueuedAt: job.EnqueuedAt, StartedAt: job.StartedAt,
+		OrphanWarning: job.OrphanWarning,
+		EnqueuedAt:    job.EnqueuedAt, StartedAt: job.StartedAt,
 		FinishedAt: job.FinishedAt, Prompt: displayPrompt,
 		RetryCount: job.RetryCount, Agentic: job.Agentic,
 		PromptPrebuilt: job.PromptPrebuilt, ReviewType: job.ReviewType,

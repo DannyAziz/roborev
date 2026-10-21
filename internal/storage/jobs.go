@@ -100,9 +100,10 @@ type EnqueueOpts struct {
 	MinSeverity         string   // Minimum severity filter (canonical: critical/high/medium/low or empty)
 	// Job-level failover override (F7): preferred over the workflow-resolved
 	// backup agent/model when the worker fails this job over to a backup.
-	BackupAgent string
-	BackupModel string
-	BackupAuto  bool // BackupAgent is the enqueue-time pin of an "auto" backup
+	BackupAgent  string
+	BackupModel  string
+	BackupAuto   bool // BackupAgent is the enqueue-time pin of an "auto" backup
+	ExplicitHost bool // --host selected the host; local, not synced
 	// Panel relation (subagent review panels).
 	PanelRunUUID          *uuid.UUID                 // Groups member + synthesis jobs of one run
 	PanelRole             string                     // "", "member", or "synthesis"
@@ -311,8 +312,8 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 			status, job_type, review_type, patch_id, diff_content, dirty_files, prompt, agentic, prompt_prebuilt, output_prefix,
 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, non_voting, claim_blocked, source,
-			analysis_type, analysis_files, analysis_commit_sha, backup_auto)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			analysis_type, analysis_files, analysis_commit_sha, backup_auto, explicit_host)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
 		sessionResumedInt, opts.ResumeSourceJobUUID,
 		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
@@ -322,7 +323,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		uid, machineID, nowStr, opts.WorktreePath, normalizeMinSeverityForWrite(opts.MinSeverity), opts.BackupAgent, opts.BackupModel,
 		opts.PanelRunUUID, nullString(opts.PanelRole), nullString(opts.PanelName),
 		nullString(opts.PanelMemberName), opts.PanelMemberIndex, nullString(opts.PanelMemberConfigJSON), nonVotingInt, claimBlockedInt, nullString(opts.Source),
-		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA), opts.BackupAuto)
+		nullString(opts.AnalysisType), nullString(analysisFilesJSON), nullString(opts.AnalysisCommitSHA), opts.BackupAuto, opts.ExplicitHost)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +364,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		BackupAgent:           opts.BackupAgent,
 		BackupModel:           opts.BackupModel,
 		BackupAuto:            opts.BackupAuto,
+		ExplicitHost:          opts.ExplicitHost,
 		PanelRunUUID:          opts.PanelRunUUID,
 		PanelRole:             opts.PanelRole,
 		PanelName:             opts.PanelName,
@@ -840,6 +842,31 @@ func (db *DB) RequeueUpdateInterruptedJob(
 		    synced_at = NULL
 		WHERE id = ? AND status = 'running' AND worker_id = ?
 	`, jobID, workerID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+// RequeueJobNotBefore returns a running attempt to the queue without
+// consuming a retry. No worker claims it before notBefore.
+func (db *DB) RequeueJobNotBefore(jobID int64, workerID string, notBefore time.Time) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'queued',
+		    worker_id = NULL,
+		    started_at = NULL,
+		    session_id = NULL,
+		    session_resumed = 0,
+		    resume_source_job_uuid = NULL,
+		    token_usage = NULL,
+		    command_line = NULL,
+		    agent_invoked = 0,
+		    synced_at = NULL,
+		    retry_not_before = ?
+		WHERE id = ? AND status = 'running' AND worker_id = ?
+	`, preciseTimestampAt(notBefore), jobID, workerID)
 	if err != nil {
 		return false, err
 	}
@@ -2290,7 +2317,11 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	if err := db.attachExperimentAssignments(&j); err != nil {
 		return nil, err
 	}
-
+	jobs := []ReviewJob{j}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, err
+	}
+	j = jobs[0]
 	return &j, nil
 }
 
@@ -2843,6 +2874,9 @@ func (db *DB) GetPanelMembers(panelRunUUID uuid.UUID) ([]ReviewJob, error) {
 	if err := db.attachExperimentAssignmentsToJobs(jobs); err != nil {
 		return nil, err
 	}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, err
+	}
 	return jobs, nil
 }
 
@@ -2876,6 +2910,11 @@ func (db *DB) GetSynthesisJob(panelRunUUID uuid.UUID) (*ReviewJob, error) {
 	if err := db.attachExperimentAssignments(&j); err != nil {
 		return nil, err
 	}
+	jobs := []ReviewJob{j}
+	if err := db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, err
+	}
+	j = jobs[0]
 	return &j, nil
 }
 

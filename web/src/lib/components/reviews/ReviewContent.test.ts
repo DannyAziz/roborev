@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({
   notFound: false,
   status: "done",
   error: "",
+  orphanWarning: "",
 }));
 
 vi.mock("../../stores/context", () => ({
@@ -17,7 +18,11 @@ vi.mock("../../stores/context", () => ({
       getOutput: () => state.output,
       isLoading: () => state.loading,
       isReviewNotFound: () => state.notFound,
-      getSelectedJob: () => ({ status: state.status, error: state.error }),
+      getSelectedJob: () => ({
+        status: state.status,
+        error: state.error,
+        orphan_warning: state.orphanWarning,
+      }),
     },
   }),
 }));
@@ -33,6 +38,7 @@ afterEach(() => {
   state.notFound = false;
   state.status = "done";
   state.error = "";
+  state.orphanWarning = "";
 });
 
 describe("ReviewContent", () => {
@@ -72,5 +78,32 @@ describe("ReviewContent", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "The review agent failed before producing output.",
     );
+  });
+
+  it.each(["done", "failed", "canceled", "queued", "running"])(
+    "shows the uncleaned launch warning for a %s job",
+    (status) => {
+      const note = "cursor-cloud orphan risk: launch pending cleanup";
+      state.status = status;
+      state.error = status === "failed" ? `agent crashed ${note}` : "";
+      state.notFound = status !== "done";
+      state.output = status === "done" ? "## Review output" : "";
+      state.orphanWarning = note;
+
+      render(ReviewContent);
+
+      const warning = screen.getByText(note, {
+        selector: ".review-orphan-warning",
+      });
+      expect(warning).toHaveTextContent(`Warning: ${note}`);
+    },
+  );
+
+  it("shows no launch warning when the note is blank", () => {
+    state.orphanWarning = "  ";
+
+    render(ReviewContent);
+
+    expect(screen.queryByText(/Warning:/)).toBeNull();
   });
 });

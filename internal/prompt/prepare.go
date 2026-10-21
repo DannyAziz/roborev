@@ -1,11 +1,16 @@
 package prompt
 
 import (
-	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 
 	"go.kenn.io/roborev/internal/config"
 )
+
+// preparedPrompts maps each handoff Prepare returned in this process to the
+// complete text it wrote, until that snapshot's cleanup runs.
+var preparedPrompts sync.Map
 
 // Prepare measures the complete prompt once content assembly is finished.
 // The configured threshold selects inline text or a complete prompt file;
@@ -29,9 +34,42 @@ func (b *Builder) Prepare(text string, target SnapshotTarget) (SnapshotResult, e
 	if err != nil {
 		return SnapshotResult{}, err
 	}
+	handoff := SnapshotHandoffPrompt(file)
+	preparedPrompts.Store(handoff, text)
 	return SnapshotResult{
-		Prompt:   fmt.Sprintf("Read the complete task prompt from %q and carry out its instructions. Read the file in full before starting.\n", file),
+		Prompt:   handoff,
 		FilePath: file,
-		Cleanup:  cleanup,
+		Cleanup: func() {
+			preparedPrompts.Delete(handoff)
+			cleanup()
+		},
 	}, nil
+}
+
+const (
+	snapshotHandoffPrefix = "Read the complete task prompt from "
+	snapshotHandoffSuffix = " and carry out its instructions. Read the file in full before starting.\n"
+)
+
+// SnapshotHandoffPrompt is the entire prompt Prepare uses when the assembled
+// text exceeds the size limit.
+func SnapshotHandoffPrompt(path string) string {
+	return snapshotHandoffPrefix + strconv.Quote(path) + snapshotHandoffSuffix
+}
+
+// PreparedPromptText returns the complete text behind a handoff that Prepare
+// returned in this process and has not cleaned up. It matches the whole
+// prompt only and never opens the file the handoff names.
+func PreparedPromptText(handoff string) (string, bool) {
+	text, ok := preparedPrompts.Load(handoff)
+	if !ok {
+		return "", false
+	}
+	return text.(string), true
+}
+
+// LooksLikeSnapshotHandoff reports whether prompt has the shape of a whole
+// SnapshotHandoffPrompt, whoever wrote it.
+func LooksLikeSnapshotHandoff(prompt string) bool {
+	return strings.HasPrefix(prompt, snapshotHandoffPrefix) && strings.HasSuffix(prompt, snapshotHandoffSuffix)
 }

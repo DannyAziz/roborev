@@ -478,6 +478,16 @@ func (wp *WorkerPool) handleUpdateInterruptionLocked(
 	if !targeted {
 		return false
 	}
+	// A sent cursor-cloud create must not be queued again.
+	failedSent, err := wp.db.FailSentCloudLaunch(job.ID, workerID)
+	if err != nil {
+		log.Printf("[%s] Error failing sent cursor-cloud launch for update-interrupted job %d: %v", workerID, job.ID, err)
+		return true
+	}
+	if failedSent {
+		log.Printf("[%s] cursor-cloud sent launch for job %d was not requeued", workerID, job.ID)
+		return true
+	}
 	requeued, err := wp.db.RequeueUpdateInterruptedJob(job.ID, workerID)
 	if err != nil {
 		log.Printf("[%s] Error requeueing update-interrupted job %d: %v", workerID, job.ID, err)
@@ -641,6 +651,23 @@ func (wp *WorkerPool) prepareJobCheckout(
 	return checkout, nil
 }
 
+// priorRangeReviewRef is the git range whose earlier reviews belong in the
+// prompt. A CI cursor-cloud member is stored at the head commit; the frozen
+// pull request range lives on the synthesis job.
+func (wp *WorkerPool) priorRangeReviewRef(job *storage.ReviewJob) string {
+	if job == nil {
+		return ""
+	}
+	if gitpkg.IsRange(job.GitRef) || job.PanelRunUUID == nil || wp.db == nil {
+		return job.GitRef
+	}
+	synth, err := wp.db.GetSynthesisJob(*job.PanelRunUUID)
+	if err != nil || synth == nil || !gitpkg.IsRange(synth.GitRef) {
+		return job.GitRef
+	}
+	return synth.GitRef
+}
+
 func (wp *WorkerPool) promptBuilderForJob(
 	ctx context.Context,
 	checkout preparedJobCheckout,
@@ -695,6 +722,29 @@ func reviewJobUsesStructuredOutput(job *storage.ReviewJob) bool {
 // a job that fails a gate is never counted as an agent run. This is the synced
 // cost-eligibility signal (and stores the command line for TUI display); a
 // failed write only under-reports cost, so it is logged, not fatal.
+func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.ReviewJob, a agent.Agent) agent.Agent {
+	cloud, ok := a.(*agent.CursorCloudAgent)
+	if !ok || cloud == nil || job == nil {
+		return a
+	}
+	copied := *cloud
+	machineID, err := wp.db.GetMachineID()
+	if err != nil {
+		copied.BindLaunch = func(string, string) error { return err }
+		return &copied
+	}
+	copied.DaemonID = machineID.String() //nolint:forbidigo // launch marker is prompt text
+	copied.BindLaunch = func(token, repoURL string) error {
+		return wp.db.BeginCloudLaunch(job.ID, workerID, token, repoURL)
+	}
+	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
+	copied.MarkAgentDeleted = func(token string) error { return wp.db.MarkCloudAgentDeleted(job.ID, token) }
+	copied.MarkLaunchCleaned = func(token string) error {
+		return wp.db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, token)
+	}
+	return &copied
+}
+
 func (wp *WorkerPool) markAgentInvoked(workerID string, job *storage.ReviewJob, a agent.Agent) {
 	wp.markAgentInvokedWithCommandLine(workerID, job, a.CommandLine())
 }
@@ -981,6 +1031,13 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		}
 	}
 	wp.logJobStarted(workerID, job)
+
+	// A cursor-cloud agent edits its own VM, so a fix there never leaves a
+	// local patch. Refuse it before launch; a local backup may still run it.
+	if job.IsFixJob() && agent.IsCursorCloudAgent(job.Agent) {
+		wp.failoverOrFailNonRetryableAgentContext(ctx, workerID, job, job.Agent, agent.ErrCursorCloudFix.Error())
+		return
+	}
 
 	// Skip immediately if the agent is in quota cooldown.
 	// Resolve alias so "claude" checks cooldown for "claude-code".
@@ -1283,7 +1340,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 
 	priorResult, priorErr := pb.PreparePriorRangeReviewsSnapshot(
-		reviewPrompt, job.GitRef, cfg.ReviewContextCount, prompt.SnapshotTarget{
+		reviewPrompt, wp.priorRangeReviewRef(job), cfg.ReviewContextCount, prompt.SnapshotTarget{
 			RepoPath: reviewRepoPath, ConfigRepoPath: checkout.resolvedConfigRepoPath(),
 		},
 	)
@@ -1351,6 +1408,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			defer preparedPrompt.Cleanup()
 		}
 		reviewPrompt = preparedPrompt.Prompt
+		a = wp.bindCursorCloudLaunch(workerID, job, a)
 		wp.markAgentInvoked(workerID, job, a)
 		if planningPrompt != "" {
 			implementationInvoked = true
@@ -1416,6 +1474,24 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			wp.releaseIfPanelMember(job)
 			return // Job already marked as canceled in DB, nothing more to do
 		}
+		// A cursor-cloud create that may already have been sent, including a
+		// 429 and a deadline after send, and a wait-loop timeout, carries
+		// ErrCursorCloudNonRetryable. Pre-launch validation and the launch
+		// cap do not. Honor the sentinel before the deadline path below,
+		// which would otherwise drop it and requeue a second POST /agents.
+		if noVerdict, ok := errors.AsType[*review.NoVerdictError](err); ok && errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+			// The create was sent, so do not POST again. The stored error
+			// stays a no-verdict result: prefix, output, panel label, and
+			// the restart skip all key off that text.
+			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+			wp.failSentCursorCloud(workerID, job, agentName, review.NoVerdictMessage(noVerdict))
+			return
+		}
+		if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+			log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+			wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
 			timeoutErr := fmt.Sprintf(
 				"%s %s",
@@ -1432,6 +1508,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 	if wp.handleUpdateInterruption(ctx, workerID, job) {
+		log.Printf("[%s] discarded successful result for update-interrupted job %d", workerID, job.ID)
 		return
 	}
 
@@ -1447,12 +1524,12 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		fixPatch, patchErr = fixWorktree.CapturePatch(ctx)
 		if patchErr != nil {
 			log.Printf("[%s] Fix job %d: patch capture failed: %v", workerID, job.ID, patchErr)
-			wp.failOrRetryContext(ctx, workerID, job, agentName, fmt.Sprintf("patch capture: %v", patchErr))
+			wp.failFixAfterRunContext(ctx, workerID, job, agentName, fmt.Sprintf("patch capture: %v", patchErr))
 			return
 		}
 		if fixPatch == "" {
 			log.Printf("[%s] Fix job %d: agent produced no file changes", workerID, job.ID)
-			wp.failOrRetryContext(ctx, workerID, job, agentName, "agent produced no file changes")
+			wp.failFixAfterRunContext(ctx, workerID, job, agentName, "agent produced no file changes")
 			return
 		}
 		log.Printf("[%s] Fix job %d: captured patch (%d bytes)", workerID, job.ID, len(fixPatch))
@@ -1660,6 +1737,30 @@ func (wp *WorkerPool) failGetAgentContext(ctx context.Context, workerID string, 
 	})
 }
 
+// finishAgentError routes a finished agent error. A typed cursor-cloud launch
+// failure is terminal even when it unwraps to context.DeadlineExceeded.
+// Pre-launch validation and the launch cap do not carry that sentinel, so
+// they still use the deadline path below.
+func (wp *WorkerPool) finishAgentError(ctx context.Context, workerID string, job *storage.ReviewJob, agentName string, err error, jobTimeout time.Duration) {
+	if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+		log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+		wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
+		timeoutErr := fmt.Sprintf(
+			"%s %s",
+			agentTimeoutErrorPrefix,
+			jobTimeout.Round(time.Second),
+		)
+		log.Printf("[%s] Job %d timed out: %v", workerID, job.ID, err)
+		wp.failOrRetryAgentContext(ctx, workerID, job, agentName, timeoutErr)
+		return
+	}
+	log.Printf("[%s] Agent error on job %d: %v", workerID, job.ID, err)
+	wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
+}
+
 // failOrRetryAgentExecutionContext preserves the typed category attached by an
 // agent adapter until existing provider-limit classification has run. Unknown
 // pre-protocol failures skip same-agent retries and use the non-retryable
@@ -1672,14 +1773,29 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	agentName string,
 	executionErr error,
 ) {
+	if capErr, ok := errors.AsType[*agent.CursorCloudCapError](executionErr); ok {
+		wp.requeueCursorCloudCap(workerID, job, capErr)
+		return
+	}
+	// Same sentinel as the processJob deadline branch. A 429 is classified
+	// as transient from its text and would reach RetryJob if this ran only
+	// when the classification is LimitKindNone.
 	// A review that ran but produced no verdict (typically an unreadable
 	// diff) is deterministic for that agent: retrying it wastes runs. Fail
 	// over to the backup agent at once, or fail with the agent output kept
-	// in the stored error so the reason stays inspectable.
+	// in the stored error so the reason stays inspectable. A sent
+	// cursor-cloud create still must not be posted again.
 	if noVerdict, ok := errors.AsType[*review.NoVerdictError](executionErr); ok {
-		wp.failoverOrFailNonRetryableAgentContext(
-			ctx, workerID, job, agentName, review.NoVerdictMessage(noVerdict),
-		)
+		msg := review.NoVerdictMessage(noVerdict)
+		if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
+			wp.failSentCursorCloud(workerID, job, agentName, msg)
+			return
+		}
+		wp.failoverOrFailNonRetryableAgentContext(ctx, workerID, job, agentName, msg)
+		return
+	}
+	if errors.Is(executionErr, agent.ErrCursorCloudNonRetryable) {
+		wp.failCursorCloudWithoutRetry(workerID, job, agentName, executionErr)
 		return
 	}
 	errorMsg := fmt.Sprintf("agent: %v", executionErr)
@@ -1687,6 +1803,8 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	if !attached {
 		classification = wp.classify(agent.CanonicalName(agentName), errorMsg)
 	}
+	// A pre-launch unavailable error with no backup is permanent: failover
+	// has nowhere to go.
 	if classification.Kind == agent.LimitKindNone && agent.IsUnavailable(executionErr) {
 		wp.failoverOrFailNonRetryableAgentContext(
 			ctx, workerID, job, agentName, review.UnavailableError(errorMsg),
@@ -1834,6 +1952,60 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 	}
 }
 
+// requeueCursorCloudCap puts a job the launch cap refused back in the
+// queue. Nothing was launched, so no retry is spent. The job waits until
+// the hourly cap frees a slot, or the usual retry backoff for the
+// concurrent cap.
+func (wp *WorkerPool) requeueCursorCloudCap(workerID string, job *storage.ReviewJob, capErr *agent.CursorCloudCapError) {
+	notBefore := capErr.RetryAt
+	if notBefore.IsZero() {
+		notBefore = time.Now().Add(wp.retryBackoff)
+	}
+	wp.runAttemptTransition(workerID, job, func() {
+		requeued, err := wp.db.RequeueJobNotBefore(job.ID, workerID, notBefore)
+		if err != nil || !requeued {
+			log.Printf("[%s] cursor-cloud cap requeue for job %d failed: %v", workerID, job.ID, err)
+			return
+		}
+		log.Printf("[%s] %v; job %d requeued until %s", workerID, capErr, job.ID, notBefore.Format(time.RFC3339))
+	})
+}
+
+// failFixAfterRunContext fails a fix whose agent already returned. A
+// cursor-cloud create was sent, so the fix is not retried on cursor-cloud.
+func (wp *WorkerPool) failFixAfterRunContext(ctx context.Context, workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
+	if agent.CanonicalName(agentName) == agent.CursorCloudHost {
+		wp.failSentCursorCloud(workerID, job, agentName, errorMsg)
+		return
+	}
+	wp.failOrRetryContext(ctx, workerID, job, agentName, errorMsg)
+}
+
+// failCursorCloudWithoutRetry stops another cursor-cloud launch. A backup
+// that is not cursor-cloud still receives the job. With no such backup the
+// failure is permanent: the cap and a sent create are not retried on
+// cursor-cloud.
+func (wp *WorkerPool) failCursorCloudWithoutRetry(workerID string, job *storage.ReviewJob, agentName string, err error) {
+	wp.failSentCursorCloud(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
+}
+
+// failSentCursorCloud records errorMsg and does not run cursor-cloud again.
+// A backup that is not cursor-cloud still receives the job.
+func (wp *WorkerPool) failSentCursorCloud(workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
+	wp.runAttemptTransition(workerID, job, func() {
+		wp.failSentCursorCloudLocked(workerID, job, agentName, errorMsg)
+	})
+}
+
+func (wp *WorkerPool) failSentCursorCloudLocked(workerID string, job *storage.ReviewJob, agentName, errorMsg string) {
+	backup := wp.resolveBackupAgent(job)
+	if backup != "" && agent.CanonicalName(backup) != agent.CursorCloudHost {
+		wp.failoverOrFailNonRetryableAgentLocked(workerID, job, agentName, errorMsg)
+		return
+	}
+	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg)
+}
+
 func (wp *WorkerPool) failoverOrFailNonRetryableAgentContext(
 	_ context.Context,
 	workerID string, job *storage.ReviewJob,
@@ -1903,6 +2075,23 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 // resolveBackupAgentWithSkip is resolveBackupAgent plus a note naming the
 // marker when the backup is host and this daemon has no host model.
 func (wp *WorkerPool) resolveBackupAgentWithSkip(job *storage.ReviewJob) (string, string) {
+	backup, note := wp.resolveConfiguredBackupAgent(job)
+	// A fix never fails over to cursor-cloud: it cannot leave a local patch.
+	if job.IsFixJob() && agent.IsCursorCloudAgent(backup) {
+		return "", note
+	}
+	return backup, note
+}
+
+func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) (string, string) {
+	// --host cursor-cloud is stored on the job. That job never fails over,
+	// including to the workflow backup resolved below: a launch refused
+	// before create and a launch that failed after send both fail the job.
+	// A config host or ROBOREV_DEFAULT_HOST leaves the bit unset and may
+	// still fail over to a non-cloud backup.
+	if job.ExplicitHost && agent.CanonicalName(job.Agent) == agent.CursorCloudHost {
+		return "", ""
+	}
 	// An explicit per-job backup wins, for reliability: the enqueuer (e.g. a CI
 	// panel synthesis) chose this failover deliberately. Canonicalize the alias
 	// (e.g. "claude" -> "claude-code") via the registry; fall back to the raw

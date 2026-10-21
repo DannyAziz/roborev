@@ -882,11 +882,17 @@ reasoning = "standard"               # override legacy or exact reasoning level
 
 Per-repo overrides take priority over the global `[ci]` config. Any field not
 set in the repo's `[ci]` section falls back to the global config. If `panel` is
-set, it takes priority over the matrix fields for that repo.
+set, it takes priority over the matrix fields for that repo. `[ci] host` does
+not inherit the repository `host`, the global `host`, or `ROBOREV_DEFAULT_HOST`.
+Set `host = "cursor-cloud"` on the repository's own `[ci]` table to opt that
+repo's CI into one cloud agent for the implicit matrix. A fork or cross-repo
+pull request is refused when that opt-in is set, and stays on the local matrix
+when it is not.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `panel` | string | global `panel` | Named `[review.panels.<name>]` panel for CI reviews of this repo |
+| `host` | string | empty | CI review host for this repo. Empty keeps the local matrix. Does not inherit `host` or `ROBOREV_DEFAULT_HOST`. `cursor-cloud` opts the implicit matrix into one cloud agent |
 | `agents` | array | global `agents` | Agents for CI reviews of this repo |
 | `review_types` | array | global `review_types` | Review types for CI reviews of this repo |
 | `reviews` | table | global `reviews` | Granular agent-to-review-type map (overrides `agents` and `review_types`; empty table disables reviews) |

@@ -22,6 +22,35 @@ import (
 	"go.kenn.io/roborev/internal/tokens"
 )
 
+func TestGoalReviewCursorCloudLaunchIsNotRetried(t *testing.T) {
+	c := newWorkerTestContext(t, 1)
+	registerGoalReviewPi(t, c.Pool.cfgGetter.Config())
+	snapshot := goalreview.Snapshot{Source: "superpowers", Stage: "spec", Artifacts: []goalreview.Artifact{{Kind: "spec", Path: "spec.md", Content: "# Frozen\n"}}}
+	job, err := c.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: c.Repo.ID, Agent: "pi", GitRef: snapshot.ID(), ReviewType: "goal",
+		JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true,
+	})
+	require.NoError(t, err)
+	c.Pool.goalReviewRunner = func(context.Context, agent.Agent, string, goalreview.Snapshot, prompt.SnapshotResult, io.Writer) ([]goalreview.Finding, error) {
+		return nil, &goalreview.ExecutionError{Err: fmt.Errorf("create agent: %w", agent.ErrCursorCloudNonRetryable)}
+	}
+	claimed, err := c.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	c.Pool.processGoalReview(context.Background(), testWorkerID, claimed, c.Pool.cfgGetter.Config())
+
+	updated, err := c.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, storage.JobStatusFailed, updated.Status)
+	assert.Equal(t, "pi", updated.Agent)
+	assert.Equal(t, 0, updated.RetryCount)
+	assert.Contains(t, updated.Error, agent.ErrCursorCloudNonRetryable.Error())
+	next, err := c.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	assert.Nil(t, next)
+}
+
 func registerGoalReviewPi(t *testing.T, cfg *config.Config) {
 	t.Helper()
 	original, err := agent.Get("pi")

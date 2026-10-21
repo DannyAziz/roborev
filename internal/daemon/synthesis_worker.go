@@ -285,10 +285,13 @@ func (wp *WorkerPool) completeSynthesisLocked(
 		// Leaving the job running would strand the panel with no comment.
 		// Route the storage failure through the ordinary retry/fail path.
 		log.Printf("[%s] Error storing synthesis review for job %d: %v", workerID, job.ID, completeErr)
-		wp.failOrRetryInnerLocked(
-			workerID, job, agentName,
-			fmt.Sprintf("store synthesis review: %v", completeErr), false, nil,
-		)
+		errorMsg := fmt.Sprintf("store synthesis review: %v", completeErr)
+		if res.captureUsage && agent.CanonicalName(agentName) == agent.CursorCloudHost {
+			// The cloud synthesis already ran. A retry would POST another agent.
+			wp.failSentCursorCloudLocked(workerID, job, agentName, errorMsg)
+			return
+		}
+		wp.failOrRetryInnerLocked(workerID, job, agentName, errorMsg, false, nil)
 		return
 	}
 
@@ -353,6 +356,7 @@ func (wp *WorkerPool) runSynthesisAgent(
 	if err != nil {
 		return reviewpkg.SynthesisDocument{}, "", "", err
 	}
+	a = wp.bindCursorCloudLaunch(workerID, job, a)
 
 	wp.broadcaster.Broadcast(Event{
 		Type:     "review.started",
@@ -371,7 +375,7 @@ func (wp *WorkerPool) runSynthesisAgent(
 		outputWriter.Flush()
 		wp.outputBuffers.CloseJob(job.ID)
 	}()
-	jobLog := newAgentJobLogWriter(job.ID, agentName)
+	jobLog := openSynthesisJobLog(job.ID, agentName)
 	defer func() {
 		if cErr := jobLog.Close(); cErr != nil {
 			log.Printf("[%s] Warning: close job log for job %d: %v", workerID, job.ID, cErr)
@@ -444,8 +448,11 @@ func (wp *WorkerPool) runSynthesisAgent(
 			)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}
-		if agent.CanonicalName(agentName) == "host" {
-			// A host handoff timeout is not retried on the same agent.
+		if agent.CanonicalName(agentName) == "host" || errors.Is(err, agent.ErrCursorCloudNonRetryable) || agent.IsUnavailable(err) {
+			// Host handoff timeouts and a cursor-cloud launch that may
+			// already have been sent must keep their typed error. Formatting
+			// the error as text drops ErrCursorCloudNonRetryable, and the
+			// retry path would POST /v0/agents again.
 			wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}

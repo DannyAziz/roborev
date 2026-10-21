@@ -190,6 +190,11 @@ type APIError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	// RetryAfter is the Retry-After delay (RFC 9110). HasRetryAfter is
+	// false when the header was absent or not a delay-seconds / HTTP-date.
+	// A present zero means retry immediately.
+	RetryAfter    time.Duration
+	HasRetryAfter bool
 }
 
 func (e *APIError) Error() string {
@@ -262,6 +267,48 @@ func (c *httpClient) FinalMessage(ctx context.Context, id string) (string, error
 	return "", ErrNoAssistantMessage
 }
 
+func (c *httpClient) UserPrompt(ctx context.Context, id string) (string, error) {
+	path, err := agentPath(id)
+	if err != nil {
+		return "", err
+	}
+	var wire conversationWire
+	if err := c.do(ctx, "conversation", http.MethodGet, path+"/conversation", nil, &wire); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, msg := range wire.Messages {
+		if msg.Type != "user_message" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(msg.Text)
+	}
+	return b.String(), nil
+}
+
+func (c *httpClient) StopAgent(ctx context.Context, id string) error {
+	path, err := agentPath(id)
+	if err != nil {
+		return err
+	}
+	// POST /v0/agents/{id}/stop pauses execution and does not delete the agent.
+	// https://cursor.com/docs/cloud-agent/api/v0#stop-an-agent
+	return c.do(ctx, "stop agent", http.MethodPost, path+"/stop", nil, nil)
+}
+
+func (c *httpClient) DeleteAgent(ctx context.Context, id string) error {
+	path, err := agentPath(id)
+	if err != nil {
+		return err
+	}
+	// DELETE /v0/agents/{id} is permanent. The v0 docs do not say it stops billing.
+	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
+	return c.do(ctx, "delete agent", http.MethodDelete, path, nil, nil)
+}
+
 func (c *httpClient) ListAgents(ctx context.Context) ([]Agent, error) {
 	cursor := ""
 	seen := map[string]struct{}{"": {}}
@@ -315,6 +362,10 @@ type agentWire struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
+	Source struct {
+		Repository string `json:"repository"`
+		Ref        string `json:"ref"`
+	} `json:"source"`
 }
 
 type listWire struct {
@@ -330,7 +381,13 @@ type conversationWire struct {
 }
 
 func toAgent(w agentWire) Agent {
-	return Agent{ID: w.ID, Status: AgentStatus(w.Status), Title: w.Name}
+	return Agent{
+		ID:               w.ID,
+		Status:           AgentStatus(w.Status),
+		Title:            w.Name,
+		SourceRepository: w.Source.Repository,
+		SourceRef:        w.Source.Ref,
+	}
 }
 
 func agentPath(id string) (string, error) {
@@ -390,7 +447,7 @@ func (c *httpClient) do(ctx context.Context, op, method, path string, in, out an
 		// still redacted; apiError truncates after redacting.
 		limit := int64(maxErrorMessageBytes + len(c.authorization()))
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
-		return c.apiError(op, resp.StatusCode, data)
+		return c.apiError(op, resp.StatusCode, data, resp.Header)
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -426,24 +483,51 @@ func (c *httpClient) authorization() string {
 	return "Basic " + token
 }
 
-func (c *httpClient) apiError(op string, status int, data []byte) error {
+func (c *httpClient) apiError(op string, status int, data []byte, header http.Header) error {
 	code, message, ok := parseAPIErrorBody(data)
 	if !ok {
 		message = string(data)
 	}
-	// Redact the full error text before the 64 KiB cap. Truncating first
-	// keeps the prefix of a secret that straddles the cut.
+	// Redact the full error text, Code and Message, before the 64 KiB cap.
+	// Truncating first keeps the prefix of a secret that straddles the cut.
 	code = c.redact(strings.TrimSpace(code))
 	message = c.redact(message)
 	if len(message) > maxErrorMessageBytes {
 		message = message[:maxErrorMessageBytes]
 	}
+	retryAfter, hasRetryAfter := parseRetryAfter(header.Get("Retry-After"), time.Now())
 	return &APIError{
-		Op:         op,
-		StatusCode: status,
-		Code:       code,
-		Message:    strings.TrimSpace(message),
+		Op:            op,
+		StatusCode:    status,
+		Code:          code,
+		Message:       strings.TrimSpace(message),
+		RetryAfter:    retryAfter,
+		HasRetryAfter: hasRetryAfter,
 	}
+}
+
+// parseRetryAfter reads RFC 9110 Retry-After: delay-seconds or an HTTP-date.
+// A date already in the past is a present header with a zero wait.
+func parseRetryAfter(raw string, now time.Time) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	when, err := http.ParseTime(raw)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		return 0, true
+	}
+	return delay, true
 }
 
 func parseAPIErrorBody(data []byte) (code, message string, ok bool) {

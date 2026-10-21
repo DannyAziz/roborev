@@ -318,6 +318,15 @@ func newAgentJobLogWriter(jobID int64, agent string) *jobLogWriter {
 	return newJobLogWriterWithMode(jobID, jobLogTruncate, agent)
 }
 
+// openSynthesisJobLog keeps bytes already written for this job. A restarted
+// synthesis used to open the log with O_TRUNC and drop the cloud launch line.
+func openSynthesisJobLog(jobID int64, agent string) *jobLogWriter {
+	if info, err := os.Stat(JobLogPath(jobID)); err == nil && info.Size() > 0 {
+		return newJobLogWriterWithMode(jobID, jobLogAppend, agent)
+	}
+	return newAgentJobLogWriter(jobID, agent)
+}
+
 func newJobLogWriterWithMode(
 	jobID int64, mode jobLogOpenMode, agent string,
 ) *jobLogWriter {

@@ -46,12 +46,13 @@ form treats `name` as a positional commit argument.
     reviews from the same base available in an optional XML document
 1. Results are stored and can be viewed in the TUI
 
-Prior range reviews live in a temporary file referenced by a structured marker
-in the prompt. The agent may read it to check earlier feedback against the
-current code. The file contains review outputs and developer responses, not
-previous prompts. `review_context_count` limits the number of earlier endpoints
-included, with one review per endpoint. Repeated reviews of the current endpoint
-are excluded from this document. The file is removed when the review finishes.
+Prior range reviews are escaped into the prompt as an XML document. The prompt
+tells the agent to treat that document as reference data, not instructions. The
+document contains review outputs and developer responses, not previous prompts.
+`review_context_count` limits the number of earlier endpoints included, with one
+review per endpoint. Repeated reviews of the current endpoint are excluded. A
+stored prompt fills the document when the job runs, so reviews that finish while
+the job is queued are included.
 
 Before measuring or sending a prompt, roborev replaces invalid UTF-8 byte
 sequences with `�`. This lets reviews run when a diff includes legacy-encoded

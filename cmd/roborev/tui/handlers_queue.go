@@ -165,7 +165,11 @@ func (m model) flashNoReviewYet(job storage.ReviewJob) model {
 	case storage.JobStatusCanceled:
 		status = "canceled"
 	}
-	m.setFlash(fmt.Sprintf("Job #%d is %s — no review yet", job.ID, status), 2*time.Second, viewQueue)
+	msg := fmt.Sprintf("Job #%d is %s — no review yet", job.ID, status)
+	if line := storage.FormatLaunchOrphanWarning(&job); line != "" {
+		msg += " — " + sanitizeForDisplay(line)
+	}
+	m.setFlash(msg, 2*time.Second, viewQueue)
 	return m
 }
 

@@ -26,6 +26,9 @@ func TestMain(m *testing.M) {
 			return filepath.Join(dir, ".gemini", "antigravity-cli", "settings.json")
 		}
 	}
+	// Tests share the process-wide cursor-cloud launch cap. Lift it so
+	// unrelated tests cannot refuse each other's launches.
+	cursorCloudLaunches = &cursorCloudLaunchGate{maxConcurrent: 1 << 30, maxPerHour: 1 << 30}
 	code := testenv.RunIsolatedMain(m)
 	if dir != "" {
 		_ = os.RemoveAll(dir)

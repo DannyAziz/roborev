@@ -249,6 +249,9 @@ type Config struct {
 	ReviewGuidelines           string                          `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
 	FixGuidelines              string                          `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
 	DefaultAgent               string                          `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
+	Host                       string                          `toml:"host" comment:"Review host: local (default), host, or cursor-cloud. Empty inherits ROBOREV_DEFAULT_HOST, then local. CURSOR_API_KEY alone does not select cursor-cloud."`
+	AllowCursorCloud           bool                            `toml:"allow_cursor_cloud" comment:"Let a repository .roborev.toml select cursor-cloud through host, agent, review_agent*, backup_agent, or [ci] host. Read only from this global file. The --host flag and global settings do not need it."`
+	AllowedHosts               []string                        `toml:"allowed_hosts" comment:"Extra Host names the daemon API accepts on its loopback listener, for a local reverse proxy such as Tailscale Serve, nginx, or Caddy. Not needed when auth_key is set. Requires daemon restart."`
 	DefaultModel               string                          `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
@@ -777,6 +780,7 @@ func (c *Config) Validate() (err error) {
 type RepoConfig struct {
 	experimentOverlay               map[string]any
 	Agent                           string                          `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
+	Host                            string                          `toml:"host" comment:"Review host for this repo: local, host, or cursor-cloud. Empty inherits the global host, then ROBOREV_DEFAULT_HOST."`
 	Model                           string                          `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
 	BackupAgent                     string                          `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
 	BackupModel                     string                          `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
@@ -982,6 +986,9 @@ func (c *RepoConfig) Validate() (err error) {
 	}
 	reasoning = append(reasoning, analyzeReasoningValues(c.Analyze)...)
 	if err := validateReasoningValues(reasoning...); err != nil {
+		return err
+	}
+	if err := validateRepoCIHost(c.CI.Host); err != nil {
 		return err
 	}
 	return validateMinSeverityValues(
@@ -2589,6 +2596,11 @@ func ResolveRepoIdentity(repoPath string, getRemoteURL func(repoPath, remoteName
 	return "local://" + absPath
 }
 
+// RedactedURL is the fail-closed result of StripURLCredentials. It contains
+// no userinfo, query, or fragment from the input. Callers that would send
+// this value on must refuse instead of treating it as a repository URL.
+const RedactedURL = "redacted-url"
+
 // stripURLCredentials removes userinfo (username:password) from a URL.
 // For non-URL strings (e.g., SSH URLs like git@github.com:user/repo.git),
 // returns the original string unchanged.
@@ -2617,4 +2629,167 @@ func stripURLCredentials(rawURL string) string {
 	// Clear the userinfo
 	parsed.User = nil
 	return parsed.String()
+}
+
+// StripURLCredentials removes userinfo and every query and fragment before a
+// URL is sent to cursor-cloud. It is not the stored repo identity.
+// git@host:path has no password. Its query and fragment are dropped so a
+// credential in either one is not sent, and the launch URL still names the
+// repository. Anything url.Parse rejects, including a token in the
+// SCP user slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is
+// RedactedURL. Callers must not launch with that value.
+func StripURLCredentials(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return RedactedURL
+	}
+	if _, ok := gitSCP(rawURL); ok {
+		var host, path string
+		if !scpUserPath(rawURL, &host, &path) || host == "" || path == "" {
+			return RedactedURL
+		}
+		return "git@" + host + ":" + path
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return RedactedURL
+	}
+	if strings.HasPrefix(rawURL, "//") {
+		if parsed.Host == "" {
+			return RedactedURL
+		}
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return "//" + parsed.Host + parsed.EscapedPath()
+	}
+	if parsed.Scheme == "" && parsed.Host == "" {
+		if strings.Contains(rawURL, "@") {
+			return RedactedURL
+		}
+		return rawURL
+	}
+	if parsed.Scheme == "file" {
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		parsed.RawFragment = ""
+		return parsed.String()
+	}
+	if parsed.Scheme == "" || !transportScheme(parsed.Scheme) {
+		return RedactedURL
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Host == "" {
+		return RedactedURL
+	}
+	return parsed.String()
+}
+
+// RemoteIdentity compares cursor-cloud repository URLs. It is not the stored
+// repo identity. Userinfo, query, and fragment are dropped. A trailing
+// .git is ignored, and git@host:path matches https://host/path. The host is
+// lowercased because DNS names are case-insensitive. The path is lowercased
+// only for github.com, whose owner and repository names are case-insensitive
+// (https://docs.github.com/en/rest/repos/repos#get-a-repository).
+// Other hosts keep path case, so Org/Repo and org/repo stay distinct. An
+// empty result does not name a repository.
+func RemoteIdentity(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	var scheme, host, path string
+	var scpHost, scpPath string
+	if scpUserPath(rawURL, &scpHost, &scpPath) {
+		scheme, host, path = "https", scpHost, scpPath
+	} else {
+		parsed, err := url.Parse(rawURL)
+		if err != nil || parsed.Host == "" {
+			return ""
+		}
+		scheme = parsed.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		host = parsed.Host
+		path = parsed.EscapedPath()
+		if path == "" {
+			path = parsed.Path
+		}
+	}
+	scheme = strings.ToLower(scheme)
+	if scheme == "ssh" || scheme == "git" {
+		scheme = "https"
+	}
+	if !transportScheme(scheme) && scheme != "https" {
+		return ""
+	}
+	host = strings.ToLower(host)
+	path = strings.Trim(path, "/")
+	// Path case is part of the repository name on a self-hosted server.
+	// github.com is the host whose names are case-insensitive.
+	if githubRepoHost(host) {
+		path = strings.ToLower(path)
+	}
+	path = strings.TrimSuffix(path, ".git")
+	if host == "" || path == "" {
+		return ""
+	}
+	return scheme + "://" + host + "/" + path
+}
+
+// githubRepoHost reports the public GitHub host. Owner and repository names
+// there compare case-insensitively. A self-hosted host is not assumed to.
+func githubRepoHost(host string) bool {
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	return name == "github.com"
+}
+
+// gitSCP reports git@host:path, which has no password.
+func gitSCP(raw string) (string, bool) {
+	var host, path string
+	if !scpUserPath(raw, &host, &path) {
+		return "", false
+	}
+	user, _, _ := strings.Cut(raw, "@")
+	if user != "git" {
+		return "", false
+	}
+	return raw, true
+}
+
+func scpUserPath(raw string, host, path *string) bool {
+	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "//") {
+		return false
+	}
+	user, rest, ok := strings.Cut(raw, "@")
+	if !ok || user == "" || strings.Contains(user, "/") {
+		return false
+	}
+	h, p, ok := strings.Cut(rest, ":")
+	if !ok || h == "" || p == "" || strings.Contains(h, "/") {
+		return false
+	}
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	*host = h
+	*path = p
+	return true
+}
+
+func transportScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https", "ssh", "git", "file":
+		return true
+	default:
+		return false
+	}
 }

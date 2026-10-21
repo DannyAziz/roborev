@@ -486,6 +486,22 @@ type RepoCIConfig struct {
 	// IncludeCosts overrides the global ci.include_costs setting.
 	// Use a pointer so we can distinguish "not set" from "explicitly false".
 	IncludeCosts *bool `toml:"include_costs" comment:"Override whether CI PR comments include token cost estimates."`
+
+	// Host opts this repo's CI into a review host. Only this field does.
+	// The repo host, the global host, and ROBOREV_DEFAULT_HOST do not apply
+	// to CI. cursor-cloud is refused for a fork or cross-repo pull request.
+	Host string `toml:"host" comment:"CI review host for this repo. Empty keeps the local CI matrix. Does not inherit host or ROBOREV_DEFAULT_HOST."`
+}
+
+// validateRepoCIHost accepts an empty host, local, or cursor-cloud. CI does
+// not inherit the repo host, the global host, or ROBOREV_DEFAULT_HOST.
+func validateRepoCIHost(host string) error {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "", "local", "cursor-cloud":
+		return nil
+	default:
+		return fmt.Errorf("ci.host %q is unknown (known: local, cursor-cloud)", strings.TrimSpace(host))
+	}
 }
 
 func validateCIReviewTypes(

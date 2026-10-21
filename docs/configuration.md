@@ -1101,6 +1101,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
 | `auth_key` | string | empty | Shared Bearer key for native daemon APIs; see [Daemon authentication](#daemon-authentication) | No |
+| `allowed_hosts` | array | `[]` | Extra Host names the daemon API accepts on a loopback connection, for a local reverse proxy; see [Daemon authentication](#daemon-authentication) | No |
 | `daemon_tls.*` | table | empty | Mutual TLS files for the daemon's TCP listener; see [Transport security](#transport-security) | No |
 | `web.enabled` | bool | true | Serve the embedded browser application on a separate listener | No |
 | `web.listen` | string | 127.0.0.1:0 | Loopback browser listener address. Port 0 selects an available ephemeral port | No |
@@ -1115,6 +1116,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
 | `agent_quota_cooldown` | string | `30m0s` | Maximum daemon-wide cooldown after an agent quota or session-limit error, as a Go duration such as `10m`, `30m`, or `1h` | Yes |
 | `allow_unsafe_agents` | bool | false | Enable agentic mode globally | Yes |
+| `allow_cursor_cloud` | bool | false | Let a repository `.roborev.toml` select `cursor-cloud`; see [Cursor cloud host](#cursor-cloud-host) | Yes |
 | `anthropic_api_key` | string | - | Anthropic API key for Claude Code | Yes |
 | `review_context_count` | int | 3 | Recent reviews to include as context | Yes |
 | `review_guidelines` | string | - | Global reviewer instructions included in review prompts for every repo | Yes |
@@ -1152,6 +1154,113 @@ filter_branch = false             # Show all branches on startup (default: curre
     If you have it set and `hide_closed_by_default` is not present, the old value is
     used automatically. No action is required, but new configs should use the new
     name.
+
+### Cursor cloud host
+
+Ordinary reviews stay on the local agent. `cursor-cloud` is off unless you
+choose it. Setting `CURSOR_API_KEY` does not select it, and the defaults above
+do not change.
+
+Enable it in one of these ways:
+
+- `roborev review --host cursor-cloud`
+- `host = "cursor-cloud"` in `~/.roborev/config.toml` or `.roborev.toml` (the
+    repo value wins)
+- `ROBOREV_DEFAULT_HOST=cursor-cloud` in the environment the daemon runs in
+
+A repository `.roborev.toml` cannot start paid cloud reviews on its own. When
+cursor-cloud comes only from repository config (`host`, `agent`,
+`review_agent*`, `backup_agent`, or `[ci] host`), roborev refuses it unless the
+global `~/.roborev/config.toml` sets `allow_cursor_cloud = true`. The error
+names that key. `allow_cursor_cloud` is read only from the global config; a
+repository file cannot set it. `--host`, `--agent`, the global `host`, global
+agent settings, and `ROBOREV_DEFAULT_HOST` do not need it.
+
+```toml
+# ~/.roborev/config.toml
+allow_cursor_cloud = true
+```
+
+`--host` wins over config, and config wins over `ROBOREV_DEFAULT_HOST`. `local`
+keeps today's agent selection. `host` is the attached host model and still
+requires `ROBOREV_HOST_AGENT=1`. An explicit `cursor-cloud` without
+`CURSOR_API_KEY` is an error; roborev does not fall back to a local agent. An
+explicit `host` without `ROBOREV_HOST_AGENT=1` is the same kind of error.
+
+`--host cursor-cloud` is stored on the job, and that job never runs on a local
+agent: budget routing does not substitute one, and the job never falls back to
+one, including a workflow backup. A launch refused before the create is sent (a
+bad ref or a missing remote) and a launch that fails after the create is sent
+both fail the job. When `host = "cursor-cloud"` in config or
+`ROBOREV_DEFAULT_HOST` selects cursor-cloud, a configured non-cloud backup may
+still run.
+
+The cloud review is created at the exact commit SHA and polled until it
+finishes. `CREATING` and any other unknown status stay in progress. The agent's
+final assistant message is the review. A finished agent with no assistant
+message fails that review. roborev stops that agent, then deletes it, when the
+review ends, on success, error, timeout, and cancellation. The v0 stop call
+pauses the VM. The v0 delete docs do not say that delete ends billing. A create
+that fails after it is sent, and returns no id, is found by a token in the
+prompt and stopped and deleted the same way. v0 launch has no idempotency key. A
+delete failure is logged and reported. When the review itself succeeded, that
+failure is returned as a non-retryable error instead of the agent's text. The
+URL sent to Cursor drops userinfo, every query key, and the fragment.
+`git@host:path` keeps that shape and drops a query or fragment. A URL that
+cannot be parsed, including a token in the SCP user slot and a bad
+percent-escape, is not sent: the launch is refused. The stored repository
+identity is separate. It drops userinfo from transport URLs, keeps the query and
+the fragment, and stores an unparseable URL unchanged. Ordinary enqueue refuses
+a dirty or range review on `cursor-cloud` and does not rewrite it onto a local
+agent. CI is separate: an opted-in same-repository pull request runs that range
+on cursor-cloud. A declared fix, compact, or task with no prompt and a dirty or
+range ref is that review, so `cursor-cloud` refuses it. Goal reviews stay on the
+local agent. A custom prompt is the created job: fix and compact keep that type,
+and run or analyze is a task even when the label contains `..`. Those stay on
+the local agent when `host` is `cursor-cloud`. CI launches `cursor-cloud` only
+when the repository's own `[ci] host` is `cursor-cloud` and the global
+`allow_cursor_cloud` is true. If `CURSOR_API_KEY` is missing, the CI poller logs
+one warning when it first sees such a repository. The repository `host`, the
+global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. The check runs
+when a matrix member, a named-panel member, or synthesis would enqueue
+cursor-cloud, not only when `[ci] host` is set. A fork or cross-repo pull
+request is refused on every one of those paths. An empty or unknown head or base
+repository, including a deleted fork, fails closed and does not launch. The
+deferred retry and the pull-request lookup both carry the head and base
+repository names. A retry that does not have them cannot launch cursor-cloud. An
+oversized prompt is not sent to cursor-cloud as a local file path. When Prepare
+writes the prompt snapshot under `snapshot_dir` (default `.roborev`), it also
+keeps the complete prompt text in memory, keyed by the exact handoff text it
+returns. The adapter sends that kept text only when the entire launch text is
+such a handoff. A launch text shaped like a whole handoff that this daemon
+process did not prepare, or whose snapshot was already cleaned up, is refused.
+Any other prompt is used as written. The adapter never opens a path named in a
+prompt. Without the opt-in, CI keeps its local matrix. An opted-in
+same-repository matrix launches one cloud agent. That job is stored as a range
+review, and the prebuilt prompt covers the pull request range. The agent is
+launched at the head commit. The adapter still refuses a ref that is empty,
+`dirty`, or contains `..`. CI does not send that ref.
+
+Launch limits are checked before the agent is created. The defaults are 4
+concurrent launches and 60 launches in a rolling hour. 4 matches the default
+worker count. 60 is one launch a minute. A launch past either limit creates no
+agent and the job waits in the queue until a slot frees. A finished review frees
+its concurrent slot after the agent is deleted. A launch stops counting one hour
+after it started.
+
+Set `ROBOREV_CURSOR_CLOUD_MAX_CONCURRENT` and
+`ROBOREV_CURSOR_CLOUD_MAX_PER_HOUR` to a positive integer to change a limit. An
+unset, zero, or invalid value keeps the default.
+
+The request tells the agent to avoid shell tools, ignore the repository's
+`.cursor` configuration, skip `environment.json` setup, not write to the
+repository, and read only the tree at that commit.
+
+!!! note "Limitation: the API cannot enforce the sandbox"
+
+    `CreateAgent` has no fields to disable shell tools, ignore `.cursor`, skip
+    `environment.json`, or confine reads. Those rules are prompt text. The Cursor
+    API cannot enforce them.
 
 ### Review Search Embeddings
 
@@ -1422,6 +1531,20 @@ Set a shared key in the daemon owner's global config to require authentication
 for all native daemon APIs, including reads, shutdown, streaming, profiling, MCP
 and the OpenAPI document. Authentication is disabled when `auth_key` is empty
 (the default). This key is global-only; repo config cannot override it.
+
+Without a key, a plain HTTP request that reaches the daemon over a loopback
+connection must name `localhost` or a loopback address as its Host. This refuses
+a web page that rebinds its own DNS name to `127.0.0.1`. The TLS listener, Unix
+sockets, and the web UI listener, which has its own host and origin checks, are
+unchanged. The check is skipped when `auth_key` is set, since a rebound page
+cannot present the key. A local reverse proxy (Tailscale Serve, nginx, Caddy)
+that forwards to `127.0.0.1:7373` with its public Host header needs `auth_key`,
+or its host names in the global `allowed_hosts`:
+
+```toml
+# ~/.roborev/config.toml
+allowed_hosts = ["box.tail1234.ts.net"]
+```
 
 Generate 32 random bytes encoded as 64 lowercase hex characters:
 
@@ -1955,7 +2078,7 @@ attempt. A manual rerun on this daemon restores the pre-budget agent and backup
 settings, resolves its model again, and applies the current budget. Selecting an
 agent explicitly for the rerun replaces that original choice. The routing lock
 and original choices are local scheduling state and are not synced to other
-machines.
+machines. A `--host cursor-cloud` job is never routed.
 
 The daemon applies config reloads to subsequent job decisions. Spend is cached
 for up to 10 seconds, refreshes at UTC midnight, and is invalidated when this

@@ -125,3 +125,20 @@ func (b repeatByte) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func TestErrorBodyRedactsKeyInCode(t *testing.T) {
+	const key = "code-field-secret-key"
+	body := `{"code":"` + key + `","message":"plain"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewHTTPClient(key, WithBaseURL(srv.URL))
+	_, err := client.GetAgent(context.Background(), "bc_1")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "[REDACTED]", apiErr.Code)
+	assert.NotContains(t, apiErr.Message, key)
+	assert.NotContains(t, err.Error(), key)
+}

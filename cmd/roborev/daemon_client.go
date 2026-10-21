@@ -57,13 +57,13 @@ func waitForJob(cmd *cobra.Command, ep daemon.DaemonEndpoint, jobID int64, quiet
 			if !quiet {
 				cmd.Printf(" failed!\n")
 			}
-			return fmt.Errorf("review failed: %s", job.Error)
+			return fmt.Errorf("%s", withLaunchOrphanWarning(fmt.Sprintf("review failed: %s", job.Error), job))
 
 		case storage.JobStatusCanceled:
 			if !quiet {
 				cmd.Printf(" canceled!\n")
 			}
-			return fmt.Errorf("review was canceled")
+			return fmt.Errorf("%s", withLaunchOrphanWarning("review was canceled", job))
 
 		case storage.JobStatusQueued, storage.JobStatusRunning:
 			// Still in progress, continue polling
@@ -93,6 +93,16 @@ func waitForJob(cmd *cobra.Command, ep daemon.DaemonEndpoint, jobID int64, quiet
 	}
 }
 
+// withLaunchOrphanWarning appends the uncleaned launch note when the job
+// carries one and the message does not already include that line.
+func withLaunchOrphanWarning(msg string, job *storage.ReviewJob) string {
+	line := storage.FormatLaunchOrphanWarning(job)
+	if line == "" || strings.Contains(msg, line) {
+		return msg
+	}
+	return msg + "\n" + line
+}
+
 // showReview fetches and displays a review by job ID.
 // When quiet is true, suppresses output but still returns exit code based on verdict.
 // On a FAIL verdict returns a bare *exitError (no cmd mutation) so the function
@@ -112,6 +122,9 @@ func showReview(cmd *cobra.Command, ep daemon.DaemonEndpoint, jobID int64, quiet
 		return err
 	}
 
+	if line := storage.FormatLaunchOrphanWarning(review.Job); line != "" {
+		cmd.Println(line)
+	}
 	if !quiet {
 		cmd.Printf("Review (by %s)\n", review.Agent)
 		cmd.Println(strings.Repeat("-", 60))

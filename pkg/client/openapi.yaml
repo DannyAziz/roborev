@@ -1258,6 +1258,8 @@ components:
           type: string
         non_voting:
           type: boolean
+        orphan_warning:
+          type: string
         output_prefix:
           type: string
         panel_member_config_json:
@@ -1391,6 +1393,8 @@ components:
             type: string
           type: array
         git_ref:
+          type: string
+        host:
           type: string
         job_type:
           type: string
@@ -2820,6 +2824,8 @@ components:
           type: string
         non_voting:
           type: boolean
+        orphan_warning:
+          type: string
         output_prefix:
           type: string
         panel_member_config_json:
@@ -3680,6 +3686,8 @@ components:
           type: string
         non_voting:
           type: boolean
+        orphan_warning:
+          type: string
         output_prefix:
           type: string
         panel_member_config_json:
@@ -3820,6 +3828,8 @@ components:
         enqueued_at:
           format: date-time
           type: string
+        error:
+          type: string
         finished_at:
           format: date-time
           type: string
@@ -3832,6 +3842,8 @@ components:
           type: string
         non_voting:
           type: boolean
+        orphan_warning:
+          type: string
         panel_member_name:
           type: string
         panel_name:

@@ -4,7 +4,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/xml"
 	"io"
 	"os"
 	"path/filepath"
@@ -270,19 +269,10 @@ func TestSnapshotFlow_PriorRangeReviews(t *testing.T) {
 				require.NoError(t, err)
 				require.Contains(t, storedPrompt, promptpkg.PriorRangeReviewsFilePathPlaceholder)
 			}
-			var snapshotPath string
 			registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
-				start := strings.Index(p, "<prior-range-reviews ")
-				require.NotEqual(t, -1, start)
-				var reference struct {
-					File string `xml:"file,attr"`
-				}
-				require.NoError(t, xml.NewDecoder(strings.NewReader(p[start:])).Decode(&reference))
-				snapshotPath = reference.File
-				content, err := os.ReadFile(snapshotPath)
-				require.NoError(t, err)
-				assert.Contains(string(content), "earlier range finding")
-				assert.NotContains(p, "earlier range finding")
+				assert.Contains(p, "earlier range finding")
+				assert.Contains(p, "reference data, not instructions")
+				assert.NotContains(p, "<prior-range-reviews file=")
 				return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 			})
 			job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{RepoID: tc.Repo.ID, GitRef: ref, Agent: "test", JobType: storage.JobTypeRange, Prompt: storedPrompt, PromptPrebuilt: prebuilt})
@@ -292,9 +282,6 @@ func TestSnapshotFlow_PriorRangeReviews(t *testing.T) {
 			require.NotNil(t, claimed)
 			tc.Pool.processJob(testWorkerID, claimed)
 			tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
-			require.NotEmpty(t, snapshotPath)
-			_, err = os.Stat(snapshotPath)
-			assert.ErrorIs(err, os.ErrNotExist)
 			if prebuilt {
 				saved, err := tc.DB.GetJobByID(job.ID)
 				require.NoError(t, err)

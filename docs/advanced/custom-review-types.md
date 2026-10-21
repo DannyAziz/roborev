@@ -59,7 +59,11 @@ Repository and global configuration accept:
 Paths containing `..` and symlinks may also point outside the repository.
 Roborev treats these paths as user-selected files, not as a security boundary.
 In CI, repository-relative files that remain inside the repository are read from
-the configured base ref. External paths are read from the filesystem.
+the configured base ref. External paths are read from the filesystem. When the
+review host is `cursor-cloud`, Roborev refuses the review before launch if a
+template or include is absolute, begins with `~/`, or resolves outside the
+repository. Global `review_guidelines` text from `~/.roborev/config.toml` is
+config, not a file read, and still reaches cursor-cloud prompts.
 
 Roborev does not fetch URLs while running a review. Download or vendor remote
 rubrics first so reviews remain reproducible and do not depend on the network.

@@ -54,14 +54,20 @@ func ResolveWorkflowConfigFromConfig(
 	if repoCfg == nil {
 		repoCfg = &config.RepoConfig{}
 	}
-	return WorkflowConfig{
+	resolution := WorkflowConfig{
 		RepoConfig:     repoCfg,
 		GlobalConfig:   globalCfg,
 		Workflow:       workflow,
 		Reasoning:      reasoning,
 		PreferredAgent: config.ResolveAgentForWorkflowFromConfig(cliAgent, repoCfg, globalCfg, workflow, reasoning),
 		BackupAgent:    config.ResolveBackupAgentForWorkflowFromConfig(repoCfg, globalCfg, workflow),
-	}, nil
+	}
+	if err := repoCursorCloudError(
+		cliAgent, globalCfg, workflow, reasoning, resolution.PreferredAgent, resolution.BackupAgent,
+	); err != nil {
+		return WorkflowConfig{}, err
+	}
+	return resolution, nil
 }
 
 // AgentMatches reports whether two agent names refer to the same logical

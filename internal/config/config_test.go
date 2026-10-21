@@ -5568,3 +5568,90 @@ auth_token = "weak"
 	require.NoError(t, err)
 	assert.False(t, cfg.Web.Enabled)
 }
+
+func TestStripURLCredentialsForLaunch(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "malformed userinfo is redacted",
+			input:    "https://user:fake-credential@ex ample.com/r.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "scp userinfo is redacted",
+			input:    "user:tok@host:o/r",
+			expected: RedactedURL,
+		},
+		{
+			name:     "bad percent escape is redacted",
+			input:    "https://user:tok@host/r%zz.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "access_token query is removed",
+			input:    "https://github.com/o/r.git?access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "scp token user is redacted",
+			input:    "ghp_x@github.com:o/r.git",
+			expected: RedactedURL,
+		},
+		{
+			name:     "token query is removed",
+			input:    "https://github.com/o/r.git?token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "private_token query is removed",
+			input:    "https://github.com/o/r.git?private_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "access_token fragment is removed",
+			input:    "https://github.com/o/r.git#access_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "token query drops every query field",
+			input:    "https://github.com/o/r.git?x=1&token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "oauth_token query is removed",
+			input:    "https://github.com/o/r.git?oauth_token=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "ACCESS_TOKEN query is removed regardless of case",
+			input:    "https://github.com/o/r.git?ACCESS_TOKEN=sekret",
+			expected: "https://github.com/o/r.git",
+		},
+		{
+			name:     "schemeless userinfo is removed",
+			input:    "//user:tok@host/x",
+			expected: "//host/x",
+		},
+		{
+			name:     "ssh userinfo is removed",
+			input:    "ssh://user:tok@github.com/o/r.git",
+			expected: "ssh://github.com/o/r.git",
+		},
+		{
+			name:     "git scp access_token query is removed",
+			input:    "git@github.com:o/r.git?access_token=sekret",
+			expected: "git@github.com:o/r.git",
+		},
+		{
+			name:     "git scp access_token fragment is removed",
+			input:    "git@github.com:o/r.git#access_token=sekret",
+			expected: "git@github.com:o/r.git",
+		},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.expected, StripURLCredentials(tt.input), tt.input)
+	}
+}

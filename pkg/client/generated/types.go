@@ -976,6 +976,7 @@ type EnqueueCreatedResponse struct {
 	MinSeverity           *string                `json:"min_severity,omitempty"`
 	Model                 *string                `json:"model,omitempty"`
 	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OrphanWarning         *string                `json:"orphan_warning,omitempty"`
 	OutputPrefix          *string                `json:"output_prefix,omitempty"`
 	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
 	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
@@ -1099,6 +1100,7 @@ type EnqueueRequest struct {
 	DiffContent       *string  `json:"diff_content,omitempty"`
 	DirtyFiles        []string `json:"dirty_files,omitempty"`
 	GitRef            *string  `json:"git_ref,omitempty"`
+	Host              *string  `json:"host,omitempty"`
 	JobType           *string  `json:"job_type,omitempty"`
 	MinSeverity       *string  `json:"min_severity,omitempty"`
 	Model             *string  `json:"model,omitempty"`
@@ -2562,6 +2564,7 @@ type PanelEnqueueResponse struct {
 	MinSeverity           *string                `json:"min_severity,omitempty"`
 	Model                 *string                `json:"model,omitempty"`
 	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OrphanWarning         *string                `json:"orphan_warning,omitempty"`
 	OutputPrefix          *string                `json:"output_prefix,omitempty"`
 	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
 	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
@@ -3250,6 +3253,7 @@ type ReviewJob struct {
 	MinSeverity           *string                `json:"min_severity,omitempty"`
 	Model                 *string                `json:"model,omitempty"`
 	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OrphanWarning         *string                `json:"orphan_warning,omitempty"`
 	OutputPrefix          *string                `json:"output_prefix,omitempty"`
 	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
 	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
@@ -3410,11 +3414,13 @@ type ReviewProjectionJob struct {
 	Branch          *string       `json:"branch,omitempty"`
 	CommitSubject   *string       `json:"commit_subject,omitempty"`
 	EnqueuedAt      time.Time     `json:"enqueued_at" validate:"required"`
+	ErrorData       *string       `json:"error,omitempty"`
 	FinishedAt      *time.Time    `json:"finished_at,omitempty"`
 	GitRef          string        `json:"git_ref" validate:"required"`
 	ID              int64         `json:"id"`
 	Model           *string       `json:"model,omitempty"`
 	NonVoting       *bool         `json:"non_voting,omitempty"`
+	OrphanWarning   *string       `json:"orphan_warning,omitempty"`
 	PanelMemberName *string       `json:"panel_member_name,omitempty"`
 	PanelName       *string       `json:"panel_name,omitempty"`
 	PanelRole       *string       `json:"panel_role,omitempty"`

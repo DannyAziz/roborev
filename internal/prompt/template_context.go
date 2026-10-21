@@ -108,6 +108,12 @@ func (o ReviewOptionalContext) PriorRangeReviewsXMLPath() string {
 	return escapeXML(o.PriorRangeReviewsFile)
 }
 
+// PriorRangeReviewsBlock is the escaped prior-range document plus its
+// framing line. Empty when the builder did not insert one.
+func (o ReviewOptionalContext) PriorRangeReviewsBlock() string {
+	return PriorRangeReviewsBlock(o.PriorRangeReviewsFile)
+}
+
 func (o ReviewOptionalContext) ProjectGuidelinesBody() string {
 	if o.ProjectGuidelines == nil {
 		return ""

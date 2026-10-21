@@ -182,5 +182,8 @@ func repoManagementError(err error) error {
 	if errors.Is(err, sql.ErrNoRows) {
 		return huma.Error404NotFound("repository not found")
 	}
+	if errors.Is(err, storage.ErrRepoHasCloudLaunch) {
+		return huma.Error409Conflict("cannot delete repository with an uncleaned cursor-cloud launch")
+	}
 	return huma.Error500InternalServerError(err.Error())
 }

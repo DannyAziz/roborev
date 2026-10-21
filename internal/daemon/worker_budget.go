@@ -17,7 +17,9 @@ func (wp *WorkerPool) selectBudgetJobAgent(ctx context.Context, workerID string,
 		agent.CanonicalName(job.Agent) == "test" ||
 		job.FrozenExperimentPlan != nil || job.BudgetRoutingLocked || job.RetryCount != 0 || job.SessionID != "" ||
 		job.RequestedModel != "" || job.RequestedProvider != "" || job.PanelRole != "" ||
-		job.IsCIReview() || job.JobType == storage.JobTypeClassify || job.IsSynthesisJob() {
+		job.IsCIReview() || job.JobType == storage.JobTypeClassify || job.IsSynthesisJob() ||
+		// --host cursor-cloud never runs on a cheaper local agent.
+		(job.ExplicitHost && agent.CanonicalName(job.Agent) == agent.CursorCloudHost) {
 		return nil, true
 	}
 	configRoot := job.RepoPath

@@ -6,10 +6,13 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -272,15 +275,15 @@ func (b *Builder) BuildWithSnapshotTarget(
 		}
 	}()
 
-	var priorReviewsFile string
+	var priorDoc string
 	if reviews := b.priorRangeReviewsForRef(gitRef, contextCount); len(reviews) > 0 {
-		priorReviewsFile, result.Cleanup, err = b.writePriorRangeReviewsSnapshot(reviews, target)
+		priorDoc, err = encodePriorRangeReviews(reviews)
 		if err != nil {
 			return result, err
 		}
 	}
 	text, err := b.buildWithOpts(gitRef, contextCount, agentName, reviewType, buildOpts{
-		minSeverity: minSeverity, priorRangeReviewsFile: &priorReviewsFile,
+		minSeverity: minSeverity, priorRangeReviewsFile: &priorDoc,
 	})
 	if err != nil {
 		return result, err
@@ -289,16 +292,7 @@ func (b *Builder) BuildWithSnapshotTarget(
 	if err != nil {
 		return result, err
 	}
-	priorCleanup := result.Cleanup
 	result = prepared
-	if priorCleanup != nil {
-		result.Cleanup = func() {
-			if prepared.Cleanup != nil {
-				prepared.Cleanup()
-			}
-			priorCleanup()
-		}
-	}
 	return result, nil
 }
 
@@ -366,6 +360,13 @@ func writeExternalDiffSnapshot(repoPath, snapshotRoot, diff string) (string, fun
 	return writeExternalSnapshot(repoPath, snapshotRoot, "roborev-snapshot-content.diff", diff)
 }
 
+// snapshotBeforeCreateForTest runs after the snapshot root is validated and
+// before the snapshot directory is created.
+var snapshotBeforeCreateForTest func()
+
+// writeExternalSnapshot creates the snapshot directory and file through an
+// os.Root at repoPath. A component swapped for a symlink that leaves the
+// repository after validation makes the write fail instead of following it.
 func writeExternalSnapshot(repoPath, snapshotRoot, filename, content string) (string, func(), error) {
 	if err := validateSnapshotRoot(repoPath, snapshotRoot); err != nil {
 		return "", nil, err
@@ -373,50 +374,95 @@ func writeExternalSnapshot(repoPath, snapshotRoot, filename, content string) (st
 	if err := ensureSnapshotRootIgnored(repoPath, snapshotRoot); err != nil {
 		return "", nil, fmt.Errorf("ensure snapshot dir ignored: %w", err)
 	}
-	if err := os.MkdirAll(snapshotRoot, 0o755); err != nil {
+	absRepo, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve repo root: %w", err)
+	}
+	absRoot, err := filepath.Abs(snapshotRoot)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve snapshot root: %w", err)
+	}
+	relRoot, err := filepath.Rel(absRepo, absRoot)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve snapshot root: %w", err)
+	}
+	root, err := os.OpenRoot(absRepo)
+	if err != nil {
+		return "", nil, fmt.Errorf("open repo root: %w", err)
+	}
+	defer root.Close()
+	if err := root.MkdirAll(relRoot, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create snapshot root: %w", err)
 	}
 	if err := validateSnapshotRoot(repoPath, snapshotRoot); err != nil {
 		return "", nil, err
 	}
+	if snapshotBeforeCreateForTest != nil {
+		snapshotBeforeCreateForTest()
+	}
 	snapshotLifecycleMu.Lock()
-	dir, err := os.MkdirTemp(snapshotRoot, "roborev-snapshot-*")
+	relDir, err := mkdirSnapshotTemp(root, relRoot)
 	if err != nil {
 		snapshotLifecycleMu.Unlock()
 		return "", nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
-	if err := writeSnapshotMarker(dir); err != nil {
-		os.RemoveAll(dir)
+	dir := filepath.Join(snapshotRoot, filepath.Base(relDir))
+	remove := func() { removeSnapshotDir(absRepo, relDir) }
+	if err := root.WriteFile(filepath.Join(relDir, snapshotMarkerFile), []byte("roborev snapshot\n"), 0o600); err != nil {
+		remove()
 		snapshotLifecycleMu.Unlock()
 		return "", nil, fmt.Errorf("write snapshot marker: %w", err)
 	}
 	unregister := registerActiveSnapshot(dir)
 	snapshotLifecycleMu.Unlock()
 	snapshotFile := filepath.Join(dir, filename)
-	f, err := os.OpenFile(snapshotFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := root.OpenFile(filepath.Join(relDir, filename), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		unregister()
-		os.RemoveAll(dir)
+		remove()
 		return "", nil, fmt.Errorf("create snapshot: %w", err)
 	}
 	_, writeErr := f.WriteString(content)
 	closeErr := f.Close()
 	if writeErr != nil || closeErr != nil {
 		unregister()
-		os.RemoveAll(dir)
+		remove()
 		if writeErr != nil {
 			return "", nil, fmt.Errorf("write snapshot: %w", writeErr)
 		}
 		return "", nil, fmt.Errorf("close snapshot: %w", closeErr)
 	}
 	return snapshotFile, func() {
-		os.RemoveAll(dir)
+		remove()
 		unregister()
 	}, nil
 }
 
-func writeSnapshotMarker(dir string) error {
-	return os.WriteFile(filepath.Join(dir, snapshotMarkerFile), []byte("roborev snapshot\n"), 0o600)
+// mkdirSnapshotTemp creates a new roborev-snapshot-* directory under relRoot
+// inside root, as os.MkdirTemp does, and returns its root-relative path.
+func mkdirSnapshotTemp(root *os.Root, relRoot string) (string, error) {
+	for range 10000 {
+		relDir := filepath.Join(relRoot, "roborev-snapshot-"+strconv.FormatUint(uint64(rand.Uint32()), 10))
+		err := root.Mkdir(relDir, 0o700)
+		if err == nil {
+			return relDir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("create snapshot dir under %s: %w", relRoot, fs.ErrExist)
+}
+
+// removeSnapshotDir removes relDir through an os.Root at repoPath, so a
+// swapped symlink above it cannot redirect the removal.
+func removeSnapshotDir(repoPath, relDir string) {
+	root, err := os.OpenRoot(repoPath)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	_ = root.RemoveAll(relDir)
 }
 
 func registerActiveSnapshot(dir string) func() {
@@ -590,7 +636,7 @@ func (b *Builder) BuildDirtyWithFiles(diff string, changedFiles []string, contex
 	ctx.optional.DependencyMetadata = buildDependencyMetadataSection(changedFiles)
 
 	ctx.optional.ProjectGuidelines = buildProjectGuidelinesSectionView(
-		LoadGuidelinesLocal(b.resolvedConfigRepoPath(), b.globalCfg),
+		loadGuidelinesLocal(b.resolvedConfigRepoPath(), b.globalCfg, repoFilesOnly(agentName)),
 	)
 
 	// Uncommitted changes have no commit messages, so "current" mode has no
@@ -710,9 +756,9 @@ func (b *Builder) newPromptBuildContext(agentName, reviewType, minSeverity, defa
 	}, nil
 }
 
-func defaultOptionalSections(ctx context.Context, repoPath string, globalCfg *config.Config, additionalContext string) optionalSectionsView {
+func defaultOptionalSections(ctx context.Context, repoPath string, globalCfg *config.Config, additionalContext string, repoOnly bool) optionalSectionsView {
 	return optionalSectionsView{
-		ProjectGuidelines: buildProjectGuidelinesSectionView(LoadGuidelinesWithConfig(ctx, repoPath, globalCfg)),
+		ProjectGuidelines: buildProjectGuidelinesSectionView(loadGuidelinesWithConfig(ctx, repoPath, globalCfg, repoOnly)),
 		AdditionalContext: buildAdditionalContextSection(additionalContext),
 	}
 }
@@ -876,7 +922,7 @@ func selectRichestRangePromptView(limit int, view TemplateContext, variants []di
 
 // buildSinglePrompt constructs a prompt for a single commit
 func (b *Builder) buildSinglePrompt(sha string, contextCount int, agentName, reviewType string, opts buildOpts) (string, error) {
-	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "review", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext))
+	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "review", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext, repoFilesOnly(agentName)))
 	if err != nil {
 		return "", err
 	}
@@ -936,7 +982,7 @@ func (b *Builder) buildSinglePrompt(sha string, contextCount int, agentName, rev
 
 // buildRangePrompt constructs a prompt for a commit range
 func (b *Builder) buildRangePrompt(rangeRef string, contextCount int, agentName, reviewType string, opts buildOpts) (string, error) {
-	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "range", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext))
+	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "range", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext, repoFilesOnly(agentName)))
 	if err != nil {
 		return "", err
 	}
@@ -1152,10 +1198,18 @@ func reviewMDFromRef(repoPath, ref string) string {
 }
 
 // reviewMDFromDisk reads REVIEW.md from the working tree, for the same
-// local/dirty paths that read .roborev.toml off disk.
-func reviewMDFromDisk(repoPath string) string {
-	data, err := os.ReadFile(filepath.Join(repoPath, reviewMDFile))
+// local/dirty paths that read .roborev.toml off disk. With repoOnly it does
+// not follow a symlink out of the repository.
+func reviewMDFromDisk(repoPath string, repoOnly bool) string {
+	read := func() ([]byte, error) { return os.ReadFile(filepath.Join(repoPath, reviewMDFile)) }
+	if repoOnly {
+		read = func() ([]byte, error) { return readRepoFile(repoPath, reviewMDFile) }
+	}
+	data, err := read()
 	if err != nil {
+		if repoOnly && !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("prompt: skipped %s outside the repository for cursor-cloud: %v", reviewMDFile, err)
+		}
 		return ""
 	}
 	return string(data)
@@ -1165,7 +1219,7 @@ func reviewMDFromDisk(repoPath string) string {
 // branch, falling back to filesystem config when the default branch
 // has no .roborev.toml.
 func LoadGuidelines(ctx context.Context, repoPath string) string {
-	return loadRepoGuidelines(ctx, repoPath).text
+	return loadRepoGuidelines(ctx, repoPath, false).text
 }
 
 // LoadGuidelinesWithConfig merges global review guidelines with repo
@@ -1173,7 +1227,11 @@ func LoadGuidelines(ctx context.Context, repoPath string) string {
 // review_guidelines_supersede_global in repo config disables the global
 // guidelines for that repo.
 func LoadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *config.Config) string {
-	repo := loadRepoGuidelines(ctx, repoPath)
+	return loadGuidelinesWithConfig(ctx, repoPath, globalCfg, false)
+}
+
+func loadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *config.Config, repoOnly bool) string {
+	repo := loadRepoGuidelines(ctx, repoPath, repoOnly)
 	return mergeGuidelines(globalGuidelines(globalCfg), repo.text, repo.supersedeGlobal)
 }
 
@@ -1181,6 +1239,10 @@ func LoadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *c
 // guidelines from the working tree. Use it for dirty/local agent prompts
 // where the user's current local config is expected to apply.
 func LoadGuidelinesLocal(repoPath string, globalCfg *config.Config) string {
+	return loadGuidelinesLocal(repoPath, globalCfg, false)
+}
+
+func loadGuidelinesLocal(repoPath string, globalCfg *config.Config, repoOnly bool) string {
 	var repo loadedGuidelines
 	if fsCfg, err := config.LoadRepoConfig(repoPath); err == nil && fsCfg != nil {
 		repo = loadedGuidelines{
@@ -1189,7 +1251,7 @@ func LoadGuidelinesLocal(repoPath string, globalCfg *config.Config) string {
 			supersedeGlobal: fsCfg.ReviewGuidelinesSupersedeGlobal,
 		}
 	}
-	repo = withReviewMD(repo, func() string { return reviewMDFromDisk(repoPath) })
+	repo = withReviewMD(repo, func() string { return reviewMDFromDisk(repoPath, repoOnly) })
 	return mergeGuidelines(globalGuidelines(globalCfg), repo.text, repo.supersedeGlobal)
 }
 
@@ -1216,12 +1278,12 @@ func mergeGuidelines(global, repo string, repoSupersedesGlobal bool) string {
 	}
 }
 
-func loadRepoGuidelines(ctx context.Context, repoPath string) loadedGuidelines {
+func loadRepoGuidelines(ctx context.Context, repoPath string, repoOnly bool) loadedGuidelines {
 	// REVIEW.md comes from the same place as .roborev.toml: the default
 	// branch when one resolves, so an untrusted branch cannot supply review
 	// instructions; the working tree only in a repo with no default branch,
 	// where the filesystem config read below is already the only source.
-	readReviewMD := func() string { return reviewMDFromDisk(repoPath) }
+	readReviewMD := func() string { return reviewMDFromDisk(repoPath, repoOnly) }
 
 	// Load review guidelines from the default branch (origin/main,
 	// origin/master, etc.). Branch-specific guidelines are intentionally

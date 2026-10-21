@@ -3199,6 +3199,126 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	assert.Equal(t, "default-branch-model", members[0].Model)
 }
 
+func TestCIMatrixCursorCloudLaunchesOneAgent(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
+	t.Setenv("ROBOREV_DEFAULT_HOST", "")
+	repoCfg := &config.RepoConfig{
+		CI: config.RepoCIConfig{
+			Host:        "cursor-cloud",
+			Agents:      []string{"codex", "gemini"},
+			ReviewTypes: []string{"security", "default"},
+		},
+	}
+	members, _, err := h.Poller.resolveCIMatrixMembers(
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents":       []any{"codex", "gemini"},
+				"review_types": []any{"security", "default"},
+			},
+		}, h.Cfg, "acme/api",
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "cursor-cloud", members[0].Agent)
+	assert.Empty(t, members[0].ReviewType)
+}
+
+func TestCICursorCloudMemberLaunchesAtHead(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
+	t.Setenv("ROBOREV_DEFAULT_HOST", "")
+	require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, ".roborev.toml"), []byte("[ci]\nhost = \"cursor-cloud\"\n"), 0o644))
+	h.Cfg.AllowCursorCloud = true
+	h.Cfg.CI.Agents = []string{"codex", "gemini"}
+	h.Cfg.CI.ReviewTypes = []string{"security", "default"}
+	h.stubProcessPRGit()
+
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	rangeRef := "base-" + head + ".." + head
+	var prompted []string
+	h.Poller.buildReviewPromptFn = func(_ context.Context, _, gitRef string, _ int64, _ int, _, _, _, _ string, _ *config.RepoConfig, _ string, _ *config.Config) (string, error) {
+		prompted = append(prompted, gitRef)
+		return "range-prompt-for-" + gitRef, nil
+	}
+
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+		Number:      7,
+		HeadRefOid:  head,
+		HeadRefName: "feature",
+		BaseRefName: "main",
+		HeadRepo:    "acme/api",
+		BaseRepo:    "acme/api",
+	}, h.Cfg)
+	require.NoError(t, err)
+
+	members := h.panelMembers(t, "acme/api", 7, head)
+	require.Len(t, members, 1)
+	assert := assert.New(t)
+	assert.Equal(agent.CursorCloudHost, members[0].Agent)
+	assert.Empty(members[0].ReviewType)
+	assert.Equal(head, members[0].GitRef)
+	assert.NotContains(members[0].GitRef, "..")
+	assert.Equal(storage.JobTypeRange, members[0].JobType)
+	assert.True(members[0].PromptPrebuilt)
+	assert.Contains(members[0].Prompt, "range-prompt-for-"+rangeRef)
+	require.Len(t, prompted, 1)
+	assert.Equal(rangeRef, prompted[0])
+
+	panel, err := h.DB.GetCIPanelByPRSHA("acme/api", 7, head)
+	require.NoError(t, err)
+	require.NotNil(t, panel.SynthesisJobID)
+	synth, err := h.DB.GetJobByID(*panel.SynthesisJobID)
+	require.NoError(t, err)
+	assert.Equal(rangeRef, synth.GitRef)
+}
+
+func TestCICursorCloudMissingRangePromptDoesNotQueue(t *testing.T) {
+	cases := []struct {
+		name    string
+		prompt  string
+		err     error
+		wantErr string
+	}{
+		{name: "build error", err: fmt.Errorf("diff unavailable"), wantErr: "range prompt"},
+		{name: "empty prompt", prompt: "  ", wantErr: "prompt is empty"},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+			t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
+			t.Setenv("ROBOREV_DEFAULT_HOST", "")
+			require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, ".roborev.toml"), []byte("[ci]\nhost = \"cursor-cloud\"\n"), 0o644))
+			h.Cfg.AllowCursorCloud = true
+			h.Cfg.CI.Agents = []string{"codex"}
+			h.Cfg.CI.ReviewTypes = []string{"default"}
+			h.stubProcessPRGit()
+			h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
+				return tc.prompt, tc.err
+			}
+			head := fmt.Sprintf("%040d", i+1)
+			prNumber := 80 + i
+			err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+				Number: prNumber, HeadRefOid: head, BaseRefName: "main",
+				HeadRepo: "acme/api", BaseRepo: "acme/api",
+			}, h.Cfg)
+			require.ErrorContains(t, err, "cursor-cloud")
+			require.ErrorContains(t, err, tc.wantErr)
+			assert.False(t, h.hasPanel(t, "acme/api", prNumber, head))
+		})
+	}
+}
+
+func TestCursorCloudCIRefUsesHeadOfRange(t *testing.T) {
+	head, err := cursorCloudCIRef("base..head")
+	require.NoError(t, err)
+	assert.Equal(t, "head", head)
+
+	_, err = cursorCloudCIRef("..")
+	require.ErrorContains(t, err, "cursor-cloud")
+	require.ErrorContains(t, err, "no head commit")
+}
+
 func TestResolveCIMatrixMembersUsesCustomTypeReasoning(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.DefaultAgent = "global-agent"

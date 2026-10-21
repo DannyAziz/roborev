@@ -22,6 +22,12 @@ import (
 // pgSchemaVersion is the newest schema this binary will write.
 const pgSchemaVersion = 23
 
+// pgReadableSchemaVersion is the newest schema this binary opens. Version 24
+// is version 23 plus review_jobs.backup_auto (NOT NULL DEFAULT FALSE). This
+// binary never reads or writes that column, and its default fills the rows
+// written here, so a version 24 database opens as is and stays at 24.
+const pgReadableSchemaVersion = 24
+
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
@@ -196,8 +202,8 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("create panel index: %w", err)
 		}
-	} else if currentVersion > pgSchemaVersion {
-		return fmt.Errorf("database schema version %d is newer than supported version %d", currentVersion, pgSchemaVersion)
+	} else if currentVersion > pgReadableSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", currentVersion, pgReadableSchemaVersion)
 	} else if currentVersion < pgSchemaVersion {
 		// Run migrations
 		if currentVersion < 2 {

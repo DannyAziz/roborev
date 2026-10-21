@@ -38,7 +38,7 @@ func resolveAutoBackup(repoCfg *config.RepoConfig, cfg *config.Config, exclude s
 	exclude = resolveAlias(withoutAuto(exclude))
 	usable := func(name string) bool { return name != exclude && (eligible == nil || eligible(name)) }
 	for _, name := range append(slices.Clone(fallbackAgentOrder), Available()...) {
-		if name != "test" && name != hostAgentName && usable(name) && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
+		if name != "test" && name != hostAgentName && name != cursorCloudAgentName && usable(name) && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
 			return name
 		}
 	}

@@ -16,6 +16,9 @@ const (
 	MethodCreate = "CreateAgent"
 	MethodGet    = "GetAgent"
 	MethodFinal  = "FinalMessage"
+	MethodStop   = "StopAgent"
+	MethodDelete = "DeleteAgent"
+	MethodPrompt = "UserPrompt"
 	MethodList   = "ListAgents"
 )
 
@@ -40,10 +43,13 @@ type Fake struct {
 	Final        string
 	Error        error
 	MethodErrors map[string]error
+	// DeleteFailures makes the next N DeleteAgent calls fail, then succeed.
+	DeleteFailures int
 
 	agents  map[string]cursorcloud.Agent
 	order   []string
 	finals  map[string]string
+	prompts map[string]string
 	scripts map[string][]cursorcloud.AgentStatus
 	seq     int
 	calls   []Call
@@ -128,8 +134,14 @@ func (f *Fake) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentReque
 		status = cursorcloud.StatusCreating
 	}
 	// Title is not echoed. v0 does not accept it and returns a generated name.
-	agent := cursorcloud.Agent{ID: fmt.Sprintf("bc_fake_%d", f.seq), Status: status}
+	agent := cursorcloud.Agent{
+		ID:               fmt.Sprintf("bc_fake_%d", f.seq),
+		Status:           status,
+		SourceRepository: req.Repo,
+		SourceRef:        req.Ref,
+	}
 	f.agents[agent.ID] = agent
+	f.prompts[agent.ID] = req.Prompt
 	f.order = append(f.order, agent.ID)
 	return agent, nil
 }
@@ -184,6 +196,81 @@ func (f *Fake) FinalMessage(ctx context.Context, id string) (string, error) {
 	return "", cursorcloud.ErrNoAssistantMessage
 }
 
+func (f *Fake) UserPrompt(ctx context.Context, id string) (string, error) {
+	if err := rejectCtx(ctx); err != nil {
+		return "", err
+	}
+	if err := invalidAgentID(id); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	if err := f.fail(ctx, MethodPrompt, id, cursorcloud.CreateAgentRequest{}); err != nil {
+		return "", err
+	}
+	if _, ok := f.agents[id]; !ok {
+		return "", notFound("conversation")
+	}
+	return f.prompts[id], nil
+}
+
+func (f *Fake) StopAgent(ctx context.Context, id string) error {
+	if err := rejectCtx(ctx); err != nil {
+		return err
+	}
+	if err := invalidAgentID(id); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	if err := f.fail(ctx, MethodStop, id, cursorcloud.CreateAgentRequest{}); err != nil {
+		return err
+	}
+	if _, ok := f.agents[id]; !ok {
+		return notFound("stop agent")
+	}
+	return nil
+}
+
+func (f *Fake) DeleteAgent(ctx context.Context, id string) error {
+	if err := rejectCtx(ctx); err != nil {
+		return err
+	}
+	if err := invalidAgentID(id); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	if f.DeleteFailures > 0 {
+		f.DeleteFailures--
+		f.calls = append(f.calls, Call{Method: MethodDelete, ID: id})
+		return errors.New("delete failed")
+	}
+	if err := f.fail(ctx, MethodDelete, id, cursorcloud.CreateAgentRequest{}); err != nil {
+		return err
+	}
+	if _, ok := f.agents[id]; !ok {
+		// A second DELETE of an agent this fake already removed is the v0
+		// 404. deleteCursorCloudAgent treats that as already gone.
+		return notFound("delete agent")
+	}
+	delete(f.agents, id)
+	delete(f.finals, id)
+	delete(f.prompts, id)
+	delete(f.scripts, id)
+	next := make([]string, 0, len(f.order))
+	for _, existing := range f.order {
+		if existing != id {
+			next = append(next, existing)
+		}
+	}
+	f.order = next
+	return nil
+}
+
 func (f *Fake) ListAgents(ctx context.Context) ([]cursorcloud.Agent, error) {
 	if err := rejectCtx(ctx); err != nil {
 		return nil, err
@@ -209,6 +296,9 @@ func (f *Fake) init() {
 	}
 	if f.finals == nil {
 		f.finals = map[string]string{}
+	}
+	if f.prompts == nil {
+		f.prompts = map[string]string{}
 	}
 	if f.scripts == nil {
 		f.scripts = map[string][]cursorcloud.AgentStatus{}

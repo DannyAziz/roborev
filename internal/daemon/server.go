@@ -34,6 +34,7 @@ import (
 	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/goalreview"
 	"go.kenn.io/roborev/internal/mcpserver"
@@ -51,6 +52,7 @@ type Server struct {
 	daemonTLS               config.DaemonTLSConfig // Immutable startup TLS settings.
 	tcpTLS                  bool                   // The TCP API listener requires mutual TLS.
 	db                      *storage.DB
+	cloudLaunchClient       cursorcloud.Client // Tests inject the startup sweep. Nil uses CURSOR_API_KEY.
 	configWatcher           *ConfigWatcher
 	broadcaster             Broadcaster
 	workerPool              *WorkerPool
@@ -63,6 +65,7 @@ type Server struct {
 	searchWG                sync.WaitGroup
 	searchStopped           bool
 	httpServer              *http.Server
+	apiHandler              http.Handler // Authenticated API for the browser and remote listeners, without the loopback Host check.
 	remoteServer            *http.Server
 	remoteCancel            context.CancelFunc
 	browserMu               sync.Mutex
@@ -228,9 +231,10 @@ func newServerWithLogs(
 		mux.Handle(mcpserver.HTTPPath, mcpServer.HTTPHandler())
 	}
 
+	s.apiHandler = withAPIAuthentication(mux, cfg.AuthKey)
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: withAPIAuthentication(mux, cfg.AuthKey),
+		Handler: withLoopbackHost(s.apiHandler, cfg.AuthKey, cfg.AllowedHosts),
 	}
 
 	return s
@@ -316,7 +320,8 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("clear interrupted shutdown drain: %w", err)
 	}
 
-	// Reset stale jobs from previous runs
+	// Reset stale jobs from previous runs. A cursor-cloud launch that may
+	// already exist is failed, not requeued.
 	if err := s.db.ResetStaleJobs(); err != nil {
 		log.Printf("Warning: failed to reset stale jobs: %v", err)
 	}
@@ -371,6 +376,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		serveErrCh <- s.httpServer.Serve(serveListener)
 	}()
+	s.startCloudLaunchRecovery(ctx)
 
 	if err := cleanupStaleCIWorktrees(ctx); err != nil {
 		log.Printf("Warning: failed to clean up stale CI worktrees: %v", err)
@@ -1038,6 +1044,9 @@ func resolveRerunOpts(
 				"resolve selected agent %q: %w", selectedAgent, err,
 			)
 		}
+		if job.IsFixJob() && agent.IsCursorCloudAgent(selected.Name()) {
+			return storage.ReenqueueOpts{}, agent.ErrCursorCloudFix
+		}
 		if job.JobType == storage.JobTypeClassify && !agent.IsSchemaAgent(selected) {
 			return storage.ReenqueueOpts{}, fmt.Errorf(
 				"classifier reruns require a production SchemaAgent, got %q", selectedAgent,
@@ -1520,6 +1529,11 @@ func (s *Server) humaListJobs(
 		resp := &ListJobsOutput{}
 		job.WebURL = s.reviewBrowserURL(job.ID)
 		resp.Body.Jobs = []storage.ReviewJob{*job}
+		if err := s.db.AttachLaunchOrphanWarnings(resp.Body.Jobs); err != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("launch orphan warning: %v", err),
+			)
+		}
 		renderFixPlanPrompts(resp.Body.Jobs)
 		if !remoteScoped(ctx) {
 			attachPanelSummaries(s.db, resp.Body.Jobs)
@@ -1809,6 +1823,11 @@ func (s *Server) humaListJobs(
 	for i := range jobs {
 		jobs[i].WebURL = s.reviewBrowserURL(jobs[i].ID)
 	}
+	if err := s.db.AttachLaunchOrphanWarnings(jobs); err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("launch orphan warning: %v", err),
+		)
+	}
 	resp.Body.Jobs = jobs
 	resp.Body.HasMore = hasMore
 	resp.Body.NextCursor = nextCursor
@@ -1836,9 +1855,11 @@ func (s *Server) humaGetReview(
 	if errors.Is(err, storage.ErrLegacyReviewMigration) {
 		return nil, huma.Error409Conflict(storage.LegacyReviewMigrationNotice)
 	}
-
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, huma.Error404NotFound("review not found")
+	}
+	if err != nil {
+		return nil, huma.Error500InternalServerError(fmt.Sprintf("get review: %v", err))
 	}
 
 	if !remoteAllowsJob(ctx, review.Job) {
@@ -3039,6 +3060,11 @@ func (s *Server) humaEnqueue(
 	}
 
 	merged := config.MergeReviewConfigFromConfig(repoCfg, cfg)
+	if host, early := resolveEnqueueHost(workflow, req.ReviewType, enqueueHostJobType(req.JobType, req.CustomPrompt, gitRef), req.Host, repoCfg, cfg); early != nil {
+		return early, nil
+	} else if host != agent.ReviewHostLocal {
+		req.Panel = "none"
+	}
 	panelName := selectPanelForTarget(descriptor, req, merged)
 	if panelName != "" {
 		return s.enqueuePanelRun(ctx, panelRunInputs{
@@ -3107,10 +3133,11 @@ type singleAgentInputs struct {
 }
 
 type resolvedSingleAgent struct {
-	Agent       string
-	Model       string
-	BackupAgent string
-	BackupModel string
+	Agent        string
+	Model        string
+	BackupAgent  string
+	BackupModel  string
+	ExplicitHost bool
 }
 
 // resolveSingleAgent resolves the single-review agent for the no-panel path:
@@ -3121,6 +3148,23 @@ type resolvedSingleAgent struct {
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
 ) (resolvedSingleAgent, *RawJSONOutput) {
+	hostJobType := enqueueHostJobType(in.req.JobType, in.req.CustomPrompt, in.gitRef)
+	// A fix must leave a local patch. A cursor-cloud host or agent named on
+	// the request is refused; one from config is dropped below.
+	isFix := hostJobType == storage.JobTypeFix
+	if isFix && agent.IsCursorCloudAgent(in.req.Host) {
+		out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: agent.ErrCursorCloudFix.Error()})
+		return resolvedSingleAgent{}, out
+	}
+	if host, early := resolveEnqueueHost(in.workflow, in.req.ReviewType, hostJobType, in.req.Host, in.repoCfg, in.cfg); early != nil {
+		return resolvedSingleAgent{}, early
+	} else if host != agent.ReviewHostLocal {
+		return resolvedSingleAgent{
+			Agent:        host,
+			Model:        in.requestedModel,
+			ExplicitHost: strings.TrimSpace(in.req.Host) != "" && strings.EqualFold(host, agent.CursorCloudHost),
+		}, nil
+	}
 	resolution, err := agent.ResolveWorkflowConfigFromConfig(
 		in.req.Agent, in.repoCfg, in.cfg, in.workflow, in.reasoning,
 	)
@@ -3130,6 +3174,12 @@ func (s *Server) resolveSingleAgent(
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
 		return resolvedSingleAgent{}, out
+	}
+	if isFix {
+		if err := resolution.KeepFixLocal(in.req.Agent); err != nil {
+			out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return resolvedSingleAgent{}, out
+		}
 	}
 	agentName := resolution.PreferredAgent
 	resolved, err := agent.GetPreferredOrBackupEligible(
@@ -3200,6 +3250,7 @@ func (s *Server) enqueueSingleAgent(
 	// A named backup stays empty so failover still reads the current workflow
 	// config. An "auto" backup, and any backup frozen by an experiment, is
 	// pinned now and kept even when the pin is empty.
+	o.ExplicitHost = execution.ExplicitHost
 	o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
 	if o.BackupAuto || in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
@@ -3643,6 +3694,9 @@ func (s *Server) humaFixJob(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
+	}
+	if err := resolution.KeepFixLocal(""); err != nil {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 	}
 	agentName := resolution.PreferredAgent
 	if resolved, err := agent.GetPreferredOrBackupWithConfig(

@@ -2,13 +2,16 @@ package prompt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
 )
@@ -64,8 +67,9 @@ func (b *Builder) resolveSystemPrompt(
 			"custom review type %q is not configured", reviewType,
 		)
 	}
+	repoOnly := repoFilesOnly(agentName)
 	read := func(filePath string) (string, error) {
-		data, readErr := b.readCustomReviewFile(filePath)
+		data, readErr := b.readCustomReviewFile(filePath, repoOnly)
 		if readErr != nil {
 			return "", readErr
 		}
@@ -122,10 +126,33 @@ func (b *Builder) resolveRepoConfig() (*config.RepoConfig, error) {
 	return config.LoadRepoConfig(b.resolvedConfigRepoPath())
 }
 
+// repoFilesOnly reports whether a prompt for agentName leaves this machine.
+// Such a prompt reads no file from outside the repository: custom review
+// files and REVIEW.md must resolve inside it. Local agents keep reading the
+// paths the user configured. "cursor-cloud" is agent.CursorCloudHost, which
+// this package cannot import.
+func repoFilesOnly(agentName string) bool {
+	return agentname.Canonical(agentName) == "cursor-cloud"
+}
+
+// readRepoFile reads name through an os.Root at repoPath, so neither a ".."
+// component nor a symlink resolves outside the repository.
+func readRepoFile(repoPath, name string) ([]byte, error) {
+	root, err := os.OpenRoot(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(name)
+}
+
 func (b *Builder) readCustomReviewFile(
-	filePath string,
+	filePath string, repoOnly bool,
 ) ([]byte, error) {
 	filePath = strings.TrimSpace(filePath)
+	if repoOnly {
+		return b.readRepoOnlyCustomReviewFile(filePath)
+	}
 	resolvedPath := filePath
 	if filePath == "~" || strings.HasPrefix(filePath, "~/") ||
 		strings.HasPrefix(filePath, `~\`) {
@@ -137,7 +164,7 @@ func (b *Builder) readCustomReviewFile(
 	} else if !filepath.IsAbs(filePath) && b.repoCfgRef != "" {
 		clean := path.Clean(filepath.ToSlash(filePath))
 		if clean != "." && clean != ".." && !strings.HasPrefix(clean, "../") {
-			return b.readCustomReviewRefFile(clean)
+			return b.readCustomReviewRefFile(clean, false)
 		}
 		resolvedPath = filepath.Join(b.resolvedConfigRepoPath(), filePath)
 	} else if !filepath.IsAbs(filePath) {
@@ -146,8 +173,35 @@ func (b *Builder) readCustomReviewFile(
 	return os.ReadFile(resolvedPath)
 }
 
+// readRepoOnlyCustomReviewFile refuses a custom review file that names or
+// resolves to a path outside the repository instead of reading it.
+func (b *Builder) readRepoOnlyCustomReviewFile(filePath string) ([]byte, error) {
+	clean := path.Clean(filepath.ToSlash(filePath))
+	if filePath == "~" || strings.HasPrefix(filePath, "~/") ||
+		strings.HasPrefix(filePath, `~\`) || filepath.IsAbs(filePath) ||
+		filepath.VolumeName(filePath) != "" || path.IsAbs(clean) ||
+		clean == ".." || strings.HasPrefix(clean, "../") {
+		return nil, outsideRepoFileError(filePath)
+	}
+	if b.repoCfgRef != "" {
+		return b.readCustomReviewRefFile(clean, true)
+	}
+	data, err := readRepoFile(b.resolvedConfigRepoPath(), filepath.FromSlash(clean))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %w", outsideRepoFileError(filePath), err)
+	}
+	return data, err
+}
+
+func outsideRepoFileError(filePath string) error {
+	return fmt.Errorf(
+		"%q is outside the repository; cursor-cloud reads custom review files only from inside it",
+		filePath,
+	)
+}
+
 func (b *Builder) readCustomReviewRefFile(
-	filePath string,
+	filePath string, repoOnly bool,
 ) ([]byte, error) {
 	seen := make(map[string]struct{})
 	for {
@@ -188,6 +242,9 @@ func (b *Builder) readCustomReviewRefFile(
 
 		linkTarget := string(entry.Data)
 		if path.IsAbs(filepath.ToSlash(linkTarget)) || filepath.IsAbs(linkTarget) {
+			if repoOnly {
+				return nil, outsideRepoFileError(linkPath)
+			}
 			return os.ReadFile(filepath.Join(linkTarget, filepath.FromSlash(remaining)))
 		}
 		filesystemTarget := filepath.Clean(filepath.Join(
@@ -199,6 +256,9 @@ func (b *Builder) readCustomReviewRefFile(
 		relativeTarget, relErr := filepath.Rel(b.resolvedConfigRepoPath(), filesystemTarget)
 		if relErr != nil || relativeTarget == ".." ||
 			strings.HasPrefix(relativeTarget, ".."+string(filepath.Separator)) {
+			if repoOnly {
+				return nil, outsideRepoFileError(linkPath)
+			}
 			return os.ReadFile(filesystemTarget)
 		}
 		filePath = filepath.ToSlash(relativeTarget)

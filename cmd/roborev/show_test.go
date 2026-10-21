@@ -138,6 +138,23 @@ func TestShowOutputFormat(t *testing.T) {
 	}
 }
 
+func TestShowPrintsLaunchOrphanWarning(t *testing.T) {
+	note := storage.CloudLaunchPendingNote
+	chdir(t, t.TempDir())
+	mockReviewDaemon(t, storage.Review{
+		ID: 1, JobID: 42, Output: "LGTM", Agent: "cursor-cloud",
+		Job: &storage.ReviewJob{
+			ID: 42, Agent: "cursor-cloud", Error: "agent crashed",
+			OrphanWarning: note,
+		},
+	})
+
+	output := runShowCmd(t, "--job", "42")
+
+	assert.Contains(t, output, "Warning: "+note)
+	assert.Contains(t, output, "LGTM")
+}
+
 func TestShowTokenUsageSummary(t *testing.T) {
 	for _, tc := range []struct {
 		name, usage, want string

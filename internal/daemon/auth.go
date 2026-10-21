@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json/v2"
+	"net"
 	"net/http"
 	"strings"
 
@@ -86,4 +87,42 @@ func withAPIAuthentication(next http.Handler, key string) http.Handler {
 			_ = json.MarshalWrite(w, ErrorResponse{Error: "daemon authentication required"})
 		}
 	})
+}
+
+// withLoopbackHost refuses a plain HTTP request on a loopback connection
+// whose Host is not a loopback name. A web page that rebinds its own DNS
+// name to 127.0.0.1 reaches this listener as same-origin and sends that name
+// as Host; a local client sends localhost or a loopback address. TLS, Unix
+// socket, and non-loopback connections are unchanged. The browser and
+// remote listeners call the API without this check and keep their own
+// Host policy. With auth_key set a rebound page cannot authenticate, so the
+// check is skipped. allowedHosts are extra Host names a local reverse proxy
+// (Tailscale Serve, nginx, Caddy) forwards with.
+func withLoopbackHost(next http.Handler, authKey string, allowedHosts []string) http.Handler {
+	if authKey != "" {
+		return next
+	}
+	allowed := make(map[string]bool, len(allowedHosts))
+	for _, host := range allowedHosts {
+		allowed[strings.ToLower(strings.TrimSpace(host))] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		local, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+		if r.TLS == nil && local != nil && local.IP.IsLoopback() && !isLoopbackAuthority(r.Host) && !allowed[authorityHostname(r.Host)] {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.MarshalWrite(w, ErrorResponse{Error: "daemon requests must use a loopback host name"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authorityHostname is the lower-case host name of a Host header, without
+// its port.
+func authorityHostname(authority string) string {
+	if host, _, err := net.SplitHostPort(authority); err == nil {
+		authority = host
+	}
+	return strings.ToLower(strings.Trim(authority, "[]"))
 }

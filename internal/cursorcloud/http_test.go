@@ -129,6 +129,14 @@ func TestHTTPCreateValidationDoesNotDial(t *testing.T) {
 	require.ErrorContains(t, err, "agent id is empty")
 	_, err = client.GetAgent(context.Background(), "../secret")
 	require.ErrorContains(t, err, "agent id is invalid")
+	err = client.StopAgent(context.Background(), " ")
+	require.ErrorContains(t, err, "agent id is empty")
+	err = client.DeleteAgent(context.Background(), " ")
+	require.ErrorContains(t, err, "agent id is empty")
+	err = client.DeleteAgent(context.Background(), "../secret")
+	require.ErrorContains(t, err, "agent id is invalid")
+	err = client.StopAgent(nil, "bc_1") //nolint:staticcheck // SA1012: nil context is the case under test.
+	require.ErrorContains(t, err, "nil context")
 	_, err = client.GetAgent(nil, "bc_1") //nolint:staticcheck // SA1012: nil context is the case under test.
 	require.ErrorContains(t, err, "nil context")
 	assertNoKey(t, err)
@@ -164,6 +172,24 @@ func TestHTTPFinalMessage(t *testing.T) {
 	require.ErrorIs(t, err, cursorcloud.ErrNoAssistantMessage)
 	assert.Empty(t, text)
 	assertNoKey(t, err)
+}
+
+func TestHTTPStopAndDelete(t *testing.T) {
+	client, rec := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/agents/bc_1/stop":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"bc_1"}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v0/agents/bc_1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	require.NoError(t, client.StopAgent(context.Background(), "bc_1"))
+	require.NoError(t, client.DeleteAgent(context.Background(), "bc_1"))
+	assert.Equal(t, []string{http.MethodPost, http.MethodDelete}, methods(rec))
+	assertAuth(t, rec)
 }
 
 func TestHTTPListPaginates(t *testing.T) {
@@ -270,6 +296,46 @@ func TestHTTPErrorMappingAndRedaction(t *testing.T) {
 			assert.Contains(t, apiErr.Message, tc.wantSubstr)
 			assert.NotContains(t, apiErr.Message, testKey)
 			assertAuth(t, rec)
+		})
+	}
+}
+
+func TestHTTPRetryAfterIsKeptOnAPIError(t *testing.T) {
+	when := time.Now().Add(30 * time.Second).UTC()
+	cases := []struct {
+		name    string
+		header  string
+		wantSet bool
+		exact   time.Duration
+		min     time.Duration
+		max     time.Duration
+	}{
+		{name: "delay seconds", header: "4", wantSet: true, exact: 4 * time.Second},
+		{name: "zero", header: "0", wantSet: true, exact: 0},
+		{name: "http date", header: when.Format(http.TimeFormat), wantSet: true, min: 29 * time.Second, max: 30 * time.Second},
+		{name: "absent", header: "", wantSet: false},
+		{name: "garbage", header: "later", wantSet: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tc.header != "" {
+					w.Header().Set("Retry-After", tc.header)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, `{"message":"slow down"}`)
+			})
+			_, err := client.GetAgent(context.Background(), "bc_1")
+			var apiErr *cursorcloud.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, tc.wantSet, apiErr.HasRetryAfter)
+			if tc.exact != 0 || tc.header == "0" {
+				assert.Equal(t, tc.exact, apiErr.RetryAfter)
+			}
+			if tc.max > 0 {
+				assert.GreaterOrEqual(t, apiErr.RetryAfter, tc.min)
+				assert.LessOrEqual(t, apiErr.RetryAfter, tc.max)
+			}
 		})
 	}
 }
