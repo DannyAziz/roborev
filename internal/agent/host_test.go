@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -20,8 +21,7 @@ import (
 	"go.kenn.io/roborev/internal/config"
 )
 
-// setHostMarker forces the explicit host marker on, or leaves no marker of
-// either kind: ROBOREV_HOST_AGENT unset and no Cursor cloud detection.
+// setHostMarker sets ROBOREV_HOST_AGENT=1, or unsets it.
 func setHostMarker(t *testing.T, on bool) {
 	t.Helper()
 	if on {
@@ -29,40 +29,18 @@ func setHostMarker(t *testing.T, on bool) {
 		return
 	}
 	unsetForTest(t, HostMarkerEnv)
-	unsetForTest(t, "CURSOR_AGENT")
-	clearCloudAgentEnv(t)
-}
-
-// setDetectedHostOnly simulates a Cursor cloud agent shell with no explicit
-// ROBOREV_HOST_AGENT.
-func setDetectedHostOnly(t *testing.T) {
-	t.Helper()
-	unsetForTest(t, HostMarkerEnv)
-	t.Setenv("CURSOR_AGENT", "1")
-	t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
 }
 
 type hostMode struct {
-	name     string
-	set      func(t *testing.T)
-	explicit bool
-	detected bool
+	name string
+	set  func(t *testing.T)
+	on   bool
 }
-
-// named reports whether host is accepted when chosen by name in this mode.
-func (m hostMode) named() bool { return m.explicit }
-
-// listed reports whether host is offered in listings in this mode.
-func (m hostMode) listed() bool { return m.explicit }
 
 var hostModes = []hostMode{
 	{name: "no marker", set: func(t *testing.T) { setHostMarker(t, false) }},
-	{name: "marker 0 inside a Cursor cloud agent", set: func(t *testing.T) {
-		setDetectedHostOnly(t)
-		t.Setenv(HostMarkerEnv, "0")
-	}},
-	{name: "Cursor cloud agent shell", set: setDetectedHostOnly, detected: true},
-	{name: "explicit marker", set: func(t *testing.T) { setHostMarker(t, true) }, explicit: true},
+	{name: "marker 0", set: func(t *testing.T) { t.Setenv(HostMarkerEnv, "0") }},
+	{name: "explicit marker", set: func(t *testing.T) { setHostMarker(t, true) }, on: true},
 }
 
 func eachHostMode(t *testing.T, fn func(t *testing.T, mode hostMode)) {
@@ -80,15 +58,6 @@ func unsetForTest(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")
 	require.NoError(t, os.Unsetenv(key))
-}
-
-func clearCloudAgentEnv(t *testing.T) {
-	t.Helper()
-	for _, kv := range os.Environ() {
-		if key, _, _ := strings.Cut(kv, "="); strings.HasPrefix(key, "CLOUD_AGENT_") {
-			unsetForTest(t, key)
-		}
-	}
 }
 
 func stubPath(t *testing.T, commands ...string) {
@@ -118,85 +87,32 @@ func TestHostUnavailableSurvivesWrapping(t *testing.T) {
 	assert.False(t, IsHostUnavailable(nil))
 }
 
-func TestReadHostMarker(t *testing.T) {
+func TestHostAllowed(t *testing.T) {
 	setHostMarker(t, false)
-	assert.Equal(t, HostMarker{}, ReadHostMarker())
-
-	t.Setenv("CLOUD_AGENT_INJECTED_SECRET_NAMES", "x")
-	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CLOUD_AGENT_* alone is not detection")
-
-	clearCloudAgentEnv(t)
-	t.Setenv("CURSOR_AGENT", "1")
-	assert.Equal(t, HostMarker{}, ReadHostMarker(), "CURSOR_AGENT alone is a local Cursor shell, not a cloud host")
-
-	t.Setenv("CLOUD_AGENT_SOMETHING", "")
-	m := ReadHostMarker()
-	assert.True(t, m.Detected, "CURSOR_AGENT=1 plus any CLOUD_AGENT_* variable")
-	assert.False(t, m.Explicit)
-	assert.Contains(t, m.Why, "CLOUD_AGENT_")
-
-	t.Setenv("CURSOR_AGENT", "TRUE")
-	assert.True(t, ReadHostMarker().Detected, "CURSOR_AGENT is case-insensitive")
-	t.Setenv("CURSOR_AGENT", "0")
-	assert.Equal(t, HostMarker{}, ReadHostMarker())
-	t.Setenv("CURSOR_AGENT", "1")
-
-	for _, v := range []string{"0", "false", "OFF", "no", "bogus"} {
+	assert.False(t, HostAllowed())
+	for _, v := range []string{"", "  ", "0", "false", "OFF", "no", "bogus"} {
 		t.Setenv(HostMarkerEnv, v)
-		assert.Equal(t, HostMarker{}, ReadHostMarker(), "%s=%s overrides cloud detection", HostMarkerEnv, v)
+		assert.False(t, HostAllowed(), "%s=%q", HostMarkerEnv, v)
 	}
-	t.Setenv(HostMarkerEnv, "  ")
-	assert.True(t, ReadHostMarker().Detected, "an empty marker is unset, so detection still applies")
-
 	for _, v := range []string{"1", "true", "TRUE", " Yes ", "on"} {
 		t.Setenv(HostMarkerEnv, v)
-		m = ReadHostMarker()
-		assert.True(t, m.Explicit, "%s=%q", HostMarkerEnv, v)
-		assert.False(t, m.Detected, "the explicit marker wins over detection")
-		assert.Contains(t, m.Why, HostMarkerEnv)
+		assert.True(t, HostAllowed(), "%s=%q", HostMarkerEnv, v)
 	}
-	clearCloudAgentEnv(t)
-	t.Setenv(HostMarkerEnv, "")
-	assert.Equal(t, HostMarker{}, ReadHostMarker(), "empty marker without cloud detection is off")
-}
-
-// The ruling lives in HostMarker.Allows: host runs, is listed, and is
-// picked automatically only with ROBOREV_HOST_AGENT=1. Detection never
-// substitutes for the marker.
-func TestHostMarkerAllows(t *testing.T) {
-	for _, tc := range []struct {
-		marker              HostMarker
-		named, listed, auto bool
-	}{
-		{marker: HostMarker{}},
-		{marker: HostMarker{Detected: true}},
-		{marker: HostMarker{Explicit: true}, named: true, listed: true, auto: true},
-	} {
-		assert.Equal(t, tc.named, tc.marker.Allows(HostNamed), "%+v named", tc.marker)
-		assert.Equal(t, tc.listed, tc.marker.Allows(HostListed), "%+v listed", tc.marker)
-		assert.Equal(t, tc.auto, tc.marker.Allows(HostAuto), "%+v automatic pick", tc.marker)
-	}
-	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		assert.Equal(t, mode.named(), HostAllowed(HostNamed))
-		assert.Equal(t, mode.listed(), HostAllowed(HostListed))
-		assert.Equal(t, mode.explicit, HostAllowed(HostAuto))
-	})
 }
 
 func TestHostAvailabilityIsMarkerGated(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		assert.Equal(t, mode.named(), IsAvailable("host"))
-		assert.Equal(t, mode.named(), isAvailableWithConfig("host", &config.Config{}))
-		assert.Equal(t, mode.named(), isAvailableWithConfigFromConfig("host", nil, &config.Config{}))
+		assert.Equal(t, mode.on, IsAvailable("host"))
+		assert.Equal(t, mode.on, isAvailableWithConfig("host", &config.Config{}))
+		assert.Equal(t, mode.on, isAvailableWithConfigFromConfig("host", nil, &config.Config{}))
 	})
 }
 
 // R1: an explicitly chosen primary host without ROBOREV_HOST_AGENT=1 is a
-// hard error on every resolver, including a Cursor cloud agent shell, and
-// never falls back to another agent.
+// hard error on every resolver and never falls back to another agent.
 func TestExplicitHostWithoutMarkerErrors(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		if mode.named() {
+		if mode.on {
 			return
 		}
 		hostDir := filepath.Join(t.TempDir(), "handoff")
@@ -228,20 +144,10 @@ func TestExplicitHostWithoutMarkerErrors(t *testing.T) {
 	})
 }
 
-// Mutant pin: re-adding m.Detected to Allows(HostNamed) turns this red.
-func TestDetectionNeverSubstitutesForMarker(t *testing.T) {
-	setDetectedHostOnly(t)
-	assert.False(t, HostMarker{Detected: true}.Allows(HostNamed))
-	assert.False(t, HostAllowed(HostNamed))
-	assert.False(t, IsAvailable("host"))
-	a, err := GetAvailable("host")
-	requireHostUnavailable(t, "GetAvailable", a, err)
-}
-
 // An explicitly named host resolves in every mode that allows naming it.
 func TestExplicitHostAgent(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		if !mode.named() {
+		if !mode.on {
 			return
 		}
 		stubPath(t, "claude")
@@ -292,11 +198,10 @@ func TestStrictNamedAgentNeverReturnsHost(t *testing.T) {
 }
 
 // R3: host is never picked by auto-selection and is listed only with
-// ROBOREV_HOST_AGENT=1, not on Cursor cloud detection alone. Every
-// UnknownAgentError known-list follows the same rule.
+// ROBOREV_HOST_AGENT=1. Every UnknownAgentError known-list follows the same rule.
 func TestHostHiddenFromSelectionAndListings(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		marker := mode.listed()
+		marker := mode.on
 		stubPath(t, "claude")
 		cfg := &config.Config{}
 		a, err := GetAvailableWithConfigFromConfig(nil, "", cfg)
@@ -427,41 +332,36 @@ func TestHostAgentPlainReviewPassesRepoPath(t *testing.T) {
 }
 
 func TestHostAgentTimeout(t *testing.T) {
-	dir := t.TempDir()
-	a := hostTestAgent(dir, 40*time.Millisecond)
-	start := time.Now()
-	_, err := a.Review(context.Background(), "/repo", "HEAD", "p", nil)
-	require.Error(t, err)
-	assert.GreaterOrEqual(t, time.Since(start), 40*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		a := hostTestAgent(dir, 40*time.Millisecond)
+		start := time.Now()
+		_, err := a.Review(context.Background(), "/repo", "HEAD", "p", nil)
+		require.Error(t, err)
+		assert.Equal(t, 40*time.Millisecond, time.Since(start))
 
-	var timeoutErr *HostTimeoutError
-	require.ErrorAs(t, err, &timeoutErr)
-	assert.Equal(t, 40*time.Millisecond, timeoutErr.Timeout)
-	assert.Contains(t, err.Error(), "host handoff timeout")
-	assert.Contains(t, err.Error(), "after 40ms")
-	assert.True(t, IsUnavailable(err), "host timeout is non-retryable")
-	require.NotErrorIs(t, err, context.DeadlineExceeded, "not reported as the job timeout")
+		var timeoutErr *HostTimeoutError
+		require.ErrorAs(t, err, &timeoutErr)
+		assert.Equal(t, 40*time.Millisecond, timeoutErr.Timeout)
+		assert.Contains(t, err.Error(), "host handoff timeout")
+		assert.Contains(t, err.Error(), "after 40ms")
+		assert.True(t, IsUnavailable(err), "host timeout is non-retryable")
+		require.NotErrorIs(t, err, context.DeadlineExceeded, "not reported as the job timeout")
 
-	entries, readErr := os.ReadDir(dir)
-	require.NoError(t, readErr)
-	assert.Empty(t, entries, "handoff dir is removed after failure")
+		entries, readErr := os.ReadDir(dir)
+		require.NoError(t, readErr)
+		assert.Empty(t, entries, "handoff dir is removed after failure")
+	})
 }
 
-// The handoff timeout bounds the wait even when the poll interval is longer,
-// and an answer that lands before the deadline is still read.
+// The handoff timeout bounds the wait even when the poll interval is longer.
 func TestHostAgentPollBoundaries(t *testing.T) {
-	dir := t.TempDir()
-	a := &HostAgent{Dir: dir, Timeout: 60 * time.Millisecond, PollInterval: time.Hour}
-	fakeHost(t, dir, answerWith("late but in time"))
-	got, err := a.Review(context.Background(), "/repo", "HEAD", "p", nil)
-	require.NoError(t, err)
-	assert.Equal(t, "late but in time", got)
-
-	start := time.Now()
-	_, err = (&HostAgent{Dir: t.TempDir(), Timeout: 30 * time.Millisecond, PollInterval: time.Hour}).Review(context.Background(), "/repo", "HEAD", "p", nil)
-	require.ErrorAs(t, err, new(*HostTimeoutError))
-	assert.Less(t, time.Since(start), 5*time.Second)
-
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		_, err := (&HostAgent{Dir: t.TempDir(), Timeout: 30 * time.Millisecond, PollInterval: time.Hour}).Review(context.Background(), "/repo", "HEAD", "p", nil)
+		require.ErrorAs(t, err, new(*HostTimeoutError))
+		assert.Equal(t, 30*time.Millisecond, time.Since(start))
+	})
 	assert.Equal(t, defaultHostPollInterval, (&HostAgent{}).pollInterval())
 	assert.Equal(t, defaultHostPollInterval, (&HostAgent{PollInterval: -1}).pollInterval())
 	assert.Equal(t, time.Millisecond, (&HostAgent{PollInterval: time.Millisecond}).pollInterval())
@@ -501,16 +401,10 @@ func TestHostAgentIgnoresTempAndRefusesSymlink(t *testing.T) {
 	dir := t.TempDir()
 	answerPath := filepath.Join(dir, "answer.md")
 	require.NoError(t, os.WriteFile(answerPath+".tmp", []byte("partial"), 0o600))
-	_, ready, err := readHostAnswer(answerPath)
+	_, info, err := readHostAnswer(answerPath)
 	require.NoError(t, err)
-	assert.False(t, ready, "answer.md.tmp is never read")
+	assert.Nil(t, info, "answer.md.tmp is never read")
 
-	require.NoError(t, os.WriteFile(answerPath, []byte("  \n"), 0o600))
-	_, _, err = readHostAnswer(answerPath)
-	require.Error(t, err)
-	assert.True(t, strings.HasSuffix(err.Error(), "is empty"))
-
-	require.NoError(t, os.Remove(answerPath))
 	require.NoError(t, os.Mkdir(answerPath, 0o700))
 	_, _, err = readHostAnswer(answerPath)
 	require.ErrorContains(t, err, "not a regular file")
@@ -542,9 +436,49 @@ func TestHostAnswerReplacedBeforeOpenIsRefused(t *testing.T) {
 		require.NoError(t, os.WriteFile(other, []byte("second"), 0o600))
 		require.NoError(t, os.Rename(other, path))
 	}
-	_, ready, err := readHostAnswer(answerPath)
+	_, info, err := readHostAnswer(answerPath)
 	require.ErrorContains(t, err, "replaced while reading")
-	assert.False(t, ready)
+	assert.Nil(t, info)
+}
+
+// An answer.md written in place is read only once it is non-empty and its
+// size and mtime hold across two polls: an empty or growing file keeps the
+// wait polling.
+func TestHostAnswerWrittenInPlaceWaitsUntilStable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		answerPath := filepath.Join(t.TempDir(), "answer.md")
+		require.NoError(t, os.WriteFile(answerPath, nil, 0o600))
+		type result struct {
+			answer string
+			err    error
+		}
+		done := make(chan result, 1)
+		go func() {
+			answer, err := waitForHostAnswer(context.Background(), answerPath, time.Hour, time.Second)
+			done <- result{answer, err}
+		}()
+		write := func(data string) {
+			f, err := os.OpenFile(answerPath, os.O_WRONLY|os.O_APPEND, 0)
+			require.NoError(t, err)
+			_, err = f.WriteString(data)
+			require.NoError(t, errors.Join(err, f.Close()))
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		assert.Empty(t, done, "an empty answer.md keeps the wait polling")
+
+		write(`{"verdict":`)
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		assert.Empty(t, done, "a file seen once is not yet accepted")
+
+		write(`"pass"}`)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		got := <-done
+		require.NoError(t, got.err)
+		assert.JSONEq(t, `{"verdict":"pass"}`, got.answer, "the whole file is read, not the first half")
+	})
 }
 
 // A FIFO at answer.md never blocks the reader: it is refused on open.
@@ -566,7 +500,7 @@ func TestHostAnswerFIFOIsRefusedWithoutBlocking(t *testing.T) {
 	case err := <-done:
 		require.ErrorContains(t, err, "not a regular file")
 	case <-time.After(5 * time.Second):
-		t.Fatal("opening a FIFO answer blocked")
+		require.FailNow(t, "opening a FIFO answer blocked")
 	}
 
 	prev := beforeHostAnswerOpen
@@ -585,7 +519,7 @@ func TestHostAnswerFIFOIsRefusedWithoutBlocking(t *testing.T) {
 	case err := <-done:
 		require.ErrorContains(t, err, "not a regular file")
 	case <-time.After(5 * time.Second):
-		t.Fatal("a FIFO swapped in after the Lstat blocked the reader")
+		require.FailNow(t, "a FIFO swapped in after the Lstat blocked the reader")
 	}
 }
 
@@ -607,17 +541,19 @@ func TestHostAnswerErrorAtDeadlineIsReported(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlinks need privileges on Windows")
 	}
-	answerPath := filepath.Join(t.TempDir(), "answer.md")
-	target := filepath.Join(t.TempDir(), "secret")
-	require.NoError(t, os.WriteFile(target, []byte("do not read"), 0o600))
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		_ = os.Symlink(target, answerPath)
-	}()
-	_, err := waitForHostAnswer(context.Background(), answerPath, 200*time.Millisecond, time.Hour)
-	require.ErrorContains(t, err, "not a regular file")
-	require.NotErrorAs(t, err, new(*HostTimeoutError), "reported as the read error, not a timeout")
-	assert.True(t, IsUnavailable(err))
+	synctest.Test(t, func(t *testing.T) {
+		answerPath := filepath.Join(t.TempDir(), "answer.md")
+		target := filepath.Join(t.TempDir(), "secret")
+		require.NoError(t, os.WriteFile(target, []byte("do not read"), 0o600))
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			_ = os.Symlink(target, answerPath)
+		}()
+		_, err := waitForHostAnswer(context.Background(), answerPath, 200*time.Millisecond, time.Hour)
+		require.ErrorContains(t, err, "not a regular file")
+		require.NotErrorAs(t, err, new(*HostTimeoutError), "reported as the read error, not a timeout")
+		assert.True(t, IsUnavailable(err))
+	})
 }
 
 // Handoff files appear complete or not at all, and no temp file is left.
@@ -645,7 +581,7 @@ func TestHandoffFilesArePublishedAtomically(t *testing.T) {
 		require.NoError(t, writeHandoffFile(dir, name, data))
 		close(stop)
 		if n, ok := <-partial; ok {
-			t.Fatalf("reader saw a partial %s (%d of %d bytes)", name, n, len(data))
+			require.Failf(t, "partial handoff file", "reader saw a partial %s (%d of %d bytes)", name, n, len(data))
 		}
 		entries, err := os.ReadDir(dir)
 		require.NoError(t, err)
@@ -676,17 +612,19 @@ func TestHostAgentRefusesPlantedHandoffFile(t *testing.T) {
 }
 
 func TestHostAgentCancel(t *testing.T) {
-	dir := t.TempDir()
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-	_, err := hostTestAgent(dir, time.Minute).Review(ctx, "/repo", "HEAD", "p", nil)
-	require.ErrorIs(t, err, context.Canceled)
-	assert.False(t, IsUnavailable(err), "cancellation is not a host failure")
-	entries, _ := os.ReadDir(dir)
-	assert.Empty(t, entries)
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}()
+		_, err := hostTestAgent(dir, time.Minute).Review(ctx, "/repo", "HEAD", "p", nil)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.False(t, IsUnavailable(err), "cancellation is not a host failure")
+		entries, _ := os.ReadDir(dir)
+		assert.Empty(t, entries)
+	})
 }
 
 func TestHostJobLabel(t *testing.T) {
@@ -763,7 +701,7 @@ func TestBackupHostWithoutMarkerIsSkipped(t *testing.T) {
 // marker that would enable it.
 func TestBackupHostWithoutMarkerNothingLeftNamesMarker(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		if mode.named() {
+		if mode.on {
 			return
 		}
 		stubPath(t)
@@ -798,7 +736,7 @@ func TestBackupHostWithoutMarkerNothingLeftNamesMarker(t *testing.T) {
 // A host named as a backup is used only with ROBOREV_HOST_AGENT=1.
 func TestBackupHostWithMarkerIsUsed(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
-		if !mode.named() {
+		if !mode.on {
 			return
 		}
 		stubPath(t)
@@ -811,9 +749,8 @@ func TestBackupHostWithMarkerIsUsed(t *testing.T) {
 	})
 }
 
-// R4: host is the non-strict last resort only with ROBOREV_HOST_AGENT=1; a
-// Cursor cloud agent alone never makes it an automatic pick, and a strict
-// named agent keeps its error in every mode. No handoff dir is created.
+// R4: host is the non-strict last resort only with ROBOREV_HOST_AGENT=1, and a
+// strict named agent keeps its error in every mode. No handoff dir is created.
 func TestHostIsLastResortOnlyWithExplicitMarker(t *testing.T) {
 	eachHostMode(t, func(t *testing.T, mode hostMode) {
 		log := captureHostLastResortLog(t)
@@ -830,7 +767,7 @@ func TestHostIsLastResortOnlyWithExplicitMarker(t *testing.T) {
 			"GetAvailable no pref": func() (Agent, error) { return GetAvailable("") },
 		} {
 			a, err := resolve()
-			if !mode.explicit {
+			if !mode.on {
 				require.Error(t, err, label)
 				assert.Contains(t, err.Error(), "no agents available", label)
 				assert.NotContains(t, err.Error(), "host", "%s: the error is the same as without host", label)
@@ -845,9 +782,9 @@ func TestHostIsLastResortOnlyWithExplicitMarker(t *testing.T) {
 		assert.Nil(t, a)
 		assert.Contains(t, err.Error(), "no configured agent available")
 
-		if mode.explicit {
+		if mode.on {
 			assert.Contains(t, log.String(), `no agents available (install one of:`)
-			assert.Contains(t, log.String(), `falling back to "host": ROBOREV_HOST_AGENT=1`)
+			assert.Contains(t, log.String(), `falling back to "host": ROBOREV_HOST_AGENT=1 is set`)
 		} else {
 			assert.Empty(t, log.String())
 		}

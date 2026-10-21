@@ -161,7 +161,7 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
 	}
 	if name == hostAgentName {
 		// Only a lookup that names host gets here: automatic picks skip it.
-		return HostAllowed(HostNamed)
+		return HostAllowed()
 	}
 	ca, ok := a.(CommandAgent)
 	if !ok {

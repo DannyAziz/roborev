@@ -467,6 +467,77 @@ inconclusive results (timeout, crash, empty or oversize version output) as
 unavailable rather than as Cursor. Probes are bounded (context deadline plus a
 short `WaitDelay` so orphan pipes cannot hang availability checks forever).
 
+## Host Model Handoff
+
+The `host` agent hands a review to the AI model that is already driving your
+shell, such as a cloud coding agent, instead of running a CLI agent. roborev
+writes the review to files, and the host model writes its answer back.
+
+### Turning it on
+
+- Set `ROBOREV_HOST_AGENT=1` (or `true`, `yes`, `on`) in the environment roborev
+    runs in. Without it, naming `host` is an error and never falls back to
+    another agent.
+- The daemon reads the marker from its own environment, not from the shell that
+    queued the review. Restart the daemon from a shell that has the marker.
+- `host` runs only when named: `--agent host`, `agent = "host"`, or a named
+    backup. Automatic agent picks skip it.
+- Listings, shell completion, and `roborev check-agents` show `host` only with
+    the marker. `check-agents` never smoke-tests it, and
+    `check-agents --agent host` fails without the marker.
+
+### Handoff protocol
+
+For each review, roborev creates a private job directory and publishes these
+files atomically:
+
+| File | Contents |
+|------|----------|
+| `prompt.md` | The review prompt |
+| `schema.json` | The JSON schema, only when a structured answer is required |
+| `instructions.md` | The repository, git ref, answer format and timeout; written last |
+
+The host model then:
+
+1. Reads `instructions.md` and `prompt.md`, and reviews the change.
+1. Writes the answer to `answer.md.tmp`, then renames it to `answer.md`.
+
+roborev polls for `answer.md` every 500ms. It accepts the file once it is a
+non-empty regular file whose size and modification time are unchanged across two
+polls, so an answer written in place is not read half-written. A symlink, FIFO
+or directory at `answer.md` fails the review. The job directory is removed when
+the review finishes.
+
+### Settings
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ROBOREV_HOST_AGENT` | unset | Attaches a host model |
+| `ROBOREV_HOST_TIMEOUT` | `10m` | How long to wait for `answer.md` (a Go duration) |
+| `ROBOREV_HOST_DIR` | `<data dir>/host` | Where job directories are created |
+
+roborev creates `ROBOREV_HOST_DIR` with mode 0700 if it is missing, but does not
+change the mode or owner of a directory that already exists. Job directories are
+always 0700.
+
+### Failure behavior
+
+- A timeout, an invalid `ROBOREV_HOST_TIMEOUT`, or a refused `answer.md` fails
+    the review without same-agent retries. The job fails over to its backup
+    agent if it has one.
+- The host timeout is separate from the job timeout.
+
+### Daemon and CI limits
+
+- Once the daemon runs with the marker, every review that names `host` is handed
+    off, whichever repository it comes from. Each one holds a daemon worker
+    until it is answered or `ROBOREV_HOST_TIMEOUT` passes. With the default pool
+    of four workers (`max_workers`), a few unanswered handoffs can delay other
+    reviews.
+- CI reviews run unattended, so the CI poller refuses a panel that names `host`
+    as a reviewer, synthesizer or backup, and sets an error status on the pull
+    request.
+
 ## ACP (Agent Client Protocol)
 
 ACP lets you integrate any agent that speaks the
