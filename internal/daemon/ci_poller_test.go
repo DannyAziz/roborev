@@ -3229,6 +3229,7 @@ func TestCICursorCloudMemberLaunchesAtHead(t *testing.T) {
 	t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
 	t.Setenv("ROBOREV_DEFAULT_HOST", "")
 	require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, ".roborev.toml"), []byte("[ci]\nhost = \"cursor-cloud\"\n"), 0o644))
+	h.Cfg.AllowCursorCloud = true
 	h.Cfg.CI.Agents = []string{"codex", "gemini"}
 	h.Cfg.CI.ReviewTypes = []string{"security", "default"}
 	h.stubProcessPRGit()
@@ -3288,6 +3289,7 @@ func TestCICursorCloudMissingRangePromptDoesNotQueue(t *testing.T) {
 			t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
 			t.Setenv("ROBOREV_DEFAULT_HOST", "")
 			require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, ".roborev.toml"), []byte("[ci]\nhost = \"cursor-cloud\"\n"), 0o644))
+			h.Cfg.AllowCursorCloud = true
 			h.Cfg.CI.Agents = []string{"codex"}
 			h.Cfg.CI.ReviewTypes = []string{"default"}
 			h.stubProcessPRGit()

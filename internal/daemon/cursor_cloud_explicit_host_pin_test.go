@@ -42,6 +42,7 @@ func enqueueCursorCloudHostSource(t *testing.T, source string, configure ...func
 		cfg.Host = agent.CursorCloudHost
 	case "repo host":
 		repo.CommitFile(".roborev.toml", "host = \"cursor-cloud\"\n", "host")
+		cfg.AllowCursorCloud = true
 	case "ROBOREV_DEFAULT_HOST":
 		t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
 	default:

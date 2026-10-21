@@ -507,7 +507,7 @@ func refuseLocalCursorCloud(repoPath, hostFlag, agentName, reviewType, reasoning
 	if repoCfg != nil {
 		repoHost = repoCfg.Host
 	}
-	chosen, err := agent.ReviewHost(hostFlag, repoHost, cfg.Host)
+	chosen, err := agent.ReviewHost(hostFlag, repoHost, cfg.Host, cfg.AllowCursorCloud)
 	if err != nil {
 		return err
 	}

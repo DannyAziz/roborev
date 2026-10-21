@@ -58,7 +58,7 @@ func TestDefaultConfigUnchanged(t *testing.T) {
 
 	snapshot := func() string {
 		t.Helper()
-		host, err := ReviewHost("", repo.Host, cfg.Host)
+		host, err := ReviewHost("", repo.Host, cfg.Host, true)
 		require.NoError(t, err)
 		res, err := ResolveWorkflowConfigFromConfig("", repo, cfg, "review", "")
 		require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestExplicitCursorCloudWithoutKeyErrors(t *testing.T) {
 			if tc.env != "" {
 				t.Setenv(EnvDefaultHost, tc.env)
 			}
-			_, err := ReviewHost(tc.flag, tc.repo, "")
+			_, err := ReviewHost(tc.flag, tc.repo, "", true)
 			require.Error(t, err)
 			assert.True(t, IsCursorCloudConfig(err))
 			assert.Contains(t, err.Error(), cursorcloud.EnvAPIKey)
@@ -133,7 +133,7 @@ func TestReviewHostExplicitHostWithoutMarkerErrors(t *testing.T) {
 	setHostMarker(t, false)
 	stubPath(t, "codex")
 
-	host, err := ReviewHost("host", "", "")
+	host, err := ReviewHost("host", "", "", true)
 	require.Error(t, err)
 	assert.Empty(t, host)
 	assert.True(t, IsHostUnavailable(err))
@@ -154,7 +154,7 @@ func TestCursorAPIKeyNeverLogged(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(prev) })
 
-	host, err := ReviewHost(CursorCloudHost, "", "")
+	host, err := ReviewHost(CursorCloudHost, "", "", true)
 	require.NoError(t, err)
 	assert.Equal(t, CursorCloudHost, host)
 

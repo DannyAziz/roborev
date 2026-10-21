@@ -120,24 +120,43 @@ func IsCursorCloudConfig(err error) bool {
 	return ok
 }
 
+// CursorCloudNotAllowedError means repository config selected cursor-cloud
+// and the global config does not set allow_cursor_cloud.
+type CursorCloudNotAllowedError struct {
+	// Setting names the repository setting that selected cursor-cloud.
+	Setting string
+}
+
+func (e *CursorCloudNotAllowedError) Error() string {
+	return fmt.Sprintf(
+		"repository config %s selects %s; set allow_cursor_cloud = true in the global config (~/.roborev/config.toml) to allow it",
+		e.Setting, CursorCloudHost,
+	)
+}
+
 // ReviewHost resolves the review host. flag wins, then repo config, then
 // global config, then ROBOREV_DEFAULT_HOST, then local. An empty result is
 // local. CURSOR_API_KEY is read only after cursor-cloud is already chosen.
-func ReviewHost(flag string, repoHost, globalHost string) (string, error) {
-	chosen := strings.TrimSpace(flag)
-	if chosen == "" {
-		chosen = strings.TrimSpace(repoHost)
+// cursor-cloud chosen only by repoHost is refused unless allowRepoCloud
+// (global allow_cursor_cloud) is set.
+func ReviewHost(flag string, repoHost, globalHost string, allowRepoCloud bool) (string, error) {
+	pick := func(values ...string) string {
+		for _, v := range values {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+		return ""
 	}
-	if chosen == "" {
-		chosen = strings.TrimSpace(globalHost)
-	}
-	if chosen == "" {
-		chosen = strings.TrimSpace(os.Getenv(EnvDefaultHost))
-	}
+	envHost := os.Getenv(EnvDefaultHost)
+	chosen := pick(flag, repoHost, globalHost, envHost)
 	switch strings.ToLower(chosen) {
 	case "", ReviewHostLocal:
 		return ReviewHostLocal, nil
 	case CursorCloudHost:
+		if !allowRepoCloud && !strings.EqualFold(pick(flag, globalHost, envHost), CursorCloudHost) {
+			return "", &CursorCloudNotAllowedError{Setting: "host"}
+		}
 		if !cursorCloudKeySet() {
 			return "", &CursorCloudConfigError{}
 		}
@@ -163,6 +182,29 @@ func skippedCursorCloudBackupNote(backups ...string) string {
 		return ""
 	}
 	return fmt.Sprintf("\nbackup %q was skipped: %s is not set", cursorCloudAgentName, cursorcloud.EnvAPIKey)
+}
+
+func isCursorCloudName(name string) bool {
+	return resolveAlias(strings.TrimSpace(name)) == cursorCloudAgentName
+}
+
+// repoCursorCloudError refuses a preferred or backup cursor-cloud agent that
+// only repository config selected, unless the global config sets
+// allow_cursor_cloud. A CLI agent or a global setting is not gated.
+func repoCursorCloudError(cliAgent string, globalCfg *config.Config, workflow, reasoning, preferred, backup string) error {
+	if globalCfg != nil && globalCfg.AllowCursorCloud {
+		return nil
+	}
+	noRepo := &config.RepoConfig{}
+	if isCursorCloudName(preferred) &&
+		!isCursorCloudName(config.ResolveAgentForWorkflowFromConfig(cliAgent, noRepo, globalCfg, workflow, reasoning)) {
+		return &CursorCloudNotAllowedError{Setting: "agent"}
+	}
+	if isCursorCloudName(backup) &&
+		!isCursorCloudName(config.ResolveBackupAgentForWorkflowFromConfig(noRepo, globalCfg, workflow)) {
+		return &CursorCloudNotAllowedError{Setting: "backup_agent"}
+	}
+	return nil
 }
 
 // explicitCursorCloud returns the cursor-cloud agent when name selects it.

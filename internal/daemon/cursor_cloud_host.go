@@ -58,12 +58,12 @@ func enqueueHostJobType(explicit, customPrompt, gitRef string) string {
 }
 
 func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config.RepoConfig, cfg *config.Config) (string, *RawJSONOutput) {
-	repoHost, globalHost := "", ""
+	repoHost, globalHost, allowRepoCloud := "", "", false
 	if repo != nil {
 		repoHost = repo.Host
 	}
 	if cfg != nil {
-		globalHost = cfg.Host
+		globalHost, allowRepoCloud = cfg.Host, cfg.AllowCursorCloud
 	}
 	// Goal reviews stay local. A dirty or range review is refused before the
 	// fix/compact exemption: without a prompt the descriptor stored that
@@ -74,7 +74,7 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 	// An explicit cursor-cloud host on a dirty or range review is rejected
 	// before agent selection. It is not rewritten to the local backend.
 	if jobType == storage.JobTypeDirty || jobType == storage.JobTypeRange {
-		host, err := agent.ReviewHost(flag, repoHost, globalHost)
+		host, err := agent.ReviewHost(flag, repoHost, globalHost, allowRepoCloud)
 		if host == agent.CursorCloudHost || agent.IsCursorCloudConfig(err) {
 			out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{
 				Error: fmt.Sprintf("cursor-cloud reviews one commit and cannot run a %s review", jobType),
@@ -85,7 +85,7 @@ func resolveEnqueueHost(workflow, reviewType, jobType, flag string, repo *config
 	if !reviewHostApplies(workflow, reviewType, jobType) {
 		return agent.ReviewHostLocal, nil
 	}
-	host, err := agent.ReviewHost(flag, repoHost, globalHost)
+	host, err := agent.ReviewHost(flag, repoHost, globalHost, allowRepoCloud)
 	if err != nil {
 		out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return "", out

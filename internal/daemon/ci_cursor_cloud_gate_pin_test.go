@@ -23,6 +23,7 @@ func cloudGateHarness(t *testing.T) *ciPollerHarness {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	t.Setenv("CURSOR_API_KEY", "cursor-test-secret")
 	t.Setenv("ROBOREV_DEFAULT_HOST", "")
+	h.Cfg.AllowCursorCloud = true
 	h.stubProcessPRGit()
 	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 		return "range-prompt", nil

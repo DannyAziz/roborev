@@ -250,6 +250,8 @@ type Config struct {
 	FixGuidelines              string                          `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
 	DefaultAgent               string                          `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
 	Host                       string                          `toml:"host" comment:"Review host: local (default), host, or cursor-cloud. Empty inherits ROBOREV_DEFAULT_HOST, then local. CURSOR_API_KEY alone does not select cursor-cloud."`
+	AllowCursorCloud           bool                            `toml:"allow_cursor_cloud" comment:"Let a repository .roborev.toml select cursor-cloud through host, agent, review_agent*, backup_agent, or [ci] host. Read only from this global file. The --host flag and global settings do not need it."`
+	AllowedHosts               []string                        `toml:"allowed_hosts" comment:"Extra Host names the daemon API accepts on its loopback listener, for a local reverse proxy such as Tailscale Serve, nginx, or Caddy. Not needed when auth_key is set. Requires daemon restart."`
 	DefaultModel               string                          `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
 	DefaultBackupModel         string                          `toml:"default_backup_model"`
