@@ -621,3 +621,32 @@ func TestProcessJobCursorCloudOmitsRemoteQueryToken(t *testing.T) {
 	require.NoError(t, wtc.DB.QueryRow(`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ? AND repo_identity LIKE ?`, job.ID, "%"+secret+"%").Scan(&launches))
 	assert.Zero(t, launches)
 }
+
+// TestProcessJobCursorCloudCapRequeues: a launch the hourly cap refuses
+// creates nothing and goes back in the queue until the cap frees a slot.
+// It does not fail and does not spend a retry.
+func TestProcessJobCursorCloudCapRequeues(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "test-key")
+	tc, fake := cursorCloudRestartFixture(t)
+	fake.CreateStatus = cursorcloud.StatusFinished
+	fake.Final = cursorCloudPassJSON
+	cloud, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	cloud.(*agent.CursorCloudAgent).SetLaunchLimitsForTest(4, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	first := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	tc.Pool.processJob(testWorkerID, first)
+	tc.assertJobStatus(t, first.ID, storage.JobStatusDone)
+
+	second := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
+	tc.Pool.processJob(testWorkerID, second)
+
+	assert.Equal(t, 1, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
+	stored := tc.assertJobStatus(t, second.ID, storage.JobStatusQueued)
+	assert.Equal(t, 0, stored.RetryCount)
+	var notBefore string
+	require.NoError(t, tc.DB.QueryRow(`SELECT retry_not_before FROM review_jobs WHERE id = ?`, second.ID).Scan(&notBefore))
+	at, err := time.Parse(time.RFC3339Nano, notBefore)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now().Add(time.Hour), at, time.Minute)
+}

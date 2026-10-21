@@ -592,7 +592,7 @@ func TestCursorCloudLaunchLimitDefaults(t *testing.T) {
 
 func TestCursorCloudProductionUsesProcessLaunchGate(t *testing.T) {
 	injected := &CursorCloudAgent{Client: &cursorcloudtest.Fake{}}
-	assert.Nil(t, injected.launchGate())
+	assert.Same(t, cursorCloudLaunches, injected.launchGate())
 	assert.Same(t, cursorCloudLaunches, (&CursorCloudAgent{}).launchGate())
 }
 
@@ -668,7 +668,9 @@ func TestCursorCloudHourlyCapRefusesBeforeCreate(t *testing.T) {
 	assert.Equal(t, n, before)
 
 	_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
-	require.Error(t, err)
+	capErr, ok := errors.AsType[*CursorCloudCapError](err)
+	require.True(t, ok)
+	assert.Equal(t, clock.Add(time.Hour), capErr.RetryAt)
 	assert.Contains(t, err.Error(), "last hour")
 	assert.Equal(t, before, createCount(fake))
 

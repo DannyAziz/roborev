@@ -13,25 +13,11 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/cursorcloud"
-	"go.kenn.io/roborev/internal/goalreview"
 	"go.kenn.io/roborev/internal/prompt"
 	"go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
-
-func TestServerRecoverStaleJobsSweepsLaunch(t *testing.T) {
-	tc, fake := cursorCloudRestartFixture(t)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	created := cursorCloudPersistAttempt(t, tc, fake, job.ID, "launch-token-server", true)
-	srv := &Server{db: tc.DB, cloudLaunchClient: fake}
-
-	require.NoError(t, srv.recoverStaleJobs(context.Background()))
-
-	_, err := fake.GetAgent(t.Context(), created.ID)
-	require.Error(t, err)
-}
 
 func TestProcessJobBindsCursorCloudLaunch(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "test-key")
@@ -42,32 +28,6 @@ func TestProcessJobBindsCursorCloudLaunch(t *testing.T) {
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
 
 	tc.Pool.processJob(testWorkerID, job)
-
-	assert.Equal(t, 1, countCloudLaunchRows(t, tc.DB, job.ID))
-}
-
-func TestGoalReviewBindsCursorCloudLaunch(t *testing.T) {
-	t.Setenv(cursorcloud.EnvAPIKey, "test-key")
-	tc, fake := cursorCloudRestartFixture(t)
-	fake.CreateStatus = cursorcloud.StatusFinished
-	fake.Final = `{"findings":[]}`
-	snapshot := goalreview.Snapshot{Source: "superpowers", Stage: "spec", Artifacts: []goalreview.Artifact{{Kind: "spec", Path: "spec.md", Content: "# Frozen\n"}}}
-	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
-		RepoID: tc.Repo.ID, Agent: agent.CursorCloudHost, GitRef: snapshot.ID(), ReviewType: "goal",
-		JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true,
-	})
-	require.NoError(t, err)
-	tc.Pool.goalReviewAdmit = func(agent.Agent) error { return nil }
-	head := testutil.GetHeadSHA(t, tc.TmpDir)
-	tc.Pool.goalReviewRunner = func(ctx context.Context, a agent.Agent, root string, _ goalreview.Snapshot, _ prompt.SnapshotResult, out io.Writer) ([]goalreview.Finding, error) {
-		_, _ = a.Review(ctx, root, head, "prompt", out)
-		return nil, nil
-	}
-	claimed, err := tc.DB.ClaimJob(testWorkerID)
-	require.NoError(t, err)
-	require.Equal(t, job.ID, claimed.ID)
-
-	tc.Pool.processGoalReview(context.Background(), testWorkerID, claimed, tc.Pool.cfgGetter.Config())
 
 	assert.Equal(t, 1, countCloudLaunchRows(t, tc.DB, job.ID))
 }

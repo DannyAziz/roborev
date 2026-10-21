@@ -21,9 +21,8 @@ import (
 )
 
 // TestCursorCloudList429ThenReapsAndCleans is a reconcile list that answers
-// 429 and then succeeds. The VM is deleted. The launch row stays uncleaned:
-// that one deleting list is not a later empty sweep. The gap between the
-// lists is Retry-After. One list attempt leaves the VM and the row.
+// 429 and then succeeds. The VM is deleted and the launch is cleaned. The
+// gap between the lists is Retry-After.
 func TestCursorCloudList429ThenReapsAndCleans(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const gap = 2 * time.Second
@@ -42,7 +41,7 @@ func TestCursorCloudList429ThenReapsAndCleans(t *testing.T) {
 		assert.Equal(t, gap, at[1].Sub(at[0]))
 		deleted := cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete)
 		require.NotEmpty(t, deleted)
-		assertLaunchHeld(t, tc, job.ID, fake, deleted[0])
+		assertLaunchCleaned(t, tc, job.ID, fake, deleted[0])
 	})
 }
 

@@ -1621,7 +1621,7 @@ func (db *DB) ensureCloudLaunchTable() error {
 		repo_identity TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL DEFAULT (datetime('now')),
 		orphan_note TEXT NOT NULL DEFAULT '',
-		sweep_seen INTEGER NOT NULL DEFAULT 0
+		agent_deleted INTEGER NOT NULL DEFAULT 0
 	)`); err != nil {
 		return fmt.Errorf("cloud launch table: %w", err)
 	}
