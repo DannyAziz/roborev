@@ -1529,6 +1529,10 @@ type ReenqueueOpts struct {
 	BackupAgent string
 	BackupModel string
 	RestorePlan bool
+	// RepinBackup replaces backup_agent, backup_model and backup_auto with
+	// the values above: a rerun of an "auto" backup job pins it again.
+	RepinBackup bool
+	BackupAuto  bool
 }
 
 // ReenqueueJob resets a completed, failed, or canceled job back to queued status.
@@ -1611,6 +1615,7 @@ func (db *DB) ReenqueueJobWithRequest(
 		    min_severity = CASE WHEN ? THEN ? ELSE min_severity END,
 		    backup_agent = CASE WHEN ? THEN ? WHEN budget_original_agent != '' THEN budget_original_backup_agent ELSE backup_agent END,
 		    backup_model = CASE WHEN ? THEN ? WHEN budget_original_agent != '' THEN budget_original_backup_model ELSE backup_model END,
+		    backup_auto = CASE WHEN ? THEN ? ELSE backup_auto END,
 		    budget_original_agent = '', budget_original_backup_agent = '', budget_original_backup_model = '',
 		    prompt_prebuilt = 0,
 		    prompt = CASE WHEN job_type IN ('task', 'compact', 'fix', 'insights', 'goal_review') THEN prompt ELSE NULL END,
@@ -1627,8 +1632,9 @@ func (db *DB) ReenqueueJobWithRequest(
 		opts.RestorePlan, opts.Reasoning,
 		opts.RestorePlan, opts.ReviewType,
 		opts.RestorePlan, normalizeMinSeverityForWrite(opts.MinSeverity),
-		opts.RestorePlan, opts.BackupAgent,
-		opts.RestorePlan, opts.BackupModel,
+		opts.RestorePlan || opts.RepinBackup, opts.BackupAgent,
+		opts.RestorePlan || opts.RepinBackup, opts.BackupModel,
+		opts.RepinBackup, opts.BackupAuto,
 		updatedAt, jobID)
 	if err != nil {
 		return 0, false, err

@@ -142,7 +142,7 @@ func ReviewHost(flag string, repoHost, globalHost string) (string, error) {
 		}
 		return CursorCloudHost, nil
 	case hostAgentName:
-		if !HostAllowed(HostNamed) {
+		if !HostAllowed() {
 			return "", &HostUnavailableError{}
 		}
 		return hostAgentName, nil

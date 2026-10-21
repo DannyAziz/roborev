@@ -40,8 +40,6 @@ func unsetCursorCloudEnv(t *testing.T) {
 	unsetForTest(t, EnvDefaultHost)
 	unsetForTest(t, cursorcloud.EnvAPIKey)
 	unsetForTest(t, HostMarkerEnv)
-	unsetForTest(t, "CURSOR_AGENT")
-	clearCloudAgentEnv(t)
 }
 
 // TestDefaultConfigUnchanged proves an empty flag and config, with no

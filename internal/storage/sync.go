@@ -472,7 +472,6 @@ type SyncableJob struct {
 
 // GetJobsToSync returns terminal jobs that need to be pushed to PostgreSQL.
 // These are jobs created locally that haven't been synced or were updated since last sync.
-// backup_auto is not selected: it is local scheduling state and has no Postgres column.
 func (db *DB) GetJobsToSync(machineID uuid.UUID, limit int) ([]SyncableJob, error) {
 	rows, err := db.Query(`
 		SELECT

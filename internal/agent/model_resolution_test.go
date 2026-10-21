@@ -514,8 +514,7 @@ func TestResolveWorkflowConfigModelForSelectedAgent_BackupWithoutModelKeepsDefau
 }
 
 // An "auto" backup selected when the named primary is unavailable must not
-// inherit that primary's workflow model. Mutant pin: if ModelForSelectedAgent
-// only guards IsAuto(PreferredAgent), Claude gets gpt-5 here.
+// inherit that primary's workflow model.
 func TestModelForSelectedAgentAutoBackupSkipsWorkflowModel(t *testing.T) {
 	cfg := &config.Config{
 		DefaultAgent:      "codex",

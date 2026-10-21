@@ -25,13 +25,8 @@ import (
 // the test sees the environment of a user who never set it up.
 func defaultPathEnv(t *testing.T) {
 	t.Helper()
-	for _, kv := range os.Environ() {
-		key, _, _ := strings.Cut(kv, "=")
-		if key == "ROBOREV_HOST_AGENT" || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
-			t.Setenv(key, "")
-			require.NoError(t, os.Unsetenv(key))
-		}
-	}
+	t.Setenv("ROBOREV_HOST_AGENT", "")
+	require.NoError(t, os.Unsetenv("ROBOREV_HOST_AGENT"))
 }
 
 func defaultPathStubs(t *testing.T, commands ...string) {
@@ -54,8 +49,7 @@ func defaultPathResult(name string, err error) string {
 }
 
 // With no host or auto settings and no marker, agent resolution, CI pinning,
-// retries and failover match the upstream base byte for byte. The golden
-// transcript below was generated on 00316ee7 and must not change.
+// retries and failover follow the golden transcript below byte for byte.
 func TestDefaultPathUnchanged(t *testing.T) {
 	configs := []struct {
 		name string
@@ -130,9 +124,8 @@ func TestDefaultPathUnchanged(t *testing.T) {
 					add("failover codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, false))
 					add("retry codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, true))
 				}
-				// HTTP enqueue, not db.EnqueueJob: a named backup must stay
-				// empty here. Pinning it on every ordinary enqueue turns these
-				// rows red.
+				// HTTP enqueue, not db.EnqueueJob: a named backup stays empty
+				// on an ordinary enqueue.
 				add("enqueue: %s", defaultPathEnqueue(t, cfg))
 			})
 		}
