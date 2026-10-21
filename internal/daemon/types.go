@@ -22,6 +22,7 @@ type EnqueueRequest struct {
 	Branch            string   `json:"branch,omitempty"`     // Branch name at time of job creation
 	Since             string   `json:"since,omitempty"`      // RFC3339 lower bound for insights datasets
 	Agent             string   `json:"agent,omitempty"`
+	Host              string   `json:"host,omitempty"`                // local, host, or cursor-cloud; empty keeps the local backend
 	Model             string   `json:"model,omitempty"`               // Model to use (for opencode: provider/model format)
 	DiffContent       string   `json:"diff_content,omitempty"`        // Pre-captured diff for dirty reviews
 	DirtyFiles        []string `json:"dirty_files,omitempty"`         // Unfiltered dirty file names for prompt metadata

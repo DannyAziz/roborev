@@ -51,6 +51,7 @@ func reviewCmd() *cobra.Command {
 		repoPath    string
 		sha         string
 		agent       string
+		host        string
 		model       string
 		reasoning   string
 		reviewType  string
@@ -378,6 +379,7 @@ Examples:
 				GitRef:      gitRef,
 				Branch:      branchName,
 				Agent:       agent,
+				Host:        host,
 				Model:       model,
 				Provider:    provider,
 				Reasoning:   reasoning,
@@ -447,6 +449,7 @@ Examples:
 	cmd.Flags().StringVar(&repoPath, "repo", "", "path to git repository (default: current directory)")
 	cmd.Flags().StringVar(&sha, "sha", "HEAD", "commit SHA to review (used when no positional args)")
 	cmd.Flags().StringVar(&agent, "agent", "", "agent to use (codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok)")
+	cmd.Flags().StringVar(&host, "host", "", "review host: local (default), host, or cursor-cloud. CURSOR_API_KEY alone does not select cursor-cloud")
 	cmd.Flags().StringVar(&model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
 	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard, thorough (default), maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")

@@ -174,7 +174,7 @@ func TestLocalReviewNeverReachesCursorCloud(t *testing.T) {
 		{name: "repo backup agent", repo: "agent = \"codex\"\nbackup_agent = \"cursor-cloud\"\n", want: bindingRefusal},
 		{name: "global backup agent", repo: "agent = \"codex\"\n", global: "default_backup_agent = \"cursor-cloud\"\n", want: bindingRefusal},
 		{name: "CURSOR_API_KEY only", want: "get agent: no configured agent available"},
-		{name: "--host", args: []string{"--host", agent.CursorCloudHost}, repo: "agent = \"test\"\n", want: "unknown flag: --host"},
+		{name: "--host", args: []string{"--host", agent.CursorCloudHost}, repo: "agent = \"test\"\n"},
 		{name: "repo host", repo: "agent = \"test\"\nhost = \"cursor-cloud\"\n"},
 		{name: "global host", repo: "agent = \"test\"\n", global: "host = \"cursor-cloud\"\n"},
 		{name: "ROBOREV_DEFAULT_HOST", repo: "agent = \"test\"\n", env: true},
