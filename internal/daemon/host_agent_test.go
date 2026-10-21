@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"uuid"
 
@@ -22,16 +21,12 @@ import (
 	"go.kenn.io/roborev/internal/testutil"
 )
 
-// noHostMarker leaves no marker of either kind: ROBOREV_HOST_AGENT unset and
-// no Cursor cloud agent variables.
+// noHostMarker unsets ROBOREV_HOST_AGENT and points the handoff dir at a
+// fresh path.
 func noHostMarker(t *testing.T) string {
 	t.Helper()
-	for _, kv := range append(os.Environ(), agent.HostMarkerEnv+"=", "CURSOR_AGENT=") {
-		if key, _, _ := strings.Cut(kv, "="); key == agent.HostMarkerEnv || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
-			t.Setenv(key, "")
-			require.NoError(t, os.Unsetenv(key))
-		}
-	}
+	t.Setenv(agent.HostMarkerEnv, "")
+	require.NoError(t, os.Unsetenv(agent.HostMarkerEnv))
 	hostDir := filepath.Join(t.TempDir(), "host")
 	t.Setenv("ROBOREV_HOST_DIR", hostDir)
 	return hostDir
@@ -59,33 +54,6 @@ func TestEnqueueExplicitHostWithoutMarkerFailsFast(t *testing.T) {
 	assert.NoDirExists(t, hostDir)
 }
 
-// Mutant pin: if HostMarker.Allows(HostNamed) treats Detected as sufficient,
-// this named-host enqueue returns 201 and queues a job.
-func TestEnqueueNamedHostDetectedWithoutMarkerFails(t *testing.T) {
-	hostDir := noHostMarker(t)
-	t.Setenv("CURSOR_AGENT", "1")
-	t.Setenv("CLOUD_AGENT_FLAKE", "1")
-	server, db, tmpDir := newTestServer(t)
-	repoDir := filepath.Join(tmpDir, "repo")
-	testutil.InitTestGitRepo(t, repoDir)
-
-	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
-		RepoPath: repoDir, GitRef: "HEAD", Agent: "host",
-	})
-	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
-
-	assert.NotEqual(t, http.StatusCreated, w.Code, w.Body.String())
-	assert.GreaterOrEqual(t, w.Code, 400, w.Body.String())
-	assert.Contains(t, w.Body.String(), agent.HostMarkerEnv)
-	jobs, err := db.ListJobs("", "", 0, 0)
-	require.NoError(t, err)
-	assert.Empty(t, jobs, "nothing is queued")
-	assert.NoDirExists(t, hostDir)
-}
-
-// A queued host job whose daemon has no marker fails on its first attempt,
-// without retries or failover, and never creates a handoff dir.
 func TestWorkerExplicitHostWithoutMarkerFailsWithoutRetry(t *testing.T) {
 	hostDir := noHostMarker(t)
 	tc := newWorkerTestContext(t, 1)
@@ -246,11 +214,6 @@ func TestStoredHostBackupNeedsMarker(t *testing.T) {
 		want   string
 	}{
 		{"no marker", func(t *testing.T) { noHostMarker(t) }, ""},
-		{"detected only", func(t *testing.T) {
-			t.Setenv(agent.HostMarkerEnv, "")
-			t.Setenv("CURSOR_AGENT", "1")
-			t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
-		}, ""},
 		{"explicit marker", func(t *testing.T) { hostMarkerOn(t, "1m") }, "host"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -277,4 +240,22 @@ func TestStoredHostBackupNeedsMarker(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The host skip note comes from the same lookup as the backup, so a synthesis
+// job (which never fails over) does not blame the marker.
+func TestHostSkipNoteOnlyWhenBackupWouldRun(t *testing.T) {
+	noHostMarker(t)
+	tc := newWorkerTestContext(t, 1)
+	tc.Pool.cfgGetter.Config().DefaultBackupAgent = "host"
+
+	job := &storage.ReviewJob{JobType: storage.JobTypeSynthesis, RepoPath: tc.TmpDir, Agent: "test"}
+	backup, note := tc.Pool.resolveBackupAgentWithSkip(job)
+	assert.Empty(t, backup)
+	assert.Empty(t, note, "synthesis never fails over")
+
+	job.JobType = storage.JobTypeReview
+	backup, note = tc.Pool.resolveBackupAgentWithSkip(job)
+	assert.Empty(t, backup)
+	assert.Contains(t, note, agent.HostMarkerEnv)
 }

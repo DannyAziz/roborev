@@ -1800,7 +1800,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 	} else {
 		// Retries exhausted -- attempt failover to backup agent if this is an agent error
 		if agentError {
-			backupAgent := wp.resolveBackupAgent(job)
+			backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 			if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 				backupModel := wp.resolveBackupModel(job)
 				failedOver, foErr := wp.db.FailoverJob(job.ID, workerID, backupAgent, backupModel)
@@ -1813,7 +1813,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 					return
 				}
 			}
-			errorMsg += wp.skippedHostBackupNote(job)
+			errorMsg += skipNote
 		}
 
 		// No backup or failover failed -- mark as failed
@@ -1846,7 +1846,7 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentContext(
 func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 	workerID string, job *storage.ReviewJob, agentName, errorMsg string,
 ) {
-	backupAgent := wp.resolveBackupAgent(job)
+	backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 	if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 		backupModel := wp.resolveBackupModel(job)
 		failedOver, err := wp.db.FailoverJob(job.ID, workerID, backupAgent, backupModel)
@@ -1860,7 +1860,7 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 			return
 		}
 	}
-	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job))
+	wp.failWithoutRetryLocked(workerID, job, agentName, errorMsg+skipNote)
 }
 
 func (wp *WorkerPool) failWithoutRetryLocked(
@@ -1895,6 +1895,13 @@ func failoverWorkflow(job *storage.ReviewJob) string {
 // Personal CI jobs use only a stored, locally resolved backup. Ordinary jobs
 // retain the workflow-config fallback.
 func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+	backup, _ := wp.resolveBackupAgentWithSkip(job)
+	return backup
+}
+
+// resolveBackupAgentWithSkip is resolveBackupAgent plus a note naming the
+// marker when the backup is host and this daemon has no host model.
+func (wp *WorkerPool) resolveBackupAgentWithSkip(job *storage.ReviewJob) (string, string) {
 	// An explicit per-job backup wins, for reliability: the enqueuer (e.g. a CI
 	// panel synthesis) chose this failover deliberately. Canonicalize the alias
 	// (e.g. "claude" -> "claude-code") via the registry; fall back to the raw
@@ -1902,22 +1909,22 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	// Note: agent.Get resolves from the registry, not PATH, so this does not
 	// require local installation.
 	if job.FrozenExperimentPlan != nil && job.BackupAgent == "" {
-		return ""
+		return "", ""
 	}
 	if job.BackupAgent != "" {
-		if agent.SkippedHostBackupNote(job.BackupAgent) != "" {
-			return ""
+		if note := agent.SkippedHostBackupNote(job.BackupAgent); note != "" {
+			return "", note
 		}
 		if resolved, err := agent.Get(job.BackupAgent); err == nil {
-			return resolved.Name()
+			return resolved.Name(), ""
 		}
-		return job.BackupAgent
+		return job.BackupAgent, ""
 	}
 	if policy, err := personalJobPolicy(job); err != nil || policy != nil {
-		return ""
+		return "", ""
 	}
 	if job.JobType == storage.JobTypeSynthesis {
-		return ""
+		return "", ""
 	}
 	cfg := wp.cfgGetter.Config()
 	configRoot := job.RepoPath
@@ -1928,42 +1935,29 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 		"", configRoot, cfg, failoverWorkflow(job), "",
 	)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	backup := resolution.BackupAgent
 	if backup == "" {
-		return ""
+		return "", ""
+	}
+	if note := agent.SkippedHostBackupNote(backup); note != "" {
+		return "", note
 	}
 	// Resolve exactly the configured backup using the config-aware path so
 	// command overrides and configured ACP aliases participate in failover
 	// without falling through to unrelated agents.
 	resolved, err := agent.GetAvailableExactWithConfig(configRoot, backup, cfg)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	if job.IsGoalReviewJob() && goalreview.ValidateAgent(resolved) != nil {
-		return ""
+		return "", ""
 	}
 	if resolution.AgentMatches(resolved.Name(), job.Agent) {
-		return ""
+		return "", ""
 	}
-	return resolved.Name()
-}
-
-// skippedHostBackupNote names the marker when the job's stored or workflow
-// backup is host but this daemon has no host model.
-func (wp *WorkerPool) skippedHostBackupNote(job *storage.ReviewJob) string {
-	backup := job.BackupAgent
-	if backup == "" && job.FrozenExperimentPlan == nil {
-		configRoot := job.RepoPath
-		if job.IsGoalReviewJob() {
-			configRoot = GoalReviewConfigRepoPath(job)
-		}
-		if res, err := agent.ResolveWorkflowConfig("", configRoot, wp.cfgGetter.Config(), failoverWorkflow(job), ""); err == nil {
-			backup = res.BackupAgent
-		}
-	}
-	return agent.SkippedHostBackupNote(backup)
+	return resolved.Name(), ""
 }
 
 // resolveBackupModel returns the frozen experiment value when present.
@@ -2326,7 +2320,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
 	workerID string, job *storage.ReviewJob,
 	agentName, errorMsg, prefix, label string,
 ) {
-	backupAgent := wp.resolveBackupAgent(job)
+	backupAgent, skipNote := wp.resolveBackupAgentWithSkip(job)
 	if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 		backupModel := wp.resolveBackupModel(job)
 		failedOver, err := wp.db.FailoverJob(
@@ -2343,7 +2337,7 @@ func (wp *WorkerPool) failoverOrFailWithPrefixLocked(
 		}
 	}
 
-	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+wp.skippedHostBackupNote(job), prefix, label)
+	wp.failJobWithPrefixLocked(workerID, job, agentName, errorMsg+skipNote, prefix, label)
 }
 
 func (wp *WorkerPool) failJobWithPrefixLocked(
