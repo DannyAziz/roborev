@@ -1394,6 +1394,8 @@ components:
           type: array
         git_ref:
           type: string
+        host:
+          type: string
         job_type:
           type: string
         min_severity:

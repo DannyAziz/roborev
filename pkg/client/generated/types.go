@@ -1100,6 +1100,7 @@ type EnqueueRequest struct {
 	DiffContent       *string  `json:"diff_content,omitempty"`
 	DirtyFiles        []string `json:"dirty_files,omitempty"`
 	GitRef            *string  `json:"git_ref,omitempty"`
+	Host              *string  `json:"host,omitempty"`
 	JobType           *string  `json:"job_type,omitempty"`
 	MinSeverity       *string  `json:"min_severity,omitempty"`
 	Model             *string  `json:"model,omitempty"`
