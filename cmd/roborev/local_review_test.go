@@ -194,6 +194,59 @@ func cloudCreateFails(t *testing.T) {
 	t.Cleanup(func() { agent.Register(prev) })
 }
 
+func seedStaleRoborevHook(t *testing.T, repoDir string) (string, []byte) {
+	t.Helper()
+	hooks := filepath.Join(repoDir, ".git", "hooks")
+	require.NoError(t, os.MkdirAll(hooks, 0o755))
+	path := filepath.Join(hooks, "post-commit")
+	body := []byte("#!/bin/sh\n# roborev stale-hook-canary\necho stale-hook-canary\n")
+	require.NoError(t, os.WriteFile(path, body, 0o755))
+	return path, body
+}
+
+func TestLocalReviewRefusesLevelCursorCloudBeforeHooks(t *testing.T) {
+	cloudCreateFails(t)
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	h := newReviewHarness(t)
+	require.NoError(t, os.WriteFile(filepath.Join(h.Dir, "dirty.txt"), []byte("dirty-local-diff\n"), 0o644))
+	h.writeConfig("review_agent_thorough = \"cursor-cloud\"\n")
+	hookPath, hookBody := seedStaleRoborevHook(t, h.Dir)
+	err := h.runCmd("--local", "--repo", h.Dir, "--dirty")
+	require.ErrorContains(t, err, "--local cannot use a cursor-cloud host")
+	got, readErr := os.ReadFile(hookPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, hookBody, got)
+}
+
+func TestRunLocalReviewNameGuardRefusesCursorCloud(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v0/agents" {
+			posts.Add(1)
+		}
+		http.Error(w, "create called", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	prev, err := agent.Get(agent.CursorCloudHost)
+	require.NoError(t, err)
+	agent.Register(&agent.CursorCloudAgent{
+		Client:  cursorcloud.NewHTTPClient("cursor-test-secret-not-real", cursorcloud.WithBaseURL(srv.URL)),
+		RepoURL: "https://github.com/example/repo.git",
+	})
+	t.Cleanup(func() { agent.Register(prev) })
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	h := newReviewHarness(t)
+	h.writeConfig("review_agent_thorough = \"cursor-cloud\"\n")
+	h.Cmd.SetContext(context.Background())
+	err = runLocalReview(h.Cmd, h.Dir, "HEAD", "DIRTY-DIFF-CANARY", []string{"dirty.txt"}, "", "", "", "", "", false, "")
+	require.ErrorContains(t, err, "--local cannot use a cursor-cloud host")
+	assert.Equal(t, int32(0), posts.Load())
+}
+
 func TestLocalReviewRefusesCursorCloudBeforeHooks(t *testing.T) {
 	cloudCreateFails(t)
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
@@ -332,7 +385,7 @@ func TestLocalReviewNeverReachesCursorCloud(t *testing.T) {
 		{name: "--agent cursor-cloud --dirty", args: []string{"--agent", agent.CursorCloudHost, "--dirty"}, want: localRefusal},
 		{name: "repo agent", repo: "agent = \"cursor-cloud\"\n", want: localRefusal},
 		{name: "repo workflow agent", repo: "review_agent = \"cursor-cloud\"\n", want: localRefusal},
-		{name: "repo level agent", repo: "review_agent_thorough = \"cursor-cloud\"\n", want: "no configured agent available"},
+		{name: "repo level agent", repo: "review_agent_thorough = \"cursor-cloud\"\n", want: localRefusal},
 		{name: "global default agent", global: "default_agent = \"cursor-cloud\"\n", want: localRefusal},
 		{name: "global workflow agent", global: "review_agent = \"cursor-cloud\"\n", want: localRefusal},
 		{name: "repo backup agent", repo: "agent = \"codex\"\nbackup_agent = \"cursor-cloud\"\n", want: localRefusal},

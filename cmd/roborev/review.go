@@ -517,6 +517,15 @@ func refuseLocalCursorCloud(repoPath, hostFlag, agentName, reviewType, reasoning
 	if !agentsToo {
 		return nil
 	}
+	// An empty --reasoning flag is not "no level". The review default is
+	// thorough, and review_agent_<level> is selected only after that
+	// resolution. Match runLocalReview so the refusal sees the same agent.
+	reasoning, err = config.ResolveReviewReasoningForTypeFromConfig(
+		reasoning, repoCfg, cfg, reviewType,
+	)
+	if err != nil {
+		return fmt.Errorf("invalid reasoning: %w", err)
+	}
 	workflow := config.WorkflowForReviewType(reviewType)
 	if err := config.ValidateRepoConfig(repoPath); err != nil {
 		return fmt.Errorf("resolve workflow config: %w", err)
