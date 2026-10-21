@@ -514,6 +514,9 @@ func refuseLocalCursorCloud(repoPath, hostFlag, agentName, reviewType, reasoning
 	if chosen == agent.CursorCloudHost {
 		return errors.New("--local cannot use a cursor-cloud host")
 	}
+	if chosen != agent.ReviewHostLocal {
+		return fmt.Errorf("--local cannot use host %q", chosen)
+	}
 	if !agentsToo {
 		return nil
 	}

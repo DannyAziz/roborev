@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -124,7 +123,6 @@ func (h *reviewHarness) run(opts runOpts) error {
 
 func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 	var httpCalls atomic.Int32
-	var launchRows atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		httpCalls.Add(1)
 	}))
@@ -132,35 +130,35 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 
 	prev, err := agent.Get(agent.CursorCloudHost)
 	require.NoError(t, err)
-	cloud := &agent.CursorCloudAgent{
+	agent.Register(&agent.CursorCloudAgent{
 		Client:  cursorcloud.NewHTTPClient("cursor-test-secret-not-real", cursorcloud.WithBaseURL(srv.URL)),
 		RepoURL: "https://github.com/example/repo.git",
-	}
-	if field := reflect.ValueOf(cloud).Elem().FieldByName("BindLaunch"); field.IsValid() && field.CanSet() {
-		field.Set(reflect.MakeFunc(field.Type(), func([]reflect.Value) []reflect.Value {
-			launchRows.Add(1)
-			return []reflect.Value{reflect.Zero(field.Type().Out(0))}
-		}))
-	}
-	agent.Register(cloud)
+	})
 	t.Cleanup(func() { agent.Register(prev) })
 
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
 	for _, tc := range []struct {
-		name string
-		args []string
-		cfg  string
-		env  bool
+		name   string
+		args   []string
+		cfg    string
+		global string
+		env    bool
 	}{
 		{name: "--host", args: []string{"--host", agent.CursorCloudHost}},
 		{name: ".roborev.toml host", cfg: "host = \"cursor-cloud\"\n"},
+		{name: "global config", global: "host = \"cursor-cloud\"\n"},
 		{name: "ROBOREV_DEFAULT_HOST", env: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			httpCalls.Store(0)
-			launchRows.Store(0)
 			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
 			t.Setenv(agent.EnvDefaultHost, "")
 			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+			if tc.global != "" {
+				require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(tc.global), 0o600))
+			} else {
+				_ = os.Remove(config.GlobalConfigPath())
+			}
 			if tc.env {
 				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
 			}
@@ -171,7 +169,6 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 			err := h.runCmd(append([]string{"--local", "--repo", h.Dir, "--quiet"}, tc.args...)...)
 			require.ErrorContains(t, err, "--local cannot use a cursor-cloud host")
 			assert.Equal(t, int32(0), httpCalls.Load())
-			assert.Equal(t, int32(0), launchRows.Load())
 		})
 	}
 }
@@ -277,10 +274,21 @@ func TestLocalReviewRefusesCursorCloudBeforeHooks(t *testing.T) {
 	t.Setenv(agent.EnvDefaultHost, "")
 	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
 	h := newReviewHarness(t)
+	hookPath, hookBody := seedStaleRoborevHook(t, h.Dir)
 	err := h.runCmd("--local", "--repo", h.Dir, "--host", agent.CursorCloudHost)
 	require.ErrorContains(t, err, "--local cannot use a cursor-cloud host")
-	_, statErr := os.Stat(filepath.Join(h.Dir, ".git", "hooks", "post-commit"))
-	require.ErrorIs(t, statErr, os.ErrNotExist)
+	got, readErr := os.ReadFile(hookPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, hookBody, got)
+}
+
+func TestLocalReviewRejectsNonLocalHost(t *testing.T) {
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv(agent.HostMarkerEnv, "1")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	h := newReviewHarness(t)
+	err := h.runCmd("--local", "--repo", h.Dir, "--host", "host", "--quiet")
+	require.ErrorContains(t, err, "--local cannot use host \"host\"")
 }
 
 func TestLocalReviewRefusesCursorCloudAgentRoutes(t *testing.T) {
