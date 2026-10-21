@@ -697,6 +697,7 @@ func panelMemberOpts(
 		if err != nil {
 			return nil, fmt.Errorf("panel member %q: %w", m.Name, err)
 		}
+		o.BackupAuto = backupIsAuto(repoCfg, cfg, workflowForPanelReviewType(m.ReviewType))
 		o.Provider = m.Provider
 		o.Reasoning, o.ReviewType = m.Reasoning, m.ReviewType
 		o.PanelRunUUID, o.PanelRole = &runUUID, storage.PanelRoleMember
@@ -725,8 +726,8 @@ func resolvePanelMemberExecution(
 		strings.TrimSpace(resolution.BackupAgent) != ""
 	var selected agent.Agent
 	if strictWorkflowAgent {
-		selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-			repoCfg, resolution.PreferredAgent, cfg, resolution.BackupAgent,
+		selected, err = agent.GetPreferredOrBackupEligible(
+			repoCfg, resolution.PreferredAgent, cfg, autoBackupEligible(m.ReviewType), resolution.BackupAgent,
 		)
 	} else {
 		selected, err = agent.GetAvailableWithConfigFromConfig(
@@ -752,7 +753,7 @@ func resolvePanelMemberExecution(
 		model = override
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, selectedName, repoCfg, cfg,
+		resolution, m.ReviewType, selectedName, repoCfg, cfg,
 	)
 	return selectedName, model, backupAgent, backupModel, nil
 }

@@ -19,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PostgreSQL schema version - increment when schema changes
+// pgSchemaVersion is the newest schema this binary will write.
 const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables

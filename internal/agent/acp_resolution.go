@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 
@@ -159,6 +160,10 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
 	if !ok {
 		return false
 	}
+	if name == hostAgentName {
+		// Only a lookup that names host gets here: automatic picks skip it.
+		return HostAllowed()
+	}
 	ca, ok := a.(CommandAgent)
 	if !ok {
 		return true // non-command agents (e.g. test) are always available
@@ -185,9 +190,7 @@ func GetPreferredOrBackupWithConfig(
 	if strings.TrimSpace(repoPath) != "" {
 		repoCfg, _ = config.LoadRepoConfig(repoPath)
 	}
-	return GetPreferredOrBackupWithConfigFromConfig(
-		repoCfg, preferred, cfg, backups...,
-	)
+	return GetPreferredOrBackupEligible(repoCfg, preferred, cfg, nil, backups...)
 }
 
 // GetPreferredOrBackupWithConfigFromConfig is the config-taking core of
@@ -198,8 +201,36 @@ func GetPreferredOrBackupWithConfigFromConfig(
 	cfg *config.Config,
 	backups ...string,
 ) (Agent, error) {
+	return GetPreferredOrBackupEligible(repoCfg, preferred, cfg, nil, backups...)
+}
+
+// GetPreferredOrBackupEligible is GetPreferredOrBackupWithConfigFromConfig
+// with a capability filter for "auto" picks. Named preferred and named backups
+// are unchanged; an "auto" preferred agent or backup skips agents that
+// eligible rejects. nil eligible accepts any agent, matching ResolveAutoBackup.
+func GetPreferredOrBackupEligible(
+	repoCfg *config.RepoConfig,
+	preferred string,
+	cfg *config.Config,
+	eligible func(string) bool,
+	backups ...string,
+) (Agent, error) {
+	backups, autoBackup := splitAuto(backups)
+	if agentname.IsAuto(preferred) {
+		// No named preference: the first eligible agent in the normal order.
+		if eligible != nil {
+			if name := resolveAutoBackup(repoCfg, cfg, "", eligible, true); name != "" {
+				return GetAvailableWithConfigFromConfig(repoCfg, name, cfg)
+			}
+		}
+		return GetAvailableWithConfigFromConfig(repoCfg, "", cfg, backups...)
+	}
+
 	rawPreferred := strings.TrimSpace(preferred)
 	preferred = resolveAlias(rawPreferred)
+	if err := requestedHostError(preferred); err != nil {
+		return nil, err
+	}
 
 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
@@ -216,7 +247,7 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		if ok {
 			return backup, nil
 		}
-		return nil, unavailablePreferredBackupError(rawPreferred, backups)
+		return strictAutoBackupOr(repoCfg, cfg, rawPreferred, backups, autoBackup, eligible)
 	}
 
 	if preferred != "" {
@@ -241,12 +272,27 @@ func GetPreferredOrBackupWithConfigFromConfig(
 		return backup, nil
 	}
 
-	return nil, unavailablePreferredBackupError(preferred, backups)
+	return strictAutoBackupOr(repoCfg, cfg, preferred, backups, autoBackup, eligible)
+}
+
+// strictAutoBackupOr resolves the "auto" backup of a strict lookup once the
+// named agents are unavailable: the normal order other than preferred, never
+// host, which a strict lookup only uses when it is named. eligible filters
+// that auto pick (nil accepts any).
+func strictAutoBackupOr(repoCfg *config.RepoConfig, cfg *config.Config, preferred string, backups []string, autoBackup bool, eligible func(string) bool) (Agent, error) {
+	named := backups
+	if autoBackup {
+		if name := resolveAutoBackup(repoCfg, cfg, preferred, eligible, false); name != "" {
+			return GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
+		}
+		named = append(slices.Clone(backups), agentname.Auto)
+	}
+	return nil, withSkippedHostNote(unavailablePreferredBackupError(preferred, named), backups)
 }
 
 // AvailableNamesFromConfig returns built-in and effective named ACP agents.
 func AvailableNamesFromConfig(repoCfg *config.RepoConfig, cfg *config.Config) []string {
-	known := Available()
+	known := ListedAgentNames()
 	for name := range config.ResolveACPAgentConfigsFromConfig(repoCfg, cfg) {
 		known = append(known, namedACPAgentName(name))
 	}
@@ -309,6 +355,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 	if rawName == "" {
 		return nil, fmt.Errorf("empty agent name")
 	}
+	if agentname.IsAuto(rawName) {
+		return GetAvailableWithConfigFromConfig(repoCfg, "", cfg)
+	}
 
 	if isConfiguredACPAgentNameFromConfig(rawName, cfg, repoCfg) {
 		configured, err := configuredACPAgentFromConfig(rawName, repoCfg, cfg)
@@ -322,6 +371,9 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 	}
 
 	canonical := resolveAlias(rawName)
+	if err := requestedHostError(canonical); err != nil {
+		return nil, err
+	}
 	a, err := Get(canonical)
 	if err != nil {
 		return nil, &UnknownAgentError{
@@ -349,8 +401,11 @@ func GetAvailableExactWithConfigFromConfig(repoCfg *config.RepoConfig, name stri
 // GetAvailableWithConfigFromConfig resolves an available agent using already
 // loaded repo config, never reading repo config from the working tree.
 func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred string, cfg *config.Config, backups ...string) (Agent, error) {
-	rawPreferred := strings.TrimSpace(preferred)
+	rawPreferred := strings.TrimSpace(withoutAuto(preferred))
 	preferred = resolveAlias(rawPreferred)
+	if err := requestedHostError(preferred); err != nil {
+		return nil, err
+	}
 
 	if isConfiguredACPAgentNameFromConfig(rawPreferred, cfg, repoCfg) {
 		acpAgent, err := configuredACPAgentFromConfig(rawPreferred, repoCfg, cfg)
@@ -370,7 +425,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 		}
 
 		// Finally fall back to config-aware auto-selection.
-		return getAvailableFallbackWithConfig("", repoCfg, cfg)
+		return getAvailableFallbackWithConfig("", repoCfg, cfg, backups)
 	}
 
 	// Check the preferred agent using config command overrides before
@@ -407,7 +462,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 	}
 
 	if cfg != nil {
-		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg)
+		return getAvailableFallbackWithConfig(preferred, repoCfg, cfg, backups)
 	}
 
 	resolved, err := GetAvailable(preferred, backups...)
@@ -417,7 +472,7 @@ func GetAvailableWithConfigFromConfig(repoCfg *config.RepoConfig, preferred stri
 	return applyAgentConfigOverrides(applyCommandOverrides(resolved, cfg), cfg), nil
 }
 
-func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config) (Agent, error) {
+func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig, cfg *config.Config, backups []string) (Agent, error) {
 	for _, name := range fallbackAgentOrder {
 		if name == preferred {
 			continue
@@ -432,13 +487,13 @@ func getAvailableFallbackWithConfig(preferred string, repoCfg *config.RepoConfig
 
 	var available []string
 	for _, name := range Available() {
-		if name != "test" && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
+		if name != "test" && name != hostAgentName && isAvailableWithConfigFromConfig(name, repoCfg, cfg) {
 			available = append(available, name)
 		}
 	}
 
 	if len(available) == 0 {
-		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
+		return hostLastResortOr(fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", ")), backups)
 	}
 
 	a, _ := Get(available[0])

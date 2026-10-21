@@ -24,6 +24,7 @@ import (
 	googlegithub "github.com/google/go-github/v91/github"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 	gitpkg "go.kenn.io/roborev/internal/git"
 	ghpkg "go.kenn.io/roborev/internal/github"
@@ -849,6 +850,9 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 	if !cfg.CI.Personal.Enabled {
 		members = p.maybeAppendDesignMember(ctx, members, repo, repoCfg, cfg, mergeBase, pr.HeadRefOid)
 	}
+	if err := refuseHostForCI(members, synth); err != nil {
+		return false, &ciConfigurationError{err: err}
+	}
 
 	memberOpts, synthOpts, err := p.buildPanelOpts(
 		ctx,
@@ -1254,8 +1258,8 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 			)
 		} else {
-			selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+			selected, err = agent.GetPreferredOrBackupEligible(
+				repoCfg, resolvedAgent, cfg, autoBackupEligible(member.ReviewType), resolution.BackupAgent,
 			)
 		}
 		if err != nil {
@@ -1284,14 +1288,14 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 		model = override
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, resolvedAgent, repoCfg, cfg,
+		resolution, member.ReviewType, resolvedAgent, repoCfg, cfg,
 	)
 	return resolvedAgent, model, backupAgent, backupModel, nil
 }
 
 func backupExecutionForSelectedAgent(
 	resolution agent.WorkflowConfig,
-	selectedAgent string,
+	reviewType, selectedAgent string,
 	repoCfg *config.RepoConfig,
 	cfg *config.Config,
 ) (string, string) {
@@ -1299,8 +1303,29 @@ func backupExecutionForSelectedAgent(
 	if backupAgent == "" || resolution.AgentMatches(selectedAgent, backupAgent) {
 		return "", ""
 	}
+	// An "auto" backup is pinned to a concrete agent other than the selected
+	// one now, so failover is a single hop. It gets no model: configured
+	// backup models name a model for a specific agent, not whatever auto finds.
+	if agentname.IsAuto(backupAgent) {
+		name := agent.ResolveAutoBackup(repoCfg, cfg, selectedAgent, autoBackupEligible(reviewType))
+		if resolution.AgentMatches(selectedAgent, name) {
+			return "", ""
+		}
+		return name, ""
+	}
 	return agent.StorageNameFromConfig(backupAgent, repoCfg, cfg),
 		resolution.ModelForSelectedAgent(backupAgent, "")
+}
+
+// pinnedAutoBackup is the concrete agent an "auto" workflow backup stands for
+// at enqueue, so failover is a single hop. Named workflow backups keep
+// failover-time resolution.
+func pinnedAutoBackup(resolution agent.WorkflowConfig, reviewType, selectedAgent string) string {
+	if !agentname.IsAuto(strings.TrimSpace(resolution.BackupAgent)) {
+		return ""
+	}
+	name, _ := backupExecutionForSelectedAgent(resolution, reviewType, selectedAgent, resolution.RepoConfig, resolution.GlobalConfig)
+	return name
 }
 
 // resolveMatrixMemberAgent resolves the effective agent and model for one
@@ -1335,8 +1360,8 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 			)
 		} else {
-			selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-				repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+			selected, err = agent.GetPreferredOrBackupEligible(
+				repoCfg, resolvedAgent, cfg, autoBackupEligible(entry.ReviewType), resolution.BackupAgent,
 			)
 		}
 		if err != nil {
@@ -1358,7 +1383,7 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 		)
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, resolvedAgent, repoCfg, cfg,
+		resolution, entry.ReviewType, resolvedAgent, repoCfg, cfg,
 	)
 	ciModel := cfg.CI.Model
 	if config.ExperimentOverridesWorkflowModel(repoCfg, workflow, reasoning) {
@@ -1538,7 +1563,7 @@ func (p *CIPoller) maybeAppendDesignMember(
 				designModel = override
 			}
 			backupAgent, backupModel = backupExecutionForSelectedAgent(
-				resolution, designAgent, repoCfg, cfg,
+				resolution, config.ReviewTypeDesign, designAgent, repoCfg, cfg,
 			)
 		}
 		return append(members, config.ResolvedMember{
@@ -1604,6 +1629,22 @@ func (p *CIPoller) commitWarrantsDesign(
 		log.Printf("CI poller: auto-design Classify error for %s: %v; including design (fail open)", gitpkg.ShortSHA(sha), err)
 		return true
 	}
+}
+
+// refuseHostForCI rejects a CI run that names the host agent as a reviewer,
+// synthesizer or backup. CI reviews run unattended, and a host handoff would hold
+// a worker until ROBOREV_HOST_TIMEOUT with nobody watching.
+func refuseHostForCI(members []config.ResolvedMember, synth config.SynthesisSpec) error {
+	names := []string{synth.Agent, synth.BackupAgent}
+	for _, m := range members {
+		names = append(names, m.Agent, m.BackupAgent)
+	}
+	for _, name := range names {
+		if agent.CanonicalName(name) == "host" {
+			return errors.New("the host agent cannot run CI reviews: choose a CLI agent for CI")
+		}
+	}
+	return nil
 }
 
 // buildPanelOptsInput groups the inputs buildPanelOpts threads through, keeping
@@ -1684,6 +1725,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			Model:                 m.Model,
 			BackupAgent:           m.BackupAgent,
 			BackupModel:           m.BackupModel,
+			BackupAuto:            backupIsAuto(in.repoCfg, in.cfg, config.WorkflowForReviewType(m.ReviewType)),
 			Provider:              m.Provider,
 			Reasoning:             m.Reasoning,
 			ReviewType:            m.ReviewType,

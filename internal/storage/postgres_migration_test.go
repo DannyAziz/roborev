@@ -315,3 +315,17 @@ func TestPostgresMigration_BackupColumns(t *testing.T) { //nolint:paralleltest /
 	require.Empty(t, ba)
 	require.Empty(t, bm)
 }
+
+// TestPostgresMigration_EnsureSchemaKeepsCurrentVersion checks that running
+// EnsureSchema on a database already at pgSchemaVersion leaves its version
+// unchanged.
+func TestPostgresMigration_EnsureSchemaKeepsCurrentVersion(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	pg := openTestPgPool(t)
+	defer pg.Close()
+	ctx := context.Background()
+	require.NoError(t, pg.EnsureSchema(ctx))
+
+	var version int
+	require.NoError(t, pgxPool(pg).QueryRow(ctx, `SELECT MAX(version) FROM roborev.schema_version`).Scan(&version))
+	assert.Equal(t, pgSchemaVersion, version)
+}

@@ -99,6 +99,9 @@ func doctorAgentNames(env *doctorEnv) []string {
 	for _, ref := range env.experimentAgentReferences() {
 		add(ref.Name)
 	}
+	if agent.HostAllowed() {
+		add("host") // so the path check can tell whether the daemon has the marker too
+	}
 	return names
 }
 

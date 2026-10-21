@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -45,6 +46,9 @@ Examples:
 			}
 
 			names := agent.AvailableNamesFromConfig(repoCfg, cfg)
+			if agentFilter == "host" && !slices.Contains(names, "host") {
+				names = append(names, "host")
+			}
 
 			timeout := time.Duration(timeoutSecs) * time.Second
 			smokePrompt := "Respond with exactly: OK"
@@ -60,6 +64,17 @@ Examples:
 					continue
 				}
 				if agentFilter != "" && name != agentFilter {
+					continue
+				}
+				if name == "host" {
+					// A smoke test would block on a handoff nobody answers.
+					if _, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg); err != nil {
+						fmt.Printf("  x %-14s FAIL: %s\n", name, err)
+						failed++
+						continue
+					}
+					fmt.Printf("  - %-14s not smoke-tested: reviews are handed off to the attached host model\n", name)
+					skipped++
 					continue
 				}
 

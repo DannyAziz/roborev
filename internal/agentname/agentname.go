@@ -9,6 +9,16 @@ import (
 
 const ACPPrefix = "acp."
 
+// Auto is an agent-valued setting, not an agent: it asks for roborev's normal
+// availability order instead of a named agent. It resolves to host only as the last resort
+// under ROBOREV_HOST_AGENT=1.
+const Auto = "auto"
+
+// IsAuto reports whether name is the Auto selection keyword.
+func IsAuto(name string) bool {
+	return strings.TrimSpace(name) == Auto
+}
+
 var canonicalByName = map[string]string{
 	"codex":       "codex",
 	"claude-code": "claude-code",
@@ -25,6 +35,7 @@ var canonicalByName = map[string]string{
 	"grok":        "grok",
 	"grok-build":  "grok",
 	"acp":         "acp",
+	"host":        "host",
 	"test":        "test",
 }
 
@@ -67,7 +78,7 @@ func ValidateReference(name string) error {
 	if name == "" {
 		return nil
 	}
-	if _, builtIn := BuiltIn(name); builtIn {
+	if _, builtIn := BuiltIn(name); builtIn || name == Auto {
 		return nil
 	}
 	if _, canonicalACP := ACPConfigName(name); canonicalACP {

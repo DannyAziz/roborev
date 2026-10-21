@@ -17,7 +17,7 @@ func registerAgentCompletion(cmd *cobra.Command) {
 	if err := cmd.RegisterFlagCompletionFunc("agent", func(cmd *cobra.Command, _ []string, _ string) ([]cobra.Completion, cobra.ShellCompDirective) {
 		cfg, err := config.LoadGlobal()
 		if err != nil {
-			return agent.Available(), cobra.ShellCompDirectiveNoFileComp
+			return agent.ListedAgentNames(), cobra.ShellCompDirectiveNoFileComp
 		}
 		repoCfg, _, _ := loadCommandRepoConfig(cmd)
 		return agent.AvailableNamesFromConfig(repoCfg, cfg), cobra.ShellCompDirectiveNoFileComp

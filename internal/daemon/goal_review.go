@@ -16,6 +16,7 @@ import (
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/goalreview"
 	"go.kenn.io/roborev/internal/kata"
@@ -84,7 +85,8 @@ func (s *Server) enqueueGoalReviewWithConfig(ctx context.Context, req EnqueueReq
 	if filepath.Clean(root) != filepath.Clean(mainRoot) {
 		worktree = root
 	}
-	job, err := s.db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, GitRef: snapshot.ID(), Branch: gitrepo.CurrentBranch(ctx, root), Agent: a.Name(), Model: resolution.ModelForSelectedAgent(a.Name(), req.Model), Provider: req.Provider, RequestedModel: req.Model, RequestedProvider: req.Provider, Reasoning: reasoning, ReviewType: config.ReviewTypeGoal, JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true, Label: "Superpowers " + snapshot.Stage + " review", WorktreePath: worktree, Source: req.Source})
+	backup := pinnedAutoBackup(resolution, config.ReviewTypeGoal, a.Name())
+	job, err := s.db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, GitRef: snapshot.ID(), Branch: gitrepo.CurrentBranch(ctx, root), Agent: a.Name(), BackupAgent: backup, BackupAuto: agentname.IsAuto(resolution.BackupAgent), Model: resolution.ModelForSelectedAgent(a.Name(), req.Model), Provider: req.Provider, RequestedModel: req.Model, RequestedProvider: req.Provider, Reasoning: reasoning, ReviewType: config.ReviewTypeGoal, JobType: storage.JobTypeGoalReview, Prompt: goalreview.BuildPrompt(snapshot), PromptPrebuilt: true, Label: "Superpowers " + snapshot.Stage + " review", WorktreePath: worktree, Source: req.Source})
 	if err != nil {
 		return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}

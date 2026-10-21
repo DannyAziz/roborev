@@ -174,6 +174,9 @@ var allAgentSpecs = []agentSpec{
 		DefaultCommand: defaultACPCommand,
 	},
 	{
+		Name: hostAgentName,
+	},
+	{
 		Name: "test",
 	},
 }

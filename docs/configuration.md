@@ -1095,8 +1095,8 @@ filter_branch = false             # Show all branches on startup (default: curre
 
 | Option | Type | Default | Description | Hot-Reload |
 |--------|------|---------|-------------|------------|
-| `default_agent` | string | auto-detect | Default AI agent to use | Yes |
-| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
+| `default_agent` | string | auto-detect | Default AI agent to use. `auto` uses the availability order and pairs `default_model` only when it lands on `default_agent` (a workflow model beside `auto` is never paired). `host` needs `ROBOREV_HOST_AGENT=1`; see [Host Model Handoff](agents/index.md#host-model-handoff) | Yes |
+| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails. `auto` picks the first available agent, other than the primary, that can run the job, with no model. Ordinary enqueue, CI, panel, fix and goal reviews pin an `auto` backup when queued and keep it, even when nothing was found; a rerun pins it again. A named backup on an ordinary review is resolved at failover unless an experiment freezes it. A `host` backup is skipped without `ROBOREV_HOST_AGENT=1` | Yes |
 | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |

@@ -42,7 +42,9 @@ func ResolveAgent(root string, cfg *config.Config, options AgentOptions) (agent.
 	if err != nil {
 		return nil, "", err
 	}
-	a, err := agent.GetPreferredOrBackupWithConfig(root, resolution.PreferredAgent, cfg, resolution.BackupAgent)
+	a, err := agent.GetPreferredOrBackupEligible(
+		resolution.RepoConfig, resolution.PreferredAgent, cfg, goalCapable, resolution.BackupAgent,
+	)
 	if err != nil {
 		return nil, "", err
 	}
@@ -57,4 +59,12 @@ func ResolveAgent(root string, cfg *config.Config, options AgentOptions) (agent.
 		}
 	}
 	return a, reasoning, ValidateAgent(a)
+}
+
+// goalCapable accepts agents that can run a goal review. An "auto" backup
+// uses this so a missing pi hops to Claude instead of Codex, which the
+// later ValidateAgent check would reject.
+func goalCapable(name string) bool {
+	a, err := agent.Get(name)
+	return err == nil && ValidateAgent(a) == nil
 }

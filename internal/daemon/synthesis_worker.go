@@ -444,6 +444,11 @@ func (wp *WorkerPool) runSynthesisAgent(
 			)
 			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 		}
+		if agent.CanonicalName(agentName) == "host" {
+			// A host handoff timeout is not retried on the same agent.
+			wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
+			return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
+		}
 		wp.failOrRetryAgentContext(ctx, workerID, job, agentName, fmt.Sprintf("agent: %v", err))
 		return reviewpkg.SynthesisDocument{}, agentName, sessionWriter.SessionID(), err
 	}
@@ -468,7 +473,7 @@ func (wp *WorkerPool) configureSynthesisAgentContext(
 	cfg := wp.cfgGetter.Config()
 	baseAgent, err := resolveConfiguredJobAgent(job, cfg, job.BackupAgent)
 	if err != nil {
-		wp.failOrRetryAgentContext(ctx, workerID, job, job.Agent, fmt.Sprintf("get agent: %v", err))
+		wp.failGetAgentContext(ctx, workerID, job, err)
 		return nil, "", err
 	}
 

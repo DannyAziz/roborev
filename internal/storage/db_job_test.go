@@ -2436,6 +2436,7 @@ func TestGetJobsToSyncIncludesBackupColumns(t *testing.T) {
 	job, err := db.EnqueueJob(EnqueueOpts{
 		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
 		JobType: JobTypeReview, BackupAgent: "gemini", BackupModel: "gemini-2.5-pro",
+		BackupAuto: true,
 	})
 	require.NoError(t, err)
 	setStatus(t, db, job.ID, JobStatusDone)
@@ -2445,6 +2446,9 @@ func TestGetJobsToSyncIncludesBackupColumns(t *testing.T) {
 	require.Len(t, jobs, 1)
 	assert.Equal("gemini", jobs[0].BackupAgent)
 	assert.Equal("gemini-2.5-pro", jobs[0].BackupModel)
+	var auto int
+	require.NoError(t, db.QueryRow(`SELECT backup_auto FROM review_jobs WHERE id = ?`, job.ID).Scan(&auto))
+	assert.Equal(1, auto, "the auto pin stays on the local row")
 }
 
 func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
@@ -2470,12 +2474,64 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 	require.NoError(t, db.UpsertPulledJob(pulled, repo.ID, nil))
 
 	var ba, bm string
+	var auto int
 	row := db.QueryRow(
-		`SELECT COALESCE(backup_agent,''), COALESCE(backup_model,'') FROM review_jobs WHERE uuid = ?`, pulled.UUID,
+		`SELECT COALESCE(backup_agent,''), COALESCE(backup_model,''), backup_auto FROM review_jobs WHERE uuid = ?`, pulled.UUID,
 	)
-	require.NoError(t, row.Scan(&ba, &bm))
+	require.NoError(t, row.Scan(&ba, &bm, &auto))
 	assert.Equal("copilot", ba)
 	assert.Equal("gpt-5", bm)
+	assert.Equal(0, auto, "a pulled job does not import backup_auto")
+}
+
+func TestBackupAutoStaysLocalAcrossSync(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	src := openTestDB(t)
+	t.Cleanup(func() { src.Close() })
+	machineID, err := src.GetMachineID()
+	require.NoError(t, err)
+
+	repo := createRepo(t, src, "/tmp/backup-auto-sync")
+	commit := createCommit(t, src, repo.ID, "abc123")
+	job, err := src.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+		JobType: JobTypeReview, BackupAgent: "claude-code", BackupAuto: true,
+	})
+	require.NoError(t, err)
+	setStatus(t, src, job.ID, JobStatusDone)
+
+	outgoing, err := src.GetJobsToSync(machineID, 100)
+	require.NoError(t, err)
+	require.Len(t, outgoing, 1)
+	assert.Equal("claude-code", outgoing[0].BackupAgent)
+	var srcAuto int
+	require.NoError(t, src.QueryRow(`SELECT backup_auto FROM review_jobs WHERE id = ?`, job.ID).Scan(&srcAuto))
+	assert.Equal(1, srcAuto, "the enqueueing database keeps the auto pin")
+
+	dst := openTestDB(t)
+	t.Cleanup(func() { dst.Close() })
+	dstRepo := createRepo(t, dst, "/tmp/backup-auto-pull")
+	require.NoError(t, dst.UpsertPulledJob(PulledJob{
+		UUID:            outgoing[0].UUID,
+		GitRef:          outgoing[0].GitRef,
+		Agent:           outgoing[0].Agent,
+		Reasoning:       "thorough",
+		JobType:         JobTypeReview,
+		Status:          "done",
+		EnqueuedAt:      outgoing[0].EnqueuedAt,
+		UpdatedAt:       time.Now(),
+		SourceMachineID: testUUID("remote-machine"),
+		BackupAgent:     outgoing[0].BackupAgent,
+		BackupModel:     outgoing[0].BackupModel,
+	}, dstRepo.ID, nil))
+
+	var id int64
+	require.NoError(t, dst.QueryRow(`SELECT id FROM review_jobs WHERE uuid = ?`, outgoing[0].UUID).Scan(&id))
+	got, err := dst.GetJobByID(id)
+	require.NoError(t, err)
+	assert.Equal("claude-code", got.BackupAgent)
+	assert.False(got.BackupAuto, "the receiving database does not learn the auto pin")
 }
 
 func TestClaimJobHydratesUUID(t *testing.T) {

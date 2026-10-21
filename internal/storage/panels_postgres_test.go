@@ -95,4 +95,10 @@ func TestPostgresBackupColumnRoundTrip(t *testing.T) { //nolint:paralleltest // 
 	require.NotNil(t, found, "job not pulled back")
 	assert.Equal("claude-code", found.BackupAgent)
 	assert.Equal("opus", found.BackupModel)
+	var autoCols int
+	require.NoError(t, pool.Pool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = 'roborev' AND table_name = 'review_jobs' AND column_name = 'backup_auto'
+	`).Scan(&autoCols))
+	assert.Equal(0, autoCols, "backup_auto is not a postgres column")
 }

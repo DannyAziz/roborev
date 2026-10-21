@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -84,7 +85,31 @@ func writeFakeAgentBinary(t *testing.T, name string) string {
 	return dir
 }
 
+// doctorHostModes are the marker states: unset, ROBOREV_HOST_AGENT=0, and =1.
+var doctorHostModes = []string{"none", "zero", "explicit"}
+
+func setDoctorHostMode(t *testing.T, mode string) {
+	t.Helper()
+	t.Setenv(agent.HostMarkerEnv, "")
+	require.NoError(t, os.Unsetenv(agent.HostMarkerEnv))
+	switch mode {
+	case "zero":
+		t.Setenv(agent.HostMarkerEnv, "0")
+	case "explicit":
+		t.Setenv(agent.HostMarkerEnv, "1")
+	}
+}
+
 func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
+	for _, mode := range doctorHostModes {
+		t.Run(mode, func(t *testing.T) { testDoctorAgentsDaemonPathMismatch(t, mode) })
+	}
+}
+
+// Only ROBOREV_HOST_AGENT=1 lists host in this shell, so only that mode adds
+// a host line.
+func testDoctorAgentsDaemonPathMismatch(t *testing.T, mode string) {
+	setDoctorHostMode(t, mode)
 	t.Setenv("PATH", writeFakeAgentBinary(t, "claude"))
 
 	env := &doctorEnv{
@@ -111,9 +136,16 @@ func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
 
 	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
 	assert.Equal(doctorWarn, mismatch.Status)
-	require.Len(t, mismatch.Details, 2)
+	want := 2
+	if mode == "explicit" {
+		want = 3
+		assert.Contains(mismatch.Details[1], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment does not")
+	}
+	require.Len(t, mismatch.Details, want, "%q", mismatch.Details)
 	assert.Contains(mismatch.Details[0], "claude-code: found at ")
-	assert.Equal("daemon PATH: /usr/bin:/bin", mismatch.Details[1])
+	assert.Equal("daemon PATH: /usr/bin:/bin", mismatch.Details[want-1])
+	assert.Equal(fmt.Sprintf("%s installed here cannot be run by the daemon", plural(want-1, "agent")), mismatch.Summary)
+	assert.Equal("run 'roborev daemon restart' from this shell, or set the agent's *_cmd config key to an absolute path", mismatch.Fix)
 
 	review := findDoctorCheck(t, checks, "agents.review")
 	assert.Equal(doctorFail, review.Status)
@@ -122,6 +154,24 @@ func TestDoctorAgentsDaemonPathMismatch(t *testing.T) {
 	// The review agent is already reported; the configured-agents check must
 	// not repeat it.
 	assert.False(slices.ContainsFunc(checks, func(c doctorCheck) bool { return c.ID == "agents.configured" }), "%+v", checks)
+}
+
+// Without host, the review summary keeps the upstream "use <agent> (<path>)"
+// form, even when the daemon reports no path.
+func TestDoctorReviewSummaryKeepsPathForm(t *testing.T) {
+	setDoctorHostMode(t, "neither")
+	for _, path := range []string{"/opt/bin/claude", ""} {
+		env := &doctorEnv{
+			ctx:    t.Context(),
+			global: &config.Config{DefaultAgent: "claude-code"},
+			ping:   &daemon.PingInfo{OK: true},
+			daemonAgents: &doctorDaemonAgents{Requested: []agent.Diagnosis{
+				{Name: "claude-code", Command: "claude", Path: path, Available: true},
+			}},
+		}
+		review, _ := checkDoctorReviewAgent(env, "reviews")
+		assert.Equal(t, "reviews use claude-code ("+path+")", review.Summary)
+	}
 }
 
 func TestDoctorAgentsTrustsDaemonOverShell(t *testing.T) {
@@ -607,4 +657,86 @@ func TestDoctorDaemonTLS(t *testing.T) {
 	assert.Equal(t, doctorFail, checks[0].Status)
 	assert.Equal(t, "config.daemon_tls", checks[0].ID)
 	assert.Contains(t, checks[0].Details[0], "load daemon_tls client certificate")
+}
+
+func TestDoctorAgentsExplicitHostWithoutMarker(t *testing.T) {
+	for _, mode := range []string{"none", "zero"} {
+		t.Run(mode, func(t *testing.T) {
+			setDoctorHostMode(t, mode)
+			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
+			env := &doctorEnv{
+				ctx:    t.Context(),
+				global: &config.Config{DefaultAgent: "host", ReviewBackupAgent: "gemini"},
+			}
+			review, _ := checkDoctorReviewAgent(env, "reviews")
+			assert.Equal(t, doctorFail, review.Status, "an explicit host never falls back to the backup")
+			assert.Contains(t, review.Summary, "agent host needs ROBOREV_HOST_AGENT=1 in this shell")
+			assert.Contains(t, strings.Join(review.Details, "\n"), "backup gemini is never tried")
+			assert.Equal(t, "set ROBOREV_HOST_AGENT=1 in the environment the daemon runs in and run 'roborev daemon restart' from it, or change default_agent to an installed CLI agent", review.Fix)
+
+			for _, d := range agent.DiagnoseAll(env.repoCfg, env.global) {
+				assert.NotEqual(t, "host", d.Name, "host is not listed without a marker")
+			}
+		})
+	}
+}
+
+func TestDoctorAgentsHostBackupLabeledUnavailable(t *testing.T) {
+	for _, mode := range []string{"none", "zero"} {
+		t.Run(mode, func(t *testing.T) {
+			setDoctorHostMode(t, mode)
+			t.Setenv("PATH", writeFakeAgentBinary(t, "gemini"))
+			env := &doctorEnv{
+				ctx:    t.Context(),
+				global: &config.Config{DefaultAgent: "gemini", DefaultBackupAgent: "host"},
+			}
+			configured := findDoctorCheck(t, checkDoctorAgents(env), "agents.configured")
+			assert.Equal(t, doctorWarn, configured.Status)
+			assert.Contains(t, strings.Join(configured.Details, "\n"), `host (set by default_backup_agent): agent "host" hands reviews to a host model, but none is attached`)
+			assert.Contains(t, configured.Fix, "host needs ROBOREV_HOST_AGENT=1 where reviews run")
+		})
+	}
+}
+
+func TestDoctorAgentsNoHostMismatchWhenDaemonRunsHost(t *testing.T) {
+	for _, mode := range []string{"explicit"} {
+		t.Run(mode, func(t *testing.T) {
+			setDoctorHostMode(t, mode)
+			t.Setenv("PATH", t.TempDir())
+			env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
+			env.ping = &daemon.PingInfo{OK: true}
+			env.daemonAgents = &doctorDaemonAgents{
+				Agents:    agent.DiagnoseAll(env.repoCfg, env.global),
+				Requested: []agent.Diagnosis{agent.Diagnose(env.repoCfg, "host", env.global)},
+			}
+			mismatch := findDoctorCheck(t, checkDoctorAgents(env), "agents.daemon_path")
+			assert.Equal(t, doctorOK, mismatch.Status, "%q", mismatch.Details)
+		})
+	}
+}
+
+func TestDoctorAgentsHostWithMarker(t *testing.T) {
+	t.Setenv(agent.HostMarkerEnv, "1")
+	t.Setenv("PATH", t.TempDir())
+	env := &doctorEnv{ctx: t.Context(), global: &config.Config{DefaultAgent: "host"}}
+	review, _ := checkDoctorReviewAgent(env, "reviews")
+	assert.Equal(t, doctorOK, review.Status)
+	assert.Regexp(t, `^reviews use host \(file handoff in .+\)$`, review.Summary)
+
+	// A daemon without the marker leaves host out of its agent list (as
+	// DiagnoseAll does) and reports it as unavailable when asked by name.
+	env.ping = &daemon.PingInfo{OK: true}
+	env.daemonAgents = &doctorDaemonAgents{
+		Agents:    nil,
+		Requested: []agent.Diagnosis{{Name: "host", Error: (&agent.HostUnavailableError{}).Error()}},
+	}
+	checks := checkDoctorAgents(env)
+	mismatch := findDoctorCheck(t, checks, "agents.daemon_path")
+	assert.Contains(t, mismatch.Details[0], "host: ROBOREV_HOST_AGENT=1 is set in this shell, but the daemon's environment does not")
+	assert.NotContains(t, strings.Join(mismatch.Details, "\n"), "PATH")
+	assert.Equal(t, "run 'roborev daemon restart' from this shell so the daemon inherits ROBOREV_HOST_AGENT", mismatch.Fix)
+	review = findDoctorCheck(t, checks, "agents.review")
+	assert.Equal(t, doctorFail, review.Status)
+	assert.Contains(t, review.Summary, "in the daemon")
+	assert.Equal(t, "a host model is attached in this shell; run 'roborev daemon restart' from this shell so the daemon inherits its environment, or change default_agent to an installed CLI agent", review.Fix)
 }

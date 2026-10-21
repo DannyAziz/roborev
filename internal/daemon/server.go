@@ -30,6 +30,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/agenthook"
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
@@ -1050,6 +1051,14 @@ func resolveRerunOpts(
 				return storage.ReenqueueOpts{}, err
 			}
 		}
+		if agentname.IsAuto(selectedAgent) {
+			// Pin auto to the agent it resolved to, as enqueue does.
+			// Keep PreferredAgent as the auto keyword so model resolution
+			// uses autoSelectionModel instead of the configured primary's
+			// workflow model.
+			resolution.PreferredAgent = selectedAgent
+			selectedAgent = selected.Name()
+		}
 		storageName := agent.StorageNameFromConfig(
 			agent.CanonicalName(selectedAgent), resolution.RepoConfig, cfg,
 		)
@@ -1059,10 +1068,10 @@ func resolveRerunOpts(
 		if job.JobType == storage.JobTypeClassify {
 			model = config.ResolveClassifyModel("", resolutionPath, cfg)
 		}
-		return storage.ReenqueueOpts{
+		return repinAutoBackup(storage.ReenqueueOpts{
 			Agent: storageName,
 			Model: model,
-		}, nil
+		}, job, resolution, storageName), nil
 	}
 
 	backupAgent := resolution.BackupAgent
@@ -1074,12 +1083,29 @@ func resolveRerunOpts(
 	}
 
 	provider := strings.TrimSpace(job.RequestedProvider)
-	if model := strings.TrimSpace(job.RequestedModel); model != "" {
-		return storage.ReenqueueOpts{Agent: rerunAgent, Model: model, Provider: provider}, nil
+	model := strings.TrimSpace(job.RequestedModel)
+	if model == "" {
+		model = resolution.ModelForSelectedAgent(job.Agent, "")
 	}
+	return repinAutoBackup(storage.ReenqueueOpts{
+		Agent: rerunAgent, Model: model, Provider: provider,
+	}, job, resolution, job.Agent), nil
+}
 
-	model := resolution.ModelForSelectedAgent(job.Agent, "")
-	return storage.ReenqueueOpts{Agent: rerunAgent, Model: model, Provider: provider}, nil
+// repinAutoBackup pins the backup of a job queued with an "auto" backup
+// again, against the rerun's primary and the current config, the way enqueue
+// does. Other jobs keep their stored backup.
+func repinAutoBackup(
+	opts storage.ReenqueueOpts, job *storage.ReviewJob,
+	resolution agent.WorkflowConfig, primary string,
+) storage.ReenqueueOpts {
+	if !job.BackupAuto {
+		return opts
+	}
+	opts.RepinBackup = true
+	opts.BackupAuto = agentname.IsAuto(strings.TrimSpace(resolution.BackupAgent))
+	opts.BackupAgent = pinnedAutoBackup(resolution, job.ReviewType, primary)
+	return opts
 }
 
 func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
@@ -3106,8 +3132,8 @@ func (s *Server) resolveSingleAgent(
 		return resolvedSingleAgent{}, out
 	}
 	agentName := resolution.PreferredAgent
-	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
-		in.repoCfg, agentName, in.cfg, resolution.BackupAgent,
+	resolved, err := agent.GetPreferredOrBackupEligible(
+		in.repoCfg, agentName, in.cfg, autoBackupEligible(in.req.ReviewType), resolution.BackupAgent,
 	)
 	if err != nil {
 		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
@@ -3143,7 +3169,7 @@ func (s *Server) resolveSingleAgent(
 		return resolvedSingleAgent{}, out
 	}
 	backupAgent, backupModel := backupExecutionForSelectedAgent(
-		resolution, agentName, in.repoCfg, in.cfg,
+		resolution, in.req.ReviewType, agentName, in.repoCfg, in.cfg,
 	)
 	return resolvedSingleAgent{
 		Agent:       agentName,
@@ -3171,9 +3197,15 @@ func (s *Server) enqueueSingleAgent(
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
-	if in.experiment != nil {
+	// A named backup stays empty so failover still reads the current workflow
+	// config. An "auto" backup, and any backup frozen by an experiment, is
+	// pinned now and kept even when the pin is empty.
+	o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
+	if o.BackupAuto || in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
 		o.BackupModel = execution.BackupModel
+	}
+	if in.experiment != nil {
 		assignment, assignErr := storageAssignmentForExperiment(
 			in.experiment, experimentPlanForJob(o),
 		)
@@ -3686,6 +3718,8 @@ func (s *Server) humaFixJob(
 		Agentic:      true,
 		Label:        fmt.Sprintf("fix #%d", req.ParentJobID),
 		JobType:      storage.JobTypeFix,
+		BackupAgent:  pinnedAutoBackup(resolution, "", agentName),
+		BackupAuto:   agentname.IsAuto(resolution.BackupAgent),
 		ParentJobID:  req.ParentJobID,
 		WorktreePath: worktreePath,
 		MinSeverity:  fixMinSev,
