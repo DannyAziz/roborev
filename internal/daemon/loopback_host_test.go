@@ -30,6 +30,11 @@ func TestLoopbackListenerRefusesRebindingHost(t *testing.T) {
 		{host: "127.0.0.1:" + port, want: http.StatusOK},
 		{host: "localhost:" + port, want: http.StatusOK},
 		{host: "localhost", want: http.StatusOK},
+		{host: "localhost.:" + port, want: http.StatusOK},
+		{host: "localhost.", want: http.StatusOK},
+		{host: "rebind.localhost:" + port, want: http.StatusForbidden},
+		{host: "rebind.localhost.", want: http.StatusForbidden},
+		{host: "localhost.attacker.example:" + port, want: http.StatusForbidden},
 	} {
 		t.Run(tc.host, func(t *testing.T) {
 			assert.Equal(t, tc.want, getWithHost(t, server.Client(), server.URL+"/api/jobs", tc.host))
