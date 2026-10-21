@@ -77,7 +77,7 @@ func (s *Server) startBrowserServer(web config.WebConfig) (*BrowserRuntimeInfo, 
 	if err != nil {
 		return fail(fmt.Errorf("load embedded browser application: %w", err))
 	}
-	handler, err := s.newBrowserHandler(s.httpServer.Handler, static, policy, sessions, web.BasePath)
+	handler, err := s.newBrowserHandler(s.apiHandler, static, policy, sessions, web.BasePath)
 	if err != nil {
 		return fail(err)
 	}

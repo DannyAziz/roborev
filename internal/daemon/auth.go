@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json/v2"
+	"net"
 	"net/http"
 	"strings"
 
@@ -85,5 +86,25 @@ func withAPIAuthentication(next http.Handler, key string) http.Handler {
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.MarshalWrite(w, ErrorResponse{Error: "daemon authentication required"})
 		}
+	})
+}
+
+// withLoopbackHost refuses a plain HTTP request on a loopback connection
+// whose Host is not a loopback name. A web page that rebinds its own DNS
+// name to 127.0.0.1 reaches this listener as same-origin and sends that name
+// as Host; a local client sends localhost or a loopback address. TLS, Unix
+// socket, and non-loopback connections are unchanged. The browser and
+// remote listeners call the API without this check and keep their own
+// Host policy.
+func withLoopbackHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		local, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+		if r.TLS == nil && local != nil && local.IP.IsLoopback() && !isLoopbackAuthority(r.Host) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.MarshalWrite(w, ErrorResponse{Error: "daemon requests must use a loopback host name"})
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }

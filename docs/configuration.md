@@ -1523,6 +1523,12 @@ for all native daemon APIs, including reads, shutdown, streaming, profiling, MCP
 and the OpenAPI document. Authentication is disabled when `auth_key` is empty
 (the default). This key is global-only; repo config cannot override it.
 
+With or without a key, a plain HTTP request that reaches the daemon over a
+loopback connection must name `localhost` or a loopback address as its Host.
+This refuses a web page that rebinds its own DNS name to `127.0.0.1`. The TLS
+listener, Unix sockets, and the web UI listener, which has its own host and
+origin checks, are unchanged.
+
 Generate 32 random bytes encoded as 64 lowercase hex characters:
 
 ```bash

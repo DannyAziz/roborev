@@ -65,6 +65,7 @@ type Server struct {
 	searchWG                sync.WaitGroup
 	searchStopped           bool
 	httpServer              *http.Server
+	apiHandler              http.Handler // Authenticated API for the browser and remote listeners, without the loopback Host check.
 	remoteServer            *http.Server
 	remoteCancel            context.CancelFunc
 	browserMu               sync.Mutex
@@ -230,9 +231,10 @@ func newServerWithLogs(
 		mux.Handle(mcpserver.HTTPPath, mcpServer.HTTPHandler())
 	}
 
+	s.apiHandler = withAPIAuthentication(mux, cfg.AuthKey)
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: withAPIAuthentication(mux, cfg.AuthKey),
+		Handler: withLoopbackHost(s.apiHandler),
 	}
 
 	return s
