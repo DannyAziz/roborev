@@ -258,7 +258,6 @@ max_chars = 50000
 | `post_commit_review` | string | Post-commit hook behavior: `"commit"` (default) or `"branch"` |
 | `post_commit_batch_size` | int | Number of commits to accumulate before an automatic post-commit review. Values below `2` review every commit |
 | `hook_timeout_seconds` | int | Override the post-commit hook request timeout for this repo, in seconds. Useful for large repos where the daemon's enqueue git calls are slow. Read filesystem-only from this checkout's `.roborev.toml` (a linked worktree without its own file does not inherit the main checkout's value). Zero or negative values inherit the global / platform default |
-| `cloud_launch_clean_delay_hours` | int | Hours before a later restart's empty sweep may clean a cursor-cloud launch. A value of at least 1 hour wins over the global value. 0, a negative value, or a value that is not an integer clamps to 1 hour: it does not inherit global and it does not mean the wait is over. The confirming sweep is a separate restart, not a second list in the same pass |
 | `auto_close_passing_reviews` | bool | Automatically close reviews that pass, including reviews whose findings all fall below `review_min_severity` |
 | `review_reasoning` | string | Reasoning level for reviews. See [Reasoning Levels](#reasoning-levels) |
 | `refine_reasoning` | string | Reasoning level for refine. See [Reasoning Levels](#reasoning-levels) |
@@ -1076,7 +1075,6 @@ default_backup_model = "claude-sonnet-4-20250514"  # Model paired with default_b
 server_addr = "127.0.0.1:7373"
 max_workers = 4
 job_timeout_minutes = 30          # Per-job timeout in minutes; plan-first background fixes add an equal planning budget
-cloud_launch_clean_delay_hours = 24  # Hours before a later restart's empty sweep may clean a cursor-cloud launch. Minimum 1. A valid repo value wins.
 hook_timeout_seconds = 30         # Post-commit hook request timeout (0 = platform default: 3, 30 on Windows)
 agent_quota_cooldown = "30m"      # Maximum quota cooldown after agent limits
 review_guidelines = "Global review instructions for every repo."
@@ -1113,7 +1111,6 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `web.auth_token_file` | string | - | Host-local file containing the browser token; mutually exclusive with `web.auth_token` | No |
 | `max_workers` | int | 4 | Number of parallel review workers | No |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes; plan-first background fixes add an equal planning budget | Yes |
-| `cloud_launch_clean_delay_hours` | int | 24 | Hours before a later restart's empty sweep may clean a cursor-cloud launch. The confirming sweep is a separate restart, not a second list in the same pass. Until then the row stays uncleaned and the job keeps the orphan note. Global 0 uses 24. A valid per-repo value of at least 1 hour wins over this global value. A per-repo 0, negative, or unparseable value clamps to 1 hour and does not inherit global. The delay is never under 1 hour | Yes |
 | `isolate_reviews` | bool | false | Run committed reviews in daemon-owned detached checkouts; see [Isolated Review Checkouts](#isolated-review-checkouts) | Yes |
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
 | `agent_quota_cooldown` | string | `30m0s` | Maximum daemon-wide cooldown after an agent quota or session-limit error, as a Go duration such as `10m`, `30m`, or `1h` | Yes |
