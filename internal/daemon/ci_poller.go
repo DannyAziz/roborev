@@ -81,6 +81,8 @@ type ghPR struct {
 	HeadRefOid         string     `json:"headRefOid"`
 	HeadRefName        string     `json:"headRefName"`
 	BaseRefName        string     `json:"baseRefName"`
+	HeadRepo           string     `json:"headRepo,omitempty"`
+	BaseRepo           string     `json:"baseRepo,omitempty"`
 	Title              string     `json:"title"`
 	Author             ghPRAuthor `json:"author"`
 	Labels             []string   `json:"labels"`
@@ -814,6 +816,7 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 
 	// Resolve panel members + synthesis: a configured [ci].panel names a panel,
 	// else the agents x review_types matrix is adapted into members.
+	ciCloud := ciCursorCloudOptIn(repoCfg)
 	executionRepoCfg, executionRaw, executionCfg := repoCfg, rawRepoCfg, cfg
 	if cfg.CI.Personal.Enabled {
 		// The local personal panel is authority; repository definitions cannot
@@ -822,6 +825,11 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		local.CI.Panel = cfg.CI.Personal.Panel
 		executionCfg, executionRepoCfg, executionRaw = &local, nil, nil
 		repoCfg = personalPromptRepoConfig(repoCfg, cfg)
+	}
+	if ciCloud && ciPullRequestFork(pr) {
+		log.Printf("CI poller: refusing cursor-cloud for %s#%d: head repo %q is not base repo %q",
+			ghRepo, pr.Number, pr.HeadRepo, pr.BaseRepo)
+		return false, nil
 	}
 	members, synth, err := p.resolveCIMembers(
 		repo, executionRepoCfg, executionRaw, executionCfg, ghRepo,
@@ -1141,6 +1149,27 @@ func (p *CIPoller) resolveCIMembers(
 	return p.resolveCIMatrixMembers(repo, repoCfg, rawRepoCfg, cfg, ghRepo)
 }
 
+// ciCursorCloudOptIn reports a CI-scoped cursor-cloud choice in the repo
+// config. Global host and ROBOREV_DEFAULT_HOST are not an opt-in.
+func ciCursorCloudOptIn(repoCfg *config.RepoConfig) bool {
+	if repoCfg == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(repoCfg.CI.Host), agent.CursorCloudHost)
+}
+
+// ciPullRequestFork reports a head repository that is not the base repository.
+// Empty names are not treated as a fork so callers that do not know the
+// repositories keep the same-repo path.
+func ciPullRequestFork(pr ghPR) bool {
+	base := strings.ToLower(strings.TrimSpace(pr.BaseRepo))
+	head := strings.ToLower(strings.TrimSpace(pr.HeadRepo))
+	if base == "" || head == "" {
+		return false
+	}
+	return base != head
+}
+
 // ciPanelName returns the configured CI panel name (repo [ci].panel over global
 // [ci].panel), or "" when neither is set (the implicit-matrix fallback).
 func ciPanelName(repoCfg *config.RepoConfig, cfg *config.Config) string {
@@ -1163,6 +1192,21 @@ func (p *CIPoller) resolveCIMatrixMembers(
 	}
 	if len(matrix) == 0 {
 		return nil, config.SynthesisSpec{}, nil
+	}
+	// CI uses cursor-cloud only from this repo's [ci].host. The repo host,
+	// the global host, and ROBOREV_DEFAULT_HOST do not apply here.
+	if ciCursorCloudOptIn(repoCfg) {
+		// The agents x review_types matrix would launch one cloud VM per cell.
+		synth, err := config.ResolveCISynthesis(reasoning, repoCfg, cfg)
+		if err != nil {
+			return nil, config.SynthesisSpec{}, fmt.Errorf("resolve CI synthesis: %w", err)
+		}
+		return []config.ResolvedMember{{
+			Name:      agent.CursorCloudHost,
+			Index:     0,
+			Agent:     agent.CursorCloudHost,
+			Reasoning: reasoning,
+		}}, synth, nil
 	}
 
 	members := make([]config.ResolvedMember, 0, len(matrix))
@@ -1669,6 +1713,12 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, storage.EnqueueOpts{}, fmt.Errorf("prebuild prompt for %s#%d canceled: %w", in.ghRepo, in.prNumber, err)
 			}
+			// cursor-cloud rejects the frozen range ref, so its job ref is the
+			// head commit. The range review lives only in this prebuilt prompt.
+			// Queueing without it would review the head commit alone.
+			if agent.CanonicalName(m.Agent) == agent.CursorCloudHost {
+				return nil, storage.EnqueueOpts{}, fmt.Errorf("cursor-cloud CI review needs the prebuilt pull request range prompt: %w", err)
+			}
 			log.Printf("CI poller: failed to prebuild prompt for %s#%d (member=%s, agent=%s): %v; enqueuing without stored prompt",
 				in.ghRepo, in.prNumber, m.Name, m.Agent, err)
 			if in.cfg.CI.Personal.Enabled {
@@ -1678,6 +1728,17 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		}
 		if in.cfg.CI.Personal.Enabled && strings.TrimSpace(storedPrompt) == "" {
 			return nil, storage.EnqueueOpts{}, fmt.Errorf("personal review prompt is empty")
+		}
+		if agent.CanonicalName(m.Agent) == agent.CursorCloudHost && strings.TrimSpace(storedPrompt) == "" {
+			return nil, storage.EnqueueOpts{}, fmt.Errorf("cursor-cloud CI review prompt is empty")
+		}
+		gitRef := in.gitRef
+		if agent.CanonicalName(m.Agent) == agent.CursorCloudHost {
+			head, refErr := cursorCloudCIRef(in.gitRef)
+			if refErr != nil {
+				return nil, storage.EnqueueOpts{}, refErr
+			}
+			gitRef = head
 		}
 		acpSnapshot, err := snapshotACPExecutionConfig(
 			in.repoCfg, in.cfg, m.Agent, m.BackupAgent,
@@ -1699,7 +1760,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		}
 		memberOpts = append(memberOpts, storage.EnqueueOpts{
 			RepoID:                in.repo.ID,
-			GitRef:                in.gitRef,
+			GitRef:                gitRef,
 			Branch:                in.branch,
 			CIBaseBranch:          in.baseBranch,
 			Agent:                 m.Agent,
@@ -1765,6 +1826,18 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		ClaimBlocked:          true,
 	}
 	return memberOpts, synthOpts, nil
+}
+
+// cursorCloudCIRef is the commit a CI cursor-cloud member launches at.
+// enqueuePanelRun freezes every pull request as merge-base..head, and
+// cursor-cloud rejects a range. The head commit is the pull request tip.
+// The prompt is still built from the full range.
+func cursorCloudCIRef(gitRef string) (string, error) {
+	head := strings.TrimSpace(headOf(gitRef))
+	if head == "" || head == "dirty" || strings.Contains(head, "..") {
+		return "", fmt.Errorf("cursor-cloud reviews one commit; CI ref %q has no head commit", gitRef)
+	}
+	return head, nil
 }
 
 func listCommitsInRange(repoPath, base, head string) ([]string, error) {
@@ -2304,6 +2377,8 @@ func (p *CIPoller) listOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, erro
 			HeadRefOid:         pr.HeadRefOID,
 			HeadRefName:        pr.HeadRefName,
 			BaseRefName:        pr.BaseRefName,
+			HeadRepo:           pr.HeadRepo,
+			BaseRepo:           pr.BaseRepo,
 			Title:              pr.Title,
 			Author:             ghPRAuthor{Login: pr.AuthorLogin},
 			Labels:             pr.Labels,

@@ -989,6 +989,9 @@ func (c *RepoConfig) Validate() (err error) {
 	if err := validateReasoningValues(reasoning...); err != nil {
 		return err
 	}
+	if err := validateRepoCIHost(c.CI.Host); err != nil {
+		return err
+	}
 	return validateMinSeverityValues(
 		namedConfigValue{key: "fix_min_severity", value: c.FixMinSeverity},
 		namedConfigValue{key: "refine_min_severity", value: c.RefineMinSeverity},

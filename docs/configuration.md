@@ -1205,8 +1205,13 @@ failure is returned as a non-retryable error instead of the agent's text.
 Userinfo, `access_token` query values, and unparseable credential URLs are
 removed before the repository URL is sent or stored. A dirty or range review
 cannot use `cursor-cloud` and is not rewritten to a local agent. Goal reviews
-and fix jobs stay on the local agent. A CI matrix on `cursor-cloud` launches one
-cloud agent.
+and fix jobs stay on the local agent. CI launches `cursor-cloud` only when the
+repository's own `[ci] host` is `cursor-cloud`. The repository `host`, the
+global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. A fork or
+cross-repo pull request, where the head repository is not the base repository,
+is refused with a log line when that opt-in is set. Without the opt-in, CI keeps
+its normal local matrix, including for those pull requests. An opted-in
+same-repository matrix launches one cloud agent.
 
 Launch limits are checked before the agent is created. The defaults are 4
 concurrent launches and 60 launches in a rolling hour. 4 matches the default
