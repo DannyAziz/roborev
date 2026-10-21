@@ -123,13 +123,22 @@ func recoverOneCloudLaunch(ctx context.Context, db *storage.DB, client cursorclo
 		// start. A failed note write is returned.
 		return reportCloudLaunchOrphan(db, row, cleanDelay)
 	}
-	found, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
+	deleted, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, row.Token, repoURL)
+	if deleted != "" && row.AgentID == "" {
+		// The sweep found and deleted the VM whose id the crash did not save.
+		// Saving it now lets a later independent empty sweep clean the row.
+		// A row whose VM was never found keeps no id and stays uncleaned.
+		if attachErr := db.AttachCloudAgent(row.JobID, row.Token, deleted); attachErr != nil {
+			err = errors.Join(err, attachErr)
+		}
+	}
 	if err != nil {
 		if agent.CursorCloudCleanupOp(err) == "list" {
 			return noteRestartListFailure(db, row, err)
 		}
 		return noteRestartSweepFailure(db, row, err)
 	}
+	found := deleted != ""
 	if cursorCloudSamePassResweep != nil {
 		again, againErr := cursorCloudSamePassResweep(ctx, client, daemonID, row.Token, repoURL)
 		if againErr != nil {

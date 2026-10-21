@@ -231,7 +231,8 @@ func TestSamePassListsEmptyTwiceDoesNotClean(t *testing.T) {
 	}
 	prev := cursorCloudSamePassResweep
 	cursorCloudSamePassResweep = func(ctx context.Context, client cursorcloud.Client, daemonID, sweepToken, repoURL string) (bool, error) {
-		return agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, sweepToken, repoURL)
+		deleted, err := agent.DeleteCursorCloudLaunchByMarker(ctx, client, daemonID, sweepToken, repoURL)
+		return deleted != "", err
 	}
 	t.Cleanup(func() { cursorCloudSamePassResweep = prev })
 

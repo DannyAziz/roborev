@@ -714,7 +714,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		var found bool
 		var matchErr error
 		if err == nil {
-			found, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output)
+			found, _, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, output, marker)
 		}
 		passCancel()
 		if err != nil {
@@ -902,9 +902,10 @@ func MarkCursorCloudSent(err error) error {
 	return cursorCloudNonRetryable(err)
 }
 
-func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
+// deleteMatchingCursorCloudLaunch deletes every agent whose prompt carries
+// one of markers. deleted is the first id this call removed.
+func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL string, output io.Writer, markers ...string) (found bool, deleted string, err error) {
 	var errs []error
-	found := false
 	for _, ag := range agents {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
@@ -921,15 +922,18 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 			}
 			continue
 		}
-		if !strings.Contains(text, marker) {
+		if !slices.ContainsFunc(markers, func(m string) bool { return strings.Contains(text, m) }) {
 			continue
 		}
 		found = true
 		if delErr := deleteCursorCloudAgent(ctx, client, ag.ID, output); delErr != nil {
-			return true, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
+			return true, deleted, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
+		}
+		if deleted == "" {
+			deleted = ag.ID
 		}
 	}
-	return found, errors.Join(errs...)
+	return found, deleted, errors.Join(errs...)
 }
 
 func StopAndDeleteCursorCloudAgent(client cursorcloud.Client, id string) error {
@@ -961,7 +965,7 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 		return fmt.Errorf("cursor-cloud orphan risk: pending cleanup: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
-	found, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
+	found, _, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, output, cursorCloudLaunchMarker+reconcileToken)
 	passCancel()
 	if sweepErr != nil {
 		return sweepErr
@@ -990,23 +994,25 @@ func CursorCloudRepoUsable(raw string) bool {
 	return config.RemoteIdentity(raw) != ""
 }
 
-func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) (bool, error) {
+// DeleteCursorCloudLaunchByMarker deletes this launch's agents found by
+// marker. It returns the first id it deleted, also alongside a sweep error.
+func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) (string, error) {
 	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || !CursorCloudRepoUsable(repoURL) {
-		return false, errors.New("cursor-cloud: cleanup marker is incomplete")
+		return "", errors.New("cursor-cloud: cleanup marker is incomplete")
 	}
 	listCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
 	agents, err := client.ListAgents(listCtx)
 	cancel()
 	if err != nil {
-		return false, &cursorCloudCleanupError{op: cursorCloudCleanupList, err: fmt.Errorf("cursor-cloud: cleanup list: %w", err)}
+		return "", &cursorCloudCleanupError{op: cursorCloudCleanupList, err: fmt.Errorf("cursor-cloud: cleanup list: %w", err)}
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	found, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
+	_, deleted, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, nil, CursorCloudLaunchMarker(daemonID, token))
 	if err != nil {
-		return found, &cursorCloudCleanupError{op: cursorCloudCleanupSweep, err: err}
+		return deleted, &cursorCloudCleanupError{op: cursorCloudCleanupSweep, err: err}
 	}
-	return found, nil
+	return deleted, nil
 }
 
 const (
