@@ -1173,6 +1173,61 @@ replace `prompt.md` or plant `answer.md`, which roborev reads as the review.
 Point `ROBOREV_HOST_DIR` at a directory only the daemon's user can write.
 roborev logs a warning when that directory is group- or world-writable.
 
+### Cursor cloud host
+
+Ordinary reviews stay on the local agent. `cursor-cloud` is off unless you
+choose it. Setting `CURSOR_API_KEY` does not select it, and the defaults above
+do not change.
+
+Enable it in one of these ways:
+
+- `roborev review --host cursor-cloud`
+- `host = "cursor-cloud"` in `~/.roborev/config.toml` or `.roborev.toml` (the
+    repo value wins)
+- `ROBOREV_DEFAULT_HOST=cursor-cloud` in the environment the daemon runs in
+
+`--host` wins over config, and config wins over `ROBOREV_DEFAULT_HOST`. `local`
+keeps today's agent selection. `host` is the attached host model and still
+requires `ROBOREV_HOST_AGENT=1`. An explicit `cursor-cloud` without
+`CURSOR_API_KEY` is an error; roborev does not fall back to a local agent. An
+explicit `host` without `ROBOREV_HOST_AGENT=1` is the same kind of error.
+
+The cloud review is created at the exact commit SHA and polled until it
+finishes. `CREATING` and any other unknown status stay in progress. The agent's
+final assistant message is the review. A finished agent with no assistant
+message fails that review. roborev stops that agent, then deletes it, when the
+review ends, on success, error, timeout, and cancellation. The v0 stop call
+pauses the VM. The v0 delete docs do not say that delete ends billing. A create
+that fails after it is sent, and returns no id, is found by a token in the
+prompt and stopped and deleted the same way. v0 launch has no idempotency key. A
+delete failure is logged and reported. When the review itself succeeded, that
+failure is returned as a non-retryable error instead of the agent's text.
+Userinfo, `access_token` query values, and unparseable credential URLs are
+removed before the repository URL is sent or stored. A dirty or range review
+cannot use `cursor-cloud` and is not rewritten to a local agent. Goal reviews
+and fix jobs stay on the local agent. A CI matrix on `cursor-cloud` launches one
+cloud agent.
+
+Launch limits are checked before the agent is created. The defaults are 4
+concurrent launches and 60 launches in a rolling hour. 4 matches the default
+worker count. 60 is one launch a minute. A launch past either limit returns an
+error and creates no agent. A finished review frees its concurrent slot after
+the agent is deleted. A launch stops counting one hour after it started.
+
+Set `ROBOREV_CURSOR_CLOUD_MAX_CONCURRENT` and
+`ROBOREV_CURSOR_CLOUD_MAX_PER_HOUR` to a positive integer to change a limit. An
+unset, zero, or invalid value keeps the default.
+
+The request tells the agent to avoid shell tools, ignore the repository's
+`.cursor` configuration, skip `environment.json` setup, not write to the
+repository, and read only the tree at that commit.
+
+!!! note "Limitation: the API cannot enforce the sandbox"
+
+    `CreateAgent` has no fields to disable shell tools, ignore `.cursor`, skip
+    `environment.json`, or confine reads. Those rules are prompt text. The Cursor
+    API cannot enforce them.
+
 ### Review Search Embeddings
 
 Lexical review-history search needs no configuration and never calls an
