@@ -159,3 +159,56 @@ func TestCursorCloudCustomReviewFileInsideRepoStillSent(t *testing.T) {
 		}
 	}
 }
+
+// TestCursorCloudReviewMDSymlinkOutsideRepoNotSent pins that a REVIEW.md
+// read from the working tree (no default branch resolves) does not follow a
+// symlink out of the repository into the cursor-cloud prompt, while an
+// in-repository REVIEW.md, directly or through an in-repository symlink, is
+// still sent.
+func TestCursorCloudReviewMDSymlinkOutsideRepoNotSent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics")
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, repo *testutil.TestRepo, outside string)
+		want  string
+	}{
+		{name: "symlink outside", setup: func(t *testing.T, repo *testutil.TestRepo, outside string) {
+			require.NoError(t, os.Symlink(outside, filepath.Join(repo.Path(), "REVIEW.md")))
+		}},
+		{name: "regular file", want: "IN-REPO-REVIEWMD", setup: func(t *testing.T, repo *testutil.TestRepo, _ string) {
+			repo.WriteFile("REVIEW.md", "Guideline: IN-REPO-REVIEWMD\n")
+		}},
+		{name: "symlink inside", want: "IN-REPO-REVIEWMD", setup: func(t *testing.T, repo *testutil.TestRepo, _ string) {
+			repo.WriteFile("docs/review.md", "Guideline: IN-REPO-REVIEWMD\n")
+			require.NoError(t, os.Symlink("docs/review.md", filepath.Join(repo.Path(), "REVIEW.md")))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outside := filepath.Join(t.TempDir(), "secret.md")
+			require.NoError(t, os.WriteFile(outside, []byte("Guideline: "+outsideFileSecret+"\n"), 0o600))
+			server, fake := cursorCloudPinServer(t, nil)
+			repo := testutil.InitTestGitRepo(t, filepath.Join(t.TempDir(), "repo"))
+			repo.CommitFile(".roborev.toml", "host = \"cursor-cloud\"\n", "cfg")
+			repo.CommitFile("a.txt", "one\n", "one")
+			repo.RunGit("branch", "-m", "trunk")
+			tc.setup(t, repo, outside)
+
+			created := enqueueViaHTTP(t, server, EnqueueRequest{RepoPath: repo.Path(), GitRef: "HEAD"})
+			require.Equal(t, agent.CursorCloudHost, created.Agent)
+			processOutsideFileJob(t, server, created.ID)
+
+			require.Equal(t, 1, createCountFromFake(fake))
+			assertNoOutsideSecret(t, fake, outsideFileSecret)
+			if tc.want == "" {
+				return
+			}
+			for _, call := range fake.Calls() {
+				if call.Method == cursorcloudtest.MethodCreate {
+					assert.Contains(t, call.Request.Prompt, tc.want, "in-repository REVIEW.md missing from the prompt")
+				}
+			}
+		})
+	}
+}

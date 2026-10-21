@@ -636,7 +636,7 @@ func (b *Builder) BuildDirtyWithFiles(diff string, changedFiles []string, contex
 	ctx.optional.DependencyMetadata = buildDependencyMetadataSection(changedFiles)
 
 	ctx.optional.ProjectGuidelines = buildProjectGuidelinesSectionView(
-		LoadGuidelinesLocal(b.resolvedConfigRepoPath(), b.globalCfg),
+		loadGuidelinesLocal(b.resolvedConfigRepoPath(), b.globalCfg, repoFilesOnly(agentName)),
 	)
 
 	// Uncommitted changes have no commit messages, so "current" mode has no
@@ -756,9 +756,9 @@ func (b *Builder) newPromptBuildContext(agentName, reviewType, minSeverity, defa
 	}, nil
 }
 
-func defaultOptionalSections(ctx context.Context, repoPath string, globalCfg *config.Config, additionalContext string) optionalSectionsView {
+func defaultOptionalSections(ctx context.Context, repoPath string, globalCfg *config.Config, additionalContext string, repoOnly bool) optionalSectionsView {
 	return optionalSectionsView{
-		ProjectGuidelines: buildProjectGuidelinesSectionView(LoadGuidelinesWithConfig(ctx, repoPath, globalCfg)),
+		ProjectGuidelines: buildProjectGuidelinesSectionView(loadGuidelinesWithConfig(ctx, repoPath, globalCfg, repoOnly)),
 		AdditionalContext: buildAdditionalContextSection(additionalContext),
 	}
 }
@@ -922,7 +922,7 @@ func selectRichestRangePromptView(limit int, view TemplateContext, variants []di
 
 // buildSinglePrompt constructs a prompt for a single commit
 func (b *Builder) buildSinglePrompt(sha string, contextCount int, agentName, reviewType string, opts buildOpts) (string, error) {
-	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "review", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext))
+	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "review", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext, repoFilesOnly(agentName)))
 	if err != nil {
 		return "", err
 	}
@@ -982,7 +982,7 @@ func (b *Builder) buildSinglePrompt(sha string, contextCount int, agentName, rev
 
 // buildRangePrompt constructs a prompt for a commit range
 func (b *Builder) buildRangePrompt(rangeRef string, contextCount int, agentName, reviewType string, opts buildOpts) (string, error) {
-	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "range", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext))
+	ctx, err := b.newPromptBuildContext(agentName, reviewType, opts.minSeverity, "range", defaultOptionalSections(b.context(), b.resolvedConfigRepoPath(), b.globalCfg, opts.additionalContext, repoFilesOnly(agentName)))
 	if err != nil {
 		return "", err
 	}
@@ -1198,10 +1198,18 @@ func reviewMDFromRef(repoPath, ref string) string {
 }
 
 // reviewMDFromDisk reads REVIEW.md from the working tree, for the same
-// local/dirty paths that read .roborev.toml off disk.
-func reviewMDFromDisk(repoPath string) string {
-	data, err := os.ReadFile(filepath.Join(repoPath, reviewMDFile))
+// local/dirty paths that read .roborev.toml off disk. With repoOnly it does
+// not follow a symlink out of the repository.
+func reviewMDFromDisk(repoPath string, repoOnly bool) string {
+	read := func() ([]byte, error) { return os.ReadFile(filepath.Join(repoPath, reviewMDFile)) }
+	if repoOnly {
+		read = func() ([]byte, error) { return readRepoFile(repoPath, reviewMDFile) }
+	}
+	data, err := read()
 	if err != nil {
+		if repoOnly && !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("prompt: skipped %s outside the repository for cursor-cloud: %v", reviewMDFile, err)
+		}
 		return ""
 	}
 	return string(data)
@@ -1211,7 +1219,7 @@ func reviewMDFromDisk(repoPath string) string {
 // branch, falling back to filesystem config when the default branch
 // has no .roborev.toml.
 func LoadGuidelines(ctx context.Context, repoPath string) string {
-	return loadRepoGuidelines(ctx, repoPath).text
+	return loadRepoGuidelines(ctx, repoPath, false).text
 }
 
 // LoadGuidelinesWithConfig merges global review guidelines with repo
@@ -1219,7 +1227,11 @@ func LoadGuidelines(ctx context.Context, repoPath string) string {
 // review_guidelines_supersede_global in repo config disables the global
 // guidelines for that repo.
 func LoadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *config.Config) string {
-	repo := loadRepoGuidelines(ctx, repoPath)
+	return loadGuidelinesWithConfig(ctx, repoPath, globalCfg, false)
+}
+
+func loadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *config.Config, repoOnly bool) string {
+	repo := loadRepoGuidelines(ctx, repoPath, repoOnly)
 	return mergeGuidelines(globalGuidelines(globalCfg), repo.text, repo.supersedeGlobal)
 }
 
@@ -1227,6 +1239,10 @@ func LoadGuidelinesWithConfig(ctx context.Context, repoPath string, globalCfg *c
 // guidelines from the working tree. Use it for dirty/local agent prompts
 // where the user's current local config is expected to apply.
 func LoadGuidelinesLocal(repoPath string, globalCfg *config.Config) string {
+	return loadGuidelinesLocal(repoPath, globalCfg, false)
+}
+
+func loadGuidelinesLocal(repoPath string, globalCfg *config.Config, repoOnly bool) string {
 	var repo loadedGuidelines
 	if fsCfg, err := config.LoadRepoConfig(repoPath); err == nil && fsCfg != nil {
 		repo = loadedGuidelines{
@@ -1235,7 +1251,7 @@ func LoadGuidelinesLocal(repoPath string, globalCfg *config.Config) string {
 			supersedeGlobal: fsCfg.ReviewGuidelinesSupersedeGlobal,
 		}
 	}
-	repo = withReviewMD(repo, func() string { return reviewMDFromDisk(repoPath) })
+	repo = withReviewMD(repo, func() string { return reviewMDFromDisk(repoPath, repoOnly) })
 	return mergeGuidelines(globalGuidelines(globalCfg), repo.text, repo.supersedeGlobal)
 }
 
@@ -1262,12 +1278,12 @@ func mergeGuidelines(global, repo string, repoSupersedesGlobal bool) string {
 	}
 }
 
-func loadRepoGuidelines(ctx context.Context, repoPath string) loadedGuidelines {
+func loadRepoGuidelines(ctx context.Context, repoPath string, repoOnly bool) loadedGuidelines {
 	// REVIEW.md comes from the same place as .roborev.toml: the default
 	// branch when one resolves, so an untrusted branch cannot supply review
 	// instructions; the working tree only in a repo with no default branch,
 	// where the filesystem config read below is already the only source.
-	readReviewMD := func() string { return reviewMDFromDisk(repoPath) }
+	readReviewMD := func() string { return reviewMDFromDisk(repoPath, repoOnly) }
 
 	// Load review guidelines from the default branch (origin/main,
 	// origin/master, etc.). Branch-specific guidelines are intentionally
