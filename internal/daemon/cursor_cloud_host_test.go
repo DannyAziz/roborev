@@ -419,3 +419,76 @@ func TestNoPromptFixRangeIsRefusedAndDoesNotRun(t *testing.T) {
 		})
 	}
 }
+
+// TestPromptlessTaskOnSingleCommitStaysLocal pins where a declared task with
+// no prompt runs when the git ref is one commit. The host guard keeps that
+// declared task, so reviewHostApplies leaves it on the local agent for every
+// cursor-cloud host source. An empty host chain is local and is not a cell.
+func TestPromptlessTaskOnSingleCommitStaysLocal(t *testing.T) {
+	shapes := []struct {
+		name string
+		set  func(t *testing.T, cfg *config.Config, repoPath string, req *EnqueueRequest)
+	}{
+		{
+			name: "global config host",
+			set: func(t *testing.T, cfg *config.Config, _ string, _ *EnqueueRequest) {
+				t.Helper()
+				cfg.Host = agent.CursorCloudHost
+			},
+		},
+		{
+			name: "repo config host",
+			set: func(t *testing.T, _ *config.Config, repoPath string, _ *EnqueueRequest) {
+				t.Helper()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(repoPath, ".roborev.toml"),
+					[]byte("host = \"cursor-cloud\"\n"),
+					0o644,
+				))
+			},
+		},
+		{
+			name: "--host",
+			set: func(_ *testing.T, _ *config.Config, _ string, req *EnqueueRequest) {
+				req.Host = agent.CursorCloudHost
+			},
+		},
+		{
+			name: "ROBOREV_DEFAULT_HOST",
+			set: func(t *testing.T, _ *config.Config, _ string, _ *EnqueueRequest) {
+				t.Helper()
+				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
+			},
+		},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			assert := assert.New(t)
+			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+			t.Setenv(agent.EnvDefaultHost, "")
+			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+			db, tmpDir := testutil.OpenTestDBWithDir(t)
+			cfg := config.DefaultConfig()
+			cfg.MaxWorkers = 0
+			repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
+			repo.CommitFile("a.txt", "one\n", "one")
+			req := EnqueueRequest{
+				RepoPath: repo.Path(),
+				GitRef:   "HEAD",
+				JobType:  storage.JobTypeTask,
+				Agent:    "test",
+			}
+			shape.set(t, cfg, repo.Path(), &req)
+			server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+			t.Cleanup(func() { _ = server.Close() })
+			created := enqueueViaHTTP(t, server, req)
+			assert.Equal("test", created.Agent)
+			claimed, err := db.ClaimJob(testWorkerID)
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			assert.Equal(created.ID, claimed.ID)
+			assert.Equal("test", claimed.Agent)
+			assert.NotEqual(agent.CursorCloudHost, claimed.Agent)
+		})
+	}
+}
