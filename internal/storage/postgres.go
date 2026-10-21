@@ -20,9 +20,6 @@ import (
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
-// It stays at 23: backup_auto is local SQLite state, like budget_routing_locked,
-// and is not a Postgres column. Writing 24 would make older binaries refuse
-// the shared database ("schema version 24 is newer").
 const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
@@ -1605,8 +1602,6 @@ func (p *PgPool) upsertJobsIndividually(ctx context.Context, jobs []JobWithPgIDs
 	return success, firstErr
 }
 
-// queueJobUpsert queues one job upsert. backup_auto is not a column here:
-// the flag stays in SQLite, so the batch path and UpsertJob both omit it.
 func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 	j := jw.Job
 	dirtyFilesJSON, err := encodeDirtyFiles(j.DirtyFiles)

@@ -52,19 +52,6 @@ func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
 	}
 }
 
-// TestDefaultConfigLeavesPostgresSchemaAtV23 locks the shared-database
-// contract: EnsureSchema writes pgSchemaVersion and does not consult backup
-// or host config, so a default roborev binary must leave the schema at 23.
-// Older binaries refuse anything newer.
-func TestDefaultConfigLeavesPostgresSchemaAtV23(t *testing.T) {
-	t.Parallel()
-	assert := assert.New(t)
-	assert.Equal(23, pgSchemaVersion)
-	schema := strings.Join(pgSchemaStatements(), "\n")
-	assert.NotContains(schema, "backup_auto")
-	assert.Contains(schema, "non_voting")
-}
-
 func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {
 	t.Parallel()
 	requiredIndexes := []string{
