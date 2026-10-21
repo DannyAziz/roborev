@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/git"
@@ -207,6 +208,32 @@ func skippedCursorCloudBackupNote(backups ...string) string {
 		return ""
 	}
 	return fmt.Sprintf("\nbackup %q was skipped: %s is not set", cursorCloudAgentName, cursorcloud.EnvAPIKey)
+}
+
+// ErrCursorCloudFix refuses a fix on cursor-cloud. A Cursor cloud agent edits
+// files on its own VM, so a fix there never produces a local patch.
+var ErrCursorCloudFix = errors.New("cursor-cloud cannot run a fix: a Cursor cloud agent edits its own VM and never produces a local patch; use a local agent")
+
+// IsCursorCloudAgent reports whether name selects the cursor-cloud agent.
+func IsCursorCloudAgent(name string) bool {
+	return resolveAlias(strings.ToLower(strings.TrimSpace(name))) == cursorCloudAgentName
+}
+
+// KeepFixLocal keeps a run that must leave a local patch (fix, refine,
+// analyze --fix) off cursor-cloud. A cursor-cloud agent the caller named is
+// refused with ErrCursorCloudFix. A cursor-cloud preferred or backup agent
+// that came from config is dropped, so selection picks a local agent.
+func (w *WorkflowConfig) KeepFixLocal(explicit string) error {
+	if IsCursorCloudAgent(explicit) {
+		return ErrCursorCloudFix
+	}
+	if IsCursorCloudAgent(w.PreferredAgent) {
+		w.PreferredAgent = agentname.Auto
+	}
+	if IsCursorCloudAgent(w.BackupAgent) {
+		w.BackupAgent = ""
+	}
+	return nil
 }
 
 // explicitCursorCloud returns the cursor-cloud agent when name selects it.
