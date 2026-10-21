@@ -346,3 +346,34 @@ func TestResolveSingleAgentHostWithoutMarker(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, body.Error, "ROBOREV_HOST_AGENT")
 }
+
+// TestNoPromptFixRangeIsRefusedAndDoesNotRun is the original no-prompt fix
+// on a range ref. cursor-cloud must refuse that review so a worker cannot
+// claim and run it. The assertion is the enqueue result and the empty queue,
+// not the stored job type.
+func TestNoPromptFixRangeIsRefusedAndDoesNotRun(t *testing.T) {
+	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	db, tmpDir := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.MaxWorkers = 0
+	cfg.Host = agent.CursorCloudHost
+	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+	t.Cleanup(func() { _ = server.Close() })
+
+	repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
+	repo.CommitFile("a.txt", "one\n", "one")
+	repo.CommitFile("b.txt", "two\n", "two")
+	w := enqueueRaw(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD~1..HEAD",
+		JobType:  storage.JobTypeFix,
+		Agent:    "test",
+	})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "cannot run a range review")
+	claimed, err := db.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
+}
