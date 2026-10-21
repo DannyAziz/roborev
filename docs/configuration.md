@@ -1192,6 +1192,14 @@ requires `ROBOREV_HOST_AGENT=1`. An explicit `cursor-cloud` without
 `CURSOR_API_KEY` is an error; roborev does not fall back to a local agent. An
 explicit `host` without `ROBOREV_HOST_AGENT=1` is the same kind of error.
 
+`--host cursor-cloud` is stored on the job, and that job never runs on a local
+agent: budget routing does not substitute one, and the job never falls back to
+one, including a workflow backup. A launch refused before the create is sent (a
+bad ref, a missing remote, or the hourly launch limit) and a launch that fails
+after the create is sent both fail the job. When `host = "cursor-cloud"` in
+config or `ROBOREV_DEFAULT_HOST` selects cursor-cloud, a configured non-cloud
+backup may still run.
+
 The cloud review is created at the exact commit SHA and polled until it
 finishes. `CREATING` and any other unknown status stay in progress. The agent's
 final assistant message is the review. A finished agent with no assistant
@@ -2064,7 +2072,7 @@ attempt. A manual rerun on this daemon restores the pre-budget agent and backup
 settings, resolves its model again, and applies the current budget. Selecting an
 agent explicitly for the rerun replaces that original choice. The routing lock
 and original choices are local scheduling state and are not synced to other
-machines.
+machines. A `--host cursor-cloud` job is never routed.
 
 The daemon applies config reloads to subsequent job decisions. Spend is cached
 for up to 10 seconds, refreshes at UTC midnight, and is invalidated when this

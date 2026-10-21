@@ -63,6 +63,7 @@ func TestDefaultConfigLeavesPostgresSchemaAtV23(t *testing.T) {
 	assert.Equal(23, pgSchemaVersion)
 	schema := strings.Join(pgSchemaStatements(), "\n")
 	assert.NotContains(schema, "backup_auto")
+	assert.NotContains(schema, "explicit_host")
 	assert.Contains(schema, "non_voting")
 	assert.NotContains(schema, "review_job_cloud_launches")
 }

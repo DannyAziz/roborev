@@ -2054,6 +2054,14 @@ func failoverWorkflow(job *storage.ReviewJob) string {
 // Personal CI jobs use only a stored, locally resolved backup. Ordinary jobs
 // retain the workflow-config fallback.
 func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
+	// --host cursor-cloud is stored on the job. That job never fails over,
+	// including to the workflow backup resolved below: a launch refused
+	// before create and a launch that failed after send both fail the job.
+	// A config host or ROBOREV_DEFAULT_HOST leaves the bit unset and may
+	// still fail over to a non-cloud backup.
+	if job != nil && job.ExplicitHost && agent.CanonicalName(job.Agent) == agent.CursorCloudHost {
+		return ""
+	}
 	// An explicit per-job backup wins, for reliability: the enqueuer (e.g. a CI
 	// panel synthesis) chose this failover deliberately. Canonicalize the alias
 	// (e.g. "claude" -> "claude-code") via the registry; fall back to the raw

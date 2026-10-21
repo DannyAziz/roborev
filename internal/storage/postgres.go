@@ -22,9 +22,9 @@ import (
 )
 
 // pgSchemaVersion is the newest schema this binary will write.
-// It stays at 23: backup_auto is local SQLite state, like budget_routing_locked,
-// and is not a Postgres column. Writing 24 would make older binaries refuse
-// the shared database ("schema version 24 is newer").
+// It stays at 23: backup_auto and explicit_host are local SQLite state, like
+// budget_routing_locked, and are not Postgres columns. Writing 24 would make
+// older binaries refuse the shared database ("schema version 24 is newer").
 const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables

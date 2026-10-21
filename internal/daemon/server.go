@@ -3112,10 +3112,11 @@ type singleAgentInputs struct {
 }
 
 type resolvedSingleAgent struct {
-	Agent       string
-	Model       string
-	BackupAgent string
-	BackupModel string
+	Agent        string
+	Model        string
+	BackupAgent  string
+	BackupModel  string
+	ExplicitHost bool
 }
 
 // resolveSingleAgent resolves the single-review agent for the no-panel path:
@@ -3129,7 +3130,11 @@ func (s *Server) resolveSingleAgent(
 	if host, early := resolveEnqueueHost(in.workflow, in.req.ReviewType, enqueueHostJobType(in.req.JobType, in.req.CustomPrompt, in.gitRef), in.req.Host, in.repoCfg, in.cfg); early != nil {
 		return resolvedSingleAgent{}, early
 	} else if host != agent.ReviewHostLocal {
-		return resolvedSingleAgent{Agent: host, Model: in.requestedModel}, nil
+		return resolvedSingleAgent{
+			Agent:        host,
+			Model:        in.requestedModel,
+			ExplicitHost: strings.TrimSpace(in.req.Host) != "" && strings.EqualFold(host, agent.CursorCloudHost),
+		}, nil
 	}
 	resolution, err := agent.ResolveWorkflowConfigFromConfig(
 		in.req.Agent, in.repoCfg, in.cfg, in.workflow, in.reasoning,
@@ -3210,6 +3215,7 @@ func (s *Server) enqueueSingleAgent(
 	// A named backup stays empty so failover still reads the current workflow
 	// config. An "auto" backup, and any backup frozen by an experiment, is
 	// pinned now and kept even when the pin is empty.
+	o.ExplicitHost = execution.ExplicitHost
 	o.BackupAuto = backupIsAuto(in.repoCfg, in.cfg, in.workflow)
 	if o.BackupAuto || in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
