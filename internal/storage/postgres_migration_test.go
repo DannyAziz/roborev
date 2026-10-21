@@ -5,10 +5,13 @@ package storage
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"uuid"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +31,12 @@ var postgresV17Schema string
 
 //go:embed schemas/postgres_v18.sql
 var postgresV18Schema string
+
+// postgresV24HostBackendR6Schema is schemas/postgres_v24.sql from the
+// host-backend-r6 branch: version 23 plus review_jobs.backup_auto.
+//
+//go:embed testdata/postgres_v24_host_backend_r6.sql
+var postgresV24HostBackendR6Schema string
 
 // openTestPgPoolRawAtVersion bootstraps a fresh Postgres test pool at the
 // given older schema version by running only the corresponding embedded
@@ -53,6 +62,8 @@ func openTestPgPoolRawAtVersion(t *testing.T, version int) *PgPool {
 		14: postgresV14Schema,
 		17: postgresV17Schema,
 		18: postgresV18Schema,
+		23: pgSchemaSQL,
+		24: postgresV24HostBackendR6Schema,
 	}
 	schemaSQL, ok := schemas[version]
 	require.Truef(t, ok, "openTestPgPoolRawAtVersion: no embedded schema for version %d", version)
@@ -328,4 +339,38 @@ func TestPostgresMigration_EnsureSchemaKeepsCurrentVersion(t *testing.T) { //nol
 	var version int
 	require.NoError(t, pgxPool(pg).QueryRow(ctx, `SELECT MAX(version) FROM roborev.schema_version`).Scan(&version))
 	assert.Equal(t, pgSchemaVersion, version)
+}
+
+// TestPostgresMigration_KeepsVersion23And24 opens a v23 database and a
+// host-backend-r6 v24 database. Each keeps its own version, nothing records
+// 25, and a synced job writes into the v24 table despite its backup_auto
+// column.
+func TestPostgresMigration_KeepsVersion23And24(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	for _, version := range []int{23, 24} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			openTestPgPoolRawAtVersion(t, version)
+			ctx := t.Context()
+			pg := openTestPgPool(t)
+			require.NoError(t, pg.EnsureSchema(ctx))
+
+			rows, err := pgxPool(pg).Query(ctx, `SELECT version FROM roborev.schema_version ORDER BY version`)
+			require.NoError(t, err)
+			versions, err := pgx.CollectRows(rows, pgx.RowTo[int])
+			require.NoError(t, err)
+			assert.Equal(t, []int{version}, versions)
+
+			identity := "https://github.com/test/schema-v" + fmt.Sprint(version) + ".git"
+			repoID := createTestRepo(t, pg.Pool(), TestRepoOpts{Identity: identity})
+			commitID := createTestCommit(t, pg.Pool(), TestCommitOpts{RepoID: repoID, SHA: "schema-sha"})
+			ok, err := pg.BatchUpsertJobs(ctx, []JobWithPgIDs{{
+				Job: SyncableJob{
+					UUID: uuid.New(), RepoIdentity: identity, CommitSHA: "schema-sha", GitRef: "schema-sha",
+					Agent: "test", Status: "done", SourceMachineID: defaultTestMachineID, EnqueuedAt: time.Now(),
+				},
+				PgRepoID: repoID, PgCommitID: &commitID,
+			}})
+			require.NoError(t, err)
+			assert.Equal(t, 1, countSuccesses(ok))
+		})
+	}
 }
