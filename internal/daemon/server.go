@@ -1044,6 +1044,9 @@ func resolveRerunOpts(
 				"resolve selected agent %q: %w", selectedAgent, err,
 			)
 		}
+		if job.IsFixJob() && agent.IsCursorCloudAgent(selected.Name()) {
+			return storage.ReenqueueOpts{}, agent.ErrCursorCloudFix
+		}
 		if job.JobType == storage.JobTypeClassify && !agent.IsSchemaAgent(selected) {
 			return storage.ReenqueueOpts{}, fmt.Errorf(
 				"classifier reruns require a production SchemaAgent, got %q", selectedAgent,
@@ -3145,7 +3148,15 @@ type resolvedSingleAgent struct {
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
 ) (resolvedSingleAgent, *RawJSONOutput) {
-	if host, early := resolveEnqueueHost(in.workflow, in.req.ReviewType, enqueueHostJobType(in.req.JobType, in.req.CustomPrompt, in.gitRef), in.req.Host, in.repoCfg, in.cfg); early != nil {
+	hostJobType := enqueueHostJobType(in.req.JobType, in.req.CustomPrompt, in.gitRef)
+	// A fix must leave a local patch. A cursor-cloud host or agent named on
+	// the request is refused; one from config is dropped below.
+	isFix := hostJobType == storage.JobTypeFix
+	if isFix && agent.IsCursorCloudAgent(in.req.Host) {
+		out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: agent.ErrCursorCloudFix.Error()})
+		return resolvedSingleAgent{}, out
+	}
+	if host, early := resolveEnqueueHost(in.workflow, in.req.ReviewType, hostJobType, in.req.Host, in.repoCfg, in.cfg); early != nil {
 		return resolvedSingleAgent{}, early
 	} else if host != agent.ReviewHostLocal {
 		return resolvedSingleAgent{
@@ -3163,6 +3174,12 @@ func (s *Server) resolveSingleAgent(
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
 		return resolvedSingleAgent{}, out
+	}
+	if isFix {
+		if err := resolution.KeepFixLocal(in.req.Agent); err != nil {
+			out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return resolvedSingleAgent{}, out
+		}
 	}
 	agentName := resolution.PreferredAgent
 	resolved, err := agent.GetPreferredOrBackupEligible(
@@ -3677,6 +3694,9 @@ func (s *Server) humaFixJob(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
+	}
+	if err := resolution.KeepFixLocal(""); err != nil {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 	}
 	agentName := resolution.PreferredAgent
 	if resolved, err := agent.GetPreferredOrBackupWithConfig(

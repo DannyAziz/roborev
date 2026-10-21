@@ -847,6 +847,9 @@ func runFixAgent(cmd *cobra.Command, repoPath, agentName, model, reasoning, prom
 	if err != nil {
 		return fmt.Errorf("resolve workflow config: %w", err)
 	}
+	if err := resolution.KeepFixLocal(agentName); err != nil {
+		return err
+	}
 	agentName = resolution.PreferredAgent
 
 	a, err := agent.GetPreferredOrBackupWithConfig(

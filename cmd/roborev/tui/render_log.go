@@ -212,8 +212,9 @@ func classifyReasoningLines(job *storage.ReviewJob, width int) []string {
 		// raw classifier stderr/error text and routinely contains
 		// '\n'; without this, multiline blobs would wrap across
 		// terminal rows while logVisibleLines reserves only one row
-		// per returned line, pushing status/help off the screen.
-		text = foldWhitespace(text)
+		// per returned line, pushing status/help off the screen. The
+		// text is untrusted, so escapes and control characters go first.
+		text = foldWhitespace(sanitizeForDisplay(text))
 		if width > 0 && runewidth.StringWidth(text) > width {
 			text = runewidth.Truncate(text, width, "…")
 		}

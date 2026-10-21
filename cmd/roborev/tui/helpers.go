@@ -57,16 +57,17 @@ func keyRunes(msg tea.KeyMsg) []rune {
 	return nil
 }
 
-// setFlash sets a flash message with the given duration and view.
+// setFlash sets a flash message with the given duration and view. The
+// message often carries daemon or agent error text, so it is sanitized.
 func (m *model) setFlash(msg string, d time.Duration, v viewKind) {
-	m.flashMessage = msg
+	m.flashMessage = sanitizeForDisplay(msg)
 	m.flashExpiresAt = time.Now().Add(d)
 	m.flashView = v
 	m.flashWarning = false
 }
 
 func (m *model) setWarningFlash(msg string, d time.Duration, v viewKind) {
-	m.flashMessage = msg
+	m.flashMessage = sanitizeForDisplay(msg)
 	m.flashExpiresAt = time.Now().Add(d)
 	m.flashView = v
 	m.flashWarning = true

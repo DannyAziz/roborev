@@ -406,6 +406,9 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve workflow config: %w", err)
 	}
+	if err := resolution.KeepFixLocal(opts.agentName); err != nil {
+		return err
+	}
 
 	// 2. Connect to daemon (only after all validation passes)
 	if err := ensureDaemon(); err != nil {

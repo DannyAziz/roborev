@@ -1032,6 +1032,13 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 	wp.logJobStarted(workerID, job)
 
+	// A cursor-cloud agent edits its own VM, so a fix there never leaves a
+	// local patch. Refuse it before launch; a local backup may still run it.
+	if job.IsFixJob() && agent.IsCursorCloudAgent(job.Agent) {
+		wp.failoverOrFailNonRetryableAgentContext(ctx, workerID, job, job.Agent, agent.ErrCursorCloudFix.Error())
+		return
+	}
+
 	// Skip immediately if the agent is in quota cooldown.
 	// Resolve alias so "claude" checks cooldown for "claude-code".
 	canonicalAgent := agent.CanonicalName(job.Agent)
@@ -2068,6 +2075,15 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 // resolveBackupAgentWithSkip is resolveBackupAgent plus a note naming the
 // marker when the backup is host and this daemon has no host model.
 func (wp *WorkerPool) resolveBackupAgentWithSkip(job *storage.ReviewJob) (string, string) {
+	backup, note := wp.resolveConfiguredBackupAgent(job)
+	// A fix never fails over to cursor-cloud: it cannot leave a local patch.
+	if job.IsFixJob() && agent.IsCursorCloudAgent(backup) {
+		return "", note
+	}
+	return backup, note
+}
+
+func (wp *WorkerPool) resolveConfiguredBackupAgent(job *storage.ReviewJob) (string, string) {
 	// --host cursor-cloud is stored on the job. That job never fails over,
 	// including to the workflow backup resolved below: a launch refused
 	// before create and a launch that failed after send both fail the job.

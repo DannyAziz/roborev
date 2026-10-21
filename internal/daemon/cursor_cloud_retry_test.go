@@ -543,10 +543,9 @@ func TestCursorCloudPreLaunchValidationCanFailOver(t *testing.T) {
 	assert.Equal(t, 0, updated.RetryCount)
 }
 
-// A cloud fix job that returns without a usable patch must not launch again.
-// The cloud agent edits its own VM, so the local worktree has no changes, and
-// the ordinary retry of "no file changes" POSTs another agent.
-func TestProcessJobCursorCloudFixWithoutPatchDoesNotRelaunch(t *testing.T) {
+// A fix job on cursor-cloud is refused before any launch. The cloud agent
+// edits its own VM, so it can never leave a local patch.
+func TestProcessJobCursorCloudFixIsRefusedBeforeLaunch(t *testing.T) {
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret")
 	wtc, fake := cursorCloudRestartFixture(t)
 	wtc.Pool.retryBackoff = 0
@@ -581,12 +580,12 @@ func TestProcessJobCursorCloudFixWithoutPatchDoesNotRelaunch(t *testing.T) {
 		}
 		job = next
 	}
-	assert.Equal(t, 1, createCountFromFake(fake))
+	assert.Equal(t, 0, createCountFromFake(fake))
 	stored, err := wtc.DB.GetJobByID(fix.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 0, stored.RetryCount)
 	assert.Equal(t, storage.JobStatusFailed, stored.Status)
-	assert.Contains(t, stored.Error, "agent produced no file changes")
+	assert.Contains(t, stored.Error, "never produces a local patch")
 }
 
 // An origin whose query carries a token is stored as main stores it, but

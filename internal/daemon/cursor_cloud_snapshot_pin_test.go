@@ -135,6 +135,8 @@ func cursorCloudPinServer(t *testing.T, cfg *config.Config) (*Server, *cursorclo
 	if cfg == nil {
 		cfg = config.DefaultConfig()
 		cfg.MaxWorkers = 0
+		// Pin tests may select cursor-cloud from repository config.
+		cfg.AllowCursorCloud = true
 	}
 	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
 	t.Cleanup(func() { _ = server.Close() })

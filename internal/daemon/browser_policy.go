@@ -181,7 +181,8 @@ func isLoopbackAuthority(authority string) bool {
 		return false
 	}
 	host := strings.Trim(strings.ToLower(parsed.Hostname()), "[]")
-	if host == "localhost" {
+	// A fully qualified "localhost." names the same loopback host.
+	if host == "localhost" || host == "localhost." {
 		return true
 	}
 	ip := net.ParseIP(host)
