@@ -22,7 +22,9 @@ type CloudLaunch struct {
 	Token     string
 	TokenNull bool
 	AgentID   string
-	RepoPath  string
+	// AgentDeleted means the delete of AgentID was confirmed.
+	AgentDeleted bool
+	RepoPath     string
 	// RepoIdentity is the repository URL sent when this launch was created.
 	// Recovery lists against it. A later change to the checkout remote is not
 	// the create target.
@@ -71,18 +73,11 @@ func (db *DB) MarkCloudLaunchCleaned(launchID int64) error {
 	return err
 }
 
-// CloudLaunchSweepSeen reports whether an earlier pass already listed this
-// launch. The pass that lists does not clean. A later restart reads this
-// before it lists again.
-func (db *DB) CloudLaunchSweepSeen(id int64) (bool, error) {
-	var seen int
-	err := db.QueryRow(`SELECT sweep_seen FROM review_job_cloud_launches WHERE id = ?`, id).Scan(&seen)
-	return seen != 0, err
-}
-
-// NoteCloudLaunchSweep records that this pass listed. It does not clean.
-func (db *DB) NoteCloudLaunchSweep(id int64) error {
-	_, err := db.Exec(`UPDATE review_job_cloud_launches SET sweep_seen = 1 WHERE id = ? AND cleaned = 0`, id)
+// MarkCloudAgentDeleted records a confirmed delete of the launch's agent id.
+// Restart then skips the delete by id and only sweeps by marker.
+func (db *DB) MarkCloudAgentDeleted(jobID int64, token string) error {
+	_, err := db.Exec(`UPDATE review_job_cloud_launches SET agent_deleted = 1
+		WHERE job_id = ? AND launch_token = ? AND agent_id != ''`, jobID, token)
 	return err
 }
 
@@ -90,7 +85,6 @@ func (db *DB) NoteCloudLaunchSweep(id int64) error {
 // and token. The same token on another job or repo stays uncleaned.
 // After the job row is deleted, recovery still cleans that launch by job id
 // and token. orphan_note changes only inside MarkCloudLaunchCleaned.
-// Callers mark cleaned only after SweepAllowsClean.
 func (db *DB) MarkCloudLaunchCleanedByToken(jobID, repoID int64, token string) error {
 	rows, err := db.Query(`SELECT l.id
 		FROM review_job_cloud_launches l
@@ -123,7 +117,7 @@ func (db *DB) MarkCloudLaunchCleanedByToken(jobID, repoID int64, token string) e
 }
 
 func (db *DB) ListUncleanedCloudLaunches() ([]CloudLaunch, error) {
-	rows, err := db.Query(`SELECT l.id, l.job_id, COALESCE(j.repo_id, 0), l.launch_token, COALESCE(l.agent_id, ''), COALESCE(r.root_path, ''),
+	rows, err := db.Query(`SELECT l.id, l.job_id, COALESCE(j.repo_id, 0), l.launch_token, COALESCE(l.agent_id, ''), l.agent_deleted, COALESCE(r.root_path, ''),
 		COALESCE(l.repo_identity, ''), COALESCE(l.created_at, '')
 		FROM review_job_cloud_launches l
 		LEFT JOIN review_jobs j ON j.id = l.job_id
@@ -137,7 +131,7 @@ func (db *DB) ListUncleanedCloudLaunches() ([]CloudLaunch, error) {
 	for rows.Next() {
 		var row CloudLaunch
 		var token sql.NullString
-		if err := rows.Scan(&row.ID, &row.JobID, &row.RepoID, &token, &row.AgentID, &row.RepoPath, &row.RepoIdentity, &row.CreatedAt); err != nil {
+		if err := rows.Scan(&row.ID, &row.JobID, &row.RepoID, &token, &row.AgentID, &row.AgentDeleted, &row.RepoPath, &row.RepoIdentity, &row.CreatedAt); err != nil {
 			return nil, err
 		}
 		row.TokenNull = !token.Valid
@@ -351,11 +345,11 @@ func (db *DB) keepCloudLaunchAfterJobDelete() error {
 			repo_identity TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT '',
 			orphan_note TEXT NOT NULL DEFAULT '',
-			sweep_seen INTEGER NOT NULL DEFAULT 0)`,
+			agent_deleted INTEGER NOT NULL DEFAULT 0)`,
 		`INSERT INTO review_job_cloud_launches_keep
-			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, sweep_seen)
+			(id, job_id, launch_token, agent_id, cleaned, repo_identity, created_at, orphan_note, agent_deleted)
 			SELECT id, job_id, launch_token, agent_id, cleaned,
-				repo_identity, created_at, orphan_note, sweep_seen
+				repo_identity, created_at, orphan_note, agent_deleted
 			FROM review_job_cloud_launches`,
 		`DROP TABLE review_job_cloud_launches`,
 		`ALTER TABLE review_job_cloud_launches_keep RENAME TO review_job_cloud_launches`,

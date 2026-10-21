@@ -59,7 +59,7 @@ func TestReviewBackupCloudCleanupCrashDoesNotRelaunch(t *testing.T) {
 	require.Equal(t, 1, creates)
 	// The in-process delete already removed the VM. This start still has
 	// the uncleaned row, so it does not queue another create.
-	_ = recoverStaleJobs(context.Background(), tc.DB, fake)
+	_ = cursorCloudRecover(t, tc, fake)
 	drainRecoveredJob(t, tc, job.ID, false)
 
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
@@ -154,10 +154,9 @@ func TestCIMemberCloudCleanupCrashDoesNotRelaunch(t *testing.T) {
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
 	require.Equal(t, 1, creates)
-	// The review already deleted the VM. Restart sees that 404 as gone.
-	// The lag gate leaves the row uncleaned and does not relaunch.
-	err = recoverStaleJobs(context.Background(), tc.DB, fake)
-	require.ErrorContains(t, err, "not listed yet")
+	// The review already deleted the VM. Restart sees that 404 as gone
+	// and does not relaunch.
+	_ = cursorCloudRecover(t, tc, fake)
 	drainRecoveredJob(t, tc, job.ID, false)
 
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
@@ -215,7 +214,6 @@ func TestCISynthesisCloudCleanupCrashDoesNotRelaunch(t *testing.T) {
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
 	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
 	assert.Contains(t, updated.Error, storage.CloudLaunchInterruptedError)
-	assert.Contains(t, updated.Error, "orphan risk")
 	assert.Equal(t, primary, updated.Agent)
 	assert.Equal(t, storage.JobSourceCI, updated.Source)
 	assert.Equal(t, 0, updated.RetryCount)
@@ -258,8 +256,7 @@ func TestClassifyToDesignCloudCleanupCrashDoesNotRelaunch(t *testing.T) {
 
 	creates := cursorCloudCallCount(fake, cursorcloudtest.MethodCreate)
 	require.Equal(t, 1, creates)
-	err = recoverStaleJobs(context.Background(), tc.DB, fake)
-	require.ErrorContains(t, err, "not listed yet")
+	_ = cursorCloudRecover(t, tc, fake)
 	drainRecoveredJob(t, tc, job.ID, false)
 
 	assert.Equal(t, creates, cursorCloudCallCount(fake, cursorcloudtest.MethodCreate))
@@ -279,7 +276,7 @@ func assertBackupLaunchCleaned(t *testing.T, tc *workerTestContext, jobID int64,
 	assert.Equal(t, agent.CursorCloudHost, job.BackupAgent)
 	uncleaned, err := tc.DB.CountUncleanedCloudLaunches(jobID)
 	require.NoError(t, err)
-	assert.Equal(t, 1, uncleaned)
+	assert.Equal(t, 0, uncleaned)
 	var rows int
 	require.NoError(t, tc.DB.QueryRow(
 		`SELECT COUNT(*) FROM review_job_cloud_launches WHERE job_id = ?`, jobID,

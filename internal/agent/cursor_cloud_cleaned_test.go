@@ -41,6 +41,40 @@ func TestCursorCloudInFlightCreateWithoutVMIsNotCleaned(t *testing.T) {
 	assert.Empty(t, cursorCloudDeleteIDs(client.Fake))
 }
 
+// TestCursorCloudReconcileDeleteCleans is a create whose response was lost
+// but whose VM was listed. Reconcile deletes it and cleans the launch.
+func TestCursorCloudReconcileDeleteCleans(t *testing.T) {
+	var cleaned int
+	client := &lostCreate{Fake: &cursorcloudtest.Fake{}}
+	cloud := &CursorCloudAgent{
+		Client:  client,
+		RepoURL: "https://example.com/acme/repo.git",
+		MarkLaunchCleaned: func(string) error {
+			cleaned++
+			return nil
+		},
+	}
+	_, err := cloud.Review(
+		context.Background(), t.TempDir(),
+		"0123456789abcdef0123456789abcdef01234567", "prompt", nil,
+	)
+	require.Error(t, err)
+	assert.Equal(t, 1, cleaned)
+	assert.Len(t, cursorCloudDeleteIDs(client.Fake), 1)
+}
+
+// lostCreate creates the VM and then loses the response.
+type lostCreate struct {
+	*cursorcloudtest.Fake
+}
+
+func (c *lostCreate) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
+	if _, err := c.Fake.CreateAgent(ctx, req); err != nil {
+		return cursorcloud.Agent{}, err
+	}
+	return cursorcloud.Agent{}, context.DeadlineExceeded
+}
+
 type deadlineCreate struct {
 	*cursorcloudtest.Fake
 }

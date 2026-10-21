@@ -847,6 +847,31 @@ func (db *DB) RequeueUpdateInterruptedJob(
 	return rows > 0, err
 }
 
+// RequeueJobNotBefore returns a running attempt to the queue without
+// consuming a retry. No worker claims it before notBefore.
+func (db *DB) RequeueJobNotBefore(jobID int64, workerID string, notBefore time.Time) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'queued',
+		    worker_id = NULL,
+		    started_at = NULL,
+		    session_id = NULL,
+		    session_resumed = 0,
+		    resume_source_job_uuid = NULL,
+		    token_usage = NULL,
+		    command_line = NULL,
+		    agent_invoked = 0,
+		    synced_at = NULL,
+		    retry_not_before = ?
+		WHERE id = ? AND status = 'running' AND worker_id = ?
+	`, preciseTimestampAt(notBefore), jobID, workerID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
 // ListRunningJobIDs returns the jobs that own worker attempts at the time of
 // the query. Update preparation calls this after persisting the claim gate, so
 // the result is the complete cutover set.

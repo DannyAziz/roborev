@@ -116,10 +116,9 @@ type WorkerPool struct {
 	retryBackoff time.Duration
 
 	// Test hooks for deterministic synchronization (nil in production)
-	testHookAfterSecondCheck    func()                  // Called after second runningJobs check, before second DB lookup
-	testHookCooldownLockUpgrade func()                  // Called between RUnlock and Lock in isAgentCoolingDown
-	goalReviewRunner            goalReviewRunner        // Test-only schema adapter; nil in production.
-	goalReviewAdmit             func(agent.Agent) error // Test-only stand-in for goalreview.ValidateAgent.
+	testHookAfterSecondCheck    func()           // Called after second runningJobs check, before second DB lookup
+	testHookCooldownLockUpgrade func()           // Called between RUnlock and Lock in isAgentCoolingDown
+	goalReviewRunner            goalReviewRunner // Test-only schema adapter; nil in production.
 }
 
 // NewWorkerPool creates a new worker pool
@@ -723,6 +722,7 @@ func (wp *WorkerPool) bindCursorCloudLaunch(workerID string, job *storage.Review
 	}
 	copied.BindAgent = func(token, id string) error { return wp.db.AttachCloudAgent(job.ID, token, id) }
 	copied.NoteCleanupFailure = func(msg string) error { return wp.db.NoteCloudLaunchRisk(job.ID, msg) }
+	copied.MarkAgentDeleted = func(token string) error { return wp.db.MarkCloudAgentDeleted(job.ID, token) }
 	copied.MarkLaunchCleaned = func(token string) error {
 		return wp.db.MarkCloudLaunchCleanedByToken(job.ID, job.RepoID, token)
 	}
@@ -1740,6 +1740,10 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	agentName string,
 	executionErr error,
 ) {
+	if capErr, ok := errors.AsType[*agent.CursorCloudCapError](executionErr); ok {
+		wp.requeueCursorCloudCap(workerID, job, capErr)
+		return
+	}
 	// Same sentinel as the processJob deadline branch. A 429 is classified
 	// as transient from its text and would reach RetryJob if this ran only
 	// when the classification is LimitKindNone.
@@ -1766,9 +1770,8 @@ func (wp *WorkerPool) failOrRetryAgentExecutionContext(
 	if !attached {
 		classification = wp.classify(agent.CanonicalName(agentName), errorMsg)
 	}
-	// A cap refusal or other pre-launch unavailable error with no backup is
-	// permanent: failover has nowhere to go, and retrying cursor-cloud would
-	// only hit the same cap.
+	// A pre-launch unavailable error with no backup is permanent: failover
+	// has nowhere to go.
 	if classification.Kind == agent.LimitKindNone && agent.IsUnavailable(executionErr) {
 		wp.failoverOrFailNonRetryableAgentContext(
 			ctx, workerID, job, agentName, review.UnavailableError(errorMsg),
@@ -1914,6 +1917,25 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
 		}
 	}
+}
+
+// requeueCursorCloudCap puts a job the launch cap refused back in the
+// queue. Nothing was launched, so no retry is spent. The job waits until
+// the hourly cap frees a slot, or the usual retry backoff for the
+// concurrent cap.
+func (wp *WorkerPool) requeueCursorCloudCap(workerID string, job *storage.ReviewJob, capErr *agent.CursorCloudCapError) {
+	notBefore := capErr.RetryAt
+	if notBefore.IsZero() {
+		notBefore = time.Now().Add(wp.retryBackoff)
+	}
+	wp.runAttemptTransition(workerID, job, func() {
+		requeued, err := wp.db.RequeueJobNotBefore(job.ID, workerID, notBefore)
+		if err != nil || !requeued {
+			log.Printf("[%s] cursor-cloud cap requeue for job %d failed: %v", workerID, job.ID, err)
+			return
+		}
+		log.Printf("[%s] %v; job %d requeued until %s", workerID, capErr, job.ID, notBefore.Format(time.RFC3339))
+	})
 }
 
 // failFixAfterRunContext fails a fix whose agent already returned. A

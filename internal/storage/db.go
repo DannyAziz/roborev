@@ -1617,14 +1617,14 @@ func (db *DB) ensureCloudLaunchTable() error {
 		id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL,
 		launch_token TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', cleaned INTEGER NOT NULL DEFAULT 0,
 		repo_identity TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
-		sweep_seen INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		agent_deleted INTEGER NOT NULL DEFAULT 0)`); err != nil {
 		return fmt.Errorf("cloud launch table: %w", err)
 	}
 	for _, stmt := range []string{
 		`ALTER TABLE review_job_cloud_launches ADD COLUMN repo_identity TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE review_job_cloud_launches ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE review_job_cloud_launches ADD COLUMN orphan_note TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE review_job_cloud_launches ADD COLUMN sweep_seen INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE review_job_cloud_launches ADD COLUMN agent_deleted INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("cloud launch column: %w", err)

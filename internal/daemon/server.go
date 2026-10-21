@@ -319,8 +319,8 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Reset stale jobs from previous runs. A cursor-cloud launch that may
-	// already exist is failed and its agents are stopped.
-	if err := s.recoverStaleJobs(ctx); err != nil {
+	// already exist is failed, not requeued.
+	if err := s.db.ResetStaleJobs(); err != nil {
 		log.Printf("Warning: failed to reset stale jobs: %v", err)
 	}
 
@@ -374,6 +374,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		serveErrCh <- s.httpServer.Serve(serveListener)
 	}()
+	s.startCloudLaunchRecovery(ctx)
 
 	if err := cleanupStaleCIWorktrees(ctx); err != nil {
 		log.Printf("Warning: failed to clean up stale CI worktrees: %v", err)

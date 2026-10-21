@@ -59,54 +59,10 @@ const (
 // fixture and is not used.
 var cursorCloudReconcileWindow = 60 * time.Second
 
-// cursorCloudNow is the clock for the independent-sweep delay. Tests replace it.
-var cursorCloudNow = time.Now
-
-// cursorCloudPendingOrphanNote is written on the job while a launch stays
-// uncleaned. MarkCloudLaunchCleaned clears the copy stored on the launch row.
-const cursorCloudPendingOrphanNote = "cursor-cloud orphan risk: launch pending cleanup"
-
-// CursorCloudPendingOrphanNote is the job error text stored while a launch
-// stays uncleaned.
-func CursorCloudPendingOrphanNote() string { return cursorCloudPendingOrphanNote }
-
-// SweepAllowsClean is the only gate for marking a launch cleaned.
-// found means this sweep deleted a VM, so it is not an empty sweep.
-// byIDDeleted means every VM found so far was removed by id.
-// independent means an earlier pass already listed. A second list inside
-// the pass that is deciding, including a reconcile retry, stays false.
-// minDelay is config cloud_launch_clean_delay_hours. A valid repo value of
-// at least 1 hour wins over global; 0, negative, and unparseable clamp to
-// 1 hour. A same-day restart still has to be able to see a VM an earlier
-// list missed, so an empty sweep before that age does not clean. It is not
-// a measured listing lag. A non-positive duration is already elapsed, so
-// restart must not pass one.
-func SweepAllowsClean(found, byIDDeleted, independent bool, since, now time.Time, minDelay time.Duration) bool {
-	if found || !byIDDeleted || !independent || since.IsZero() {
-		return false
-	}
-	// A non-positive delay is not a hold. Restart normalizes the configured
-	// hours to at least one hour before calling. In-process sweeps pass
-	// independent false, so they still do not clean.
-	if minDelay <= 0 {
-		return !now.Before(since)
-	}
-	return !now.Before(since.Add(minDelay))
-}
-
-// SetCursorCloudClockForTest replaces the listing-lag clock. The returned
-// function restores the previous clock.
-func SetCursorCloudClockForTest(now func() time.Time) func() {
-	prev := cursorCloudNow
-	if now == nil {
-		now = time.Now
-	}
-	cursorCloudNow = now
-	return func() { cursorCloudNow = prev }
-}
-
-// CursorCloudNow returns the listing-lag clock.
-func CursorCloudNow() time.Time { return cursorCloudNow() }
+// CursorCloudReconcileWindow is how long a sent create is looked for in
+// the agent list. Restart uses the same window before it treats an
+// ambiguous create that is not listed as never created.
+func CursorCloudReconcileWindow() time.Duration { return cursorCloudReconcileWindow }
 
 // cursorCloudReconcilePassTimeout is the one deadline shared by every
 // candidate conversation read in a reconcile pass. It is the existing
@@ -238,13 +194,12 @@ type CursorCloudAgent struct {
 	// NoteCleanupFailure records a stop or delete that did not finish.
 	// The launch row stays uncleaned.
 	NoteCleanupFailure func(msg string) error
-	// MarkLaunchCleaned runs only after SweepAllowsClean. The storage
-	// callback clears orphan_note. An in-process sweep is not independent,
-	// so it does not call this.
+	// MarkAgentDeleted records that the delete of the created id was
+	// confirmed, so a restart does not delete it again.
+	MarkAgentDeleted func(token string) error
+	// MarkLaunchCleaned runs after every VM carrying the launch marker was
+	// confirmed deleted and a marker list showed no other match.
 	MarkLaunchCleaned func(token string) error
-	// launchedAt is when this call created the VM. A later independent
-	// sweep uses it as the start of the minimum delay.
-	launchedAt time.Time
 }
 
 // SetLaunchLimitsForTest installs a private launch gate on a.
@@ -313,9 +268,9 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 
 	release, refund, err := a.launchGate().acquire()
 	if err != nil {
-		// The cap refused before CreateAgent. Nothing was launched, so a
-		// local backup may take the job. The hourly counter was not charged.
-		return "", MarkUnavailable(err)
+		// The cap refused before CreateAgent. Nothing was launched and the
+		// hourly counter was not charged. The worker requeues the job.
+		return "", err
 	}
 	defer release()
 
@@ -344,7 +299,6 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			return "", bindErr
 		}
 	}
-	a.launchedAt = cursorCloudNow()
 	marker := CursorCloudLaunchMarker(a.DaemonID, token)
 	reconcileToken := token
 	if id := strings.TrimSpace(a.DaemonID); id != "" {
@@ -384,11 +338,6 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			}
 			err = errors.Join(err, recErr)
 		}
-		// The reconcile list is part of this create. It does not clean.
-		// The job keeps the orphan note until a later restart.
-		if noteErr := a.noteLaunchPending(); noteErr != nil {
-			err = errors.Join(err, noteErr)
-		}
 		return "", cursorCloudNonRetryable(err)
 	}
 	// Delete is armed before any later work, including the status line, so a
@@ -399,6 +348,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 			// The id from this response is gone. A provider-side duplicate
 			// shares the marker and is not that id, so the row is cleaned
 			// only after the sweep deletes every remaining match.
+			if a.MarkAgentDeleted != nil {
+				if markErr := a.MarkAgentDeleted(token); markErr != nil {
+					log.Printf("cursor-cloud: confirmed delete of %s was not recorded: %v", created.ID, markErr)
+				}
+			}
 			if cleanErr := a.markLaunchCleanedAfterDelete(client, repoURL, token, reconcileToken, output); cleanErr != nil {
 				log.Printf("cursor-cloud: launch row left uncleaned after delete: %v", cleanErr)
 				if a.NoteCleanupFailure != nil {
@@ -548,11 +502,15 @@ func deleteCursorCloudAgent(ctx context.Context, client cursorcloud.Client, id s
 	// stop fails. https://cursor.com/docs/cloud-agent/api/v0#stop-an-agent
 	// https://cursor.com/docs/cloud-agent/api/v0#delete-an-agent
 	// Stop and each DELETE get a fresh timeout. Sharing one 60s context let
-	// a stalled stop starve the deletes. The wait between DELETE attempts
-	// uses ctx, so a cancel stops the retry without skipping the first try.
+	// a stalled stop starve the deletes. The retries run on a context
+	// detached from the caller, so a review that already timed out or was
+	// canceled still gets every attempt. Its budget is the worst case of
+	// the loop: each attempt's timeout plus a capped wait before each retry.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), (2*cursorCloudDeleteAttempts-1)*cursorCloudDeleteTimeout)
+	defer retryCancel()
 	var stopNotePanic any
 	defer func() {
 		if stopNotePanic != nil {
@@ -566,10 +524,8 @@ func deleteCursorCloudAgent(ctx context.Context, client cursorcloud.Client, id s
 		note := fmt.Errorf("cursor-cloud: stop agent %s: %w", id, stopErr)
 		stopNotePanic = cleanupNotePanic(output, note.Error())
 	}
-	err := retryCursorCloud(ctx, cursorCloudDeleteRetryable, func() error {
-		// WithoutCancel so a cancel during this attempt still finishes it.
-		// The next attempt's wait observes the cancel.
-		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorCloudDeleteTimeout)
+	err := retryCursorCloud(retryCtx, cursorCloudDeleteRetryable, func() error {
+		delCtx, cancel := context.WithTimeout(retryCtx, cursorCloudDeleteTimeout)
 		defer cancel()
 		return client.DeleteAgent(delCtx, id)
 	})
@@ -676,7 +632,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 	// started only decides whether another pass begins. Each pass's
 	// conversation reads share one deadline that starts before that
 	// pass's list, so a slow list consumes it.
-	started := cursorCloudNow()
+	started := time.Now()
 	marker := cursorCloudLaunchMarker + token
 	var errs []error
 	foundLaunch := false
@@ -688,7 +644,7 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 			errs = appendReconcileErr(errs, err)
 			break
 		}
-		if attempt > 0 && !cursorCloudNow().Before(started.Add(cursorCloudReconcileWindow)) {
+		if attempt > 0 && !time.Now().Before(started.Add(cursorCloudReconcileWindow)) {
 			windowExpired = true
 			break
 		}
@@ -703,7 +659,9 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		var found bool
 		var matchErr error
 		if err == nil {
-			found, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, marker, output)
+			var matched map[string]bool
+			matched, matchErr = deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, []string{marker}, output)
+			found = matched[marker]
 		}
 		passCancel()
 		if err != nil {
@@ -717,9 +675,8 @@ func reconcileCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, 
 		} else if found || matchErr != nil {
 			if matchErr != nil {
 				errs = appendReconcileErr(errs, matchErr)
-			} else if len(onCleaned) > 0 && onCleaned[0] != nil && SweepAllowsClean(found, true, false, started, cursorCloudNow(), 0) {
-				// This list is inside the create call. A later restart is
-				// the independent empty sweep. This one does not clean.
+			} else if len(onCleaned) > 0 && onCleaned[0] != nil {
+				// Every agent with this marker was found and deleted.
 				if markErr := onCleaned[0](); markErr != nil {
 					errs = appendReconcileErr(errs, markErr)
 				}
@@ -891,9 +848,12 @@ func MarkCursorCloudSent(err error) error {
 	return cursorCloudNonRetryable(err)
 }
 
-func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL, marker string, output io.Writer) (bool, error) {
+// deleteMatchingCursorCloudLaunch reads the prompt of every listed agent in
+// repoURL once and deletes each one that carries one of markers. It returns
+// the markers it found. A delete failure stops the pass.
+func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Client, agents []cursorcloud.Agent, repoURL string, markers []string, output io.Writer) (map[string]bool, error) {
 	var errs []error
-	found := false
+	found := map[string]bool{}
 	for _, ag := range agents {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
@@ -910,12 +870,13 @@ func deleteMatchingCursorCloudLaunch(ctx context.Context, client cursorcloud.Cli
 			}
 			continue
 		}
-		if !strings.Contains(text, marker) {
+		i := slices.IndexFunc(markers, func(m string) bool { return strings.Contains(text, m) })
+		if i < 0 {
 			continue
 		}
-		found = true
+		found[markers[i]] = true
 		if delErr := deleteCursorCloudAgent(ctx, client, ag.ID, output); delErr != nil {
-			return true, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
+			return found, fmt.Errorf("cursor-cloud: orphan agent %s: %w", ag.ID, delErr)
 		}
 	}
 	return found, errors.Join(errs...)
@@ -935,9 +896,8 @@ func (a *CursorCloudAgent) markLaunchCleaned(token string) error {
 // markLaunchCleanedAfterDelete lists once more so a provider-side duplicate
 // of token is deleted before the row is cleaned. That list retries a
 // transient 429, 5xx, or timeout. The id already removed is not in that
-// list. A list or delete error leaves the row uncleaned. This list is part
-// of the same call as the delete, so it is not an independent sweep and
-// does not clean. The job keeps the orphan note until a later restart.
+// list. A list or delete error leaves the row uncleaned for the restart
+// sweep.
 func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Client, repoURL, token, reconcileToken string, output io.Writer) error {
 	if a == nil || a.MarkLaunchCleaned == nil {
 		return nil
@@ -950,24 +910,12 @@ func (a *CursorCloudAgent) markLaunchCleanedAfterDelete(client cursorcloud.Clien
 		return fmt.Errorf("cursor-cloud orphan risk: pending cleanup: cleanup list: %w", err)
 	}
 	passCtx, passCancel := context.WithTimeout(context.Background(), cursorCloudReconcilePassTimeout)
-	found, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, cursorCloudLaunchMarker+reconcileToken, output)
+	_, sweepErr := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, []string{cursorCloudLaunchMarker + reconcileToken}, output)
 	passCancel()
 	if sweepErr != nil {
 		return sweepErr
 	}
-	// Same call as the id delete. SweepAllowsClean refuses it. The orphan
-	// note stays on the job until a later independent empty sweep.
-	if !SweepAllowsClean(found, true, false, a.launchedAt, cursorCloudNow(), 0) {
-		return a.noteLaunchPending()
-	}
 	return a.markLaunchCleaned(token)
-}
-
-func (a *CursorCloudAgent) noteLaunchPending() error {
-	if a == nil || a.NoteCleanupFailure == nil {
-		return nil
-	}
-	return a.NoteCleanupFailure(cursorCloudPendingOrphanNote)
 }
 
 // CursorCloudRepoUsable is false for empty input and the redacted-url sentinel.
@@ -979,55 +927,32 @@ func CursorCloudRepoUsable(raw string) bool {
 	return config.RemoteIdentity(raw) != ""
 }
 
-func DeleteCursorCloudLaunchByMarker(ctx context.Context, client cursorcloud.Client, daemonID, token, repoURL string) (bool, error) {
-	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || strings.TrimSpace(token) == "" || !CursorCloudRepoUsable(repoURL) {
-		return false, errors.New("cursor-cloud: cleanup marker is incomplete")
+// SweepCursorCloudLaunches lists agents once and deletes every agent in
+// repoURL whose prompt carries the marker of one of tokens. It returns the
+// tokens it found. An error means the sweep did not finish, so no token can
+// be treated as clean.
+func SweepCursorCloudLaunches(ctx context.Context, client cursorcloud.Client, daemonID, repoURL string, tokens []string) (map[string]bool, error) {
+	if client == nil || ctx == nil || strings.TrimSpace(daemonID) == "" || !CursorCloudRepoUsable(repoURL) {
+		return nil, errors.New("cursor-cloud: cleanup marker is incomplete")
 	}
-	listCtx, cancel := context.WithTimeout(ctx, cursorCloudDeleteTimeout)
-	agents, err := client.ListAgents(listCtx)
-	cancel()
+	agents, err := listCursorCloudAgents(ctx, client)
 	if err != nil {
-		return false, &cursorCloudCleanupError{op: cursorCloudCleanupList, err: fmt.Errorf("cursor-cloud: cleanup list: %w", err)}
+		return nil, fmt.Errorf("cursor-cloud: cleanup list: %w", err)
+	}
+	markers := make([]string, len(tokens))
+	for i, token := range tokens {
+		markers[i] = CursorCloudLaunchMarker(daemonID, token)
 	}
 	passCtx, passCancel := context.WithTimeout(ctx, cursorCloudReconcilePassTimeout)
 	defer passCancel()
-	found, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, CursorCloudLaunchMarker(daemonID, token), nil)
-	if err != nil {
-		return found, &cursorCloudCleanupError{op: cursorCloudCleanupSweep, err: err}
+	matched, err := deleteMatchingCursorCloudLaunch(passCtx, client, agents, repoURL, markers, nil)
+	found := map[string]bool{}
+	for i, token := range tokens {
+		if matched[markers[i]] {
+			found[token] = true
+		}
 	}
-	return found, nil
-}
-
-const (
-	cursorCloudCleanupList  = "list"
-	cursorCloudCleanupSweep = "sweep"
-)
-
-// cursorCloudCleanupError marks a restart list or sweep that did not finish.
-// Error text stays the wrapped cause so callers can still match the provider
-// message.
-type cursorCloudCleanupError struct {
-	op  string
-	err error
-}
-
-func (e *cursorCloudCleanupError) Error() string {
-	if e == nil || e.err == nil {
-		return "cursor-cloud: cleanup"
-	}
-	return e.err.Error()
-}
-
-func (e *cursorCloudCleanupError) Unwrap() error { return e.err }
-
-// CursorCloudCleanupOp reports "list" or "sweep" when err came from
-// DeleteCursorCloudLaunchByMarker. Other errors return "".
-func CursorCloudCleanupOp(err error) string {
-	var cleanup *cursorCloudCleanupError
-	if !errors.As(err, &cleanup) || cleanup == nil {
-		return ""
-	}
-	return cleanup.op
+	return found, err
 }
 
 func sameCursorCloudRepo(want, got string) bool {
