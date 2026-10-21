@@ -147,8 +147,7 @@ func TestRerunSelectedAutoIsPinned(t *testing.T) {
 
 // Rerun --agent auto must resolve the model as enqueue --agent auto does:
 // keep PreferredAgent as the auto keyword so Claude does not inherit the
-// configured Codex review_model. Mutant pin: pinning the name without
-// updating resolution.PreferredAgent leaves the workflow model in place.
+// configured Codex review_model.
 func TestRerunSelectedAutoDoesNotInheritWorkflowModel(t *testing.T) {
 	noHostMarker(t)
 	stubAgentPath(t, "claude")
@@ -195,9 +194,7 @@ func TestFixJobPinsAutoBackup(t *testing.T) {
 }
 
 // Ordinary /api/enqueue pins an "auto" backup and the worker honors that
-// pin. Mutant pin: if BackupAgent/BackupAuto are only set when
-// experiment != nil, these jobs store BackupAuto false and failover
-// re-resolves auto from workflow config.
+// pin.
 func TestOrdinaryEnqueuePinsAutoBackup(t *testing.T) {
 	t.Run("stores and uses a concrete pin", func(t *testing.T) {
 		noHostMarker(t)

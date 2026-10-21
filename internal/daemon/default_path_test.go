@@ -49,8 +49,7 @@ func defaultPathResult(name string, err error) string {
 }
 
 // With no host or auto settings and no marker, agent resolution, CI pinning,
-// retries and failover match the upstream base byte for byte. The golden
-// transcript below was generated on 00316ee7 and must not change.
+// retries and failover follow the golden transcript below byte for byte.
 func TestDefaultPathUnchanged(t *testing.T) {
 	configs := []struct {
 		name string
@@ -125,9 +124,8 @@ func TestDefaultPathUnchanged(t *testing.T) {
 					add("failover codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, false))
 					add("retry codex stored backup %q: %s", stored, defaultPathFailover(t, cfg, stored, true))
 				}
-				// HTTP enqueue, not db.EnqueueJob: a named backup must stay
-				// empty here. Pinning it on every ordinary enqueue turns these
-				// rows red.
+				// HTTP enqueue, not db.EnqueueJob: a named backup stays empty
+				// on an ordinary enqueue.
 				add("enqueue: %s", defaultPathEnqueue(t, cfg))
 			})
 		}
