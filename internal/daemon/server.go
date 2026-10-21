@@ -234,7 +234,7 @@ func newServerWithLogs(
 	s.apiHandler = withAPIAuthentication(mux, cfg.AuthKey)
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: withLoopbackHost(s.apiHandler),
+		Handler: withLoopbackHost(s.apiHandler, cfg.AuthKey, cfg.AllowedHosts),
 	}
 
 	return s
