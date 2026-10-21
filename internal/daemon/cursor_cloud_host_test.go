@@ -3,6 +3,7 @@ package daemon
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -347,33 +348,74 @@ func TestResolveSingleAgentHostWithoutMarker(t *testing.T) {
 	assert.Contains(t, body.Error, "ROBOREV_HOST_AGENT")
 }
 
-// TestNoPromptFixRangeIsRefusedAndDoesNotRun is the original no-prompt fix
-// on a range ref. cursor-cloud must refuse that review so a worker cannot
-// claim and run it. The assertion is the enqueue result and the empty queue,
-// not the stored job type.
+// TestNoPromptFixRangeIsRefusedAndDoesNotRun is one cell per way ReviewHost
+// can choose cursor-cloud. A no-prompt fix of HEAD~1..HEAD is a range review,
+// so enqueue returns 400 and ClaimJob finds nothing. An empty host chain
+// resolves to local and is not a cursor-cloud cell.
 func TestNoPromptFixRangeIsRefusedAndDoesNotRun(t *testing.T) {
-	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
-	t.Setenv(agent.EnvDefaultHost, "")
-	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
-	db, tmpDir := testutil.OpenTestDBWithDir(t)
-	cfg := config.DefaultConfig()
-	cfg.MaxWorkers = 0
-	cfg.Host = agent.CursorCloudHost
-	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
-	t.Cleanup(func() { _ = server.Close() })
-
-	repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
-	repo.CommitFile("a.txt", "one\n", "one")
-	repo.CommitFile("b.txt", "two\n", "two")
-	w := enqueueRaw(t, server, EnqueueRequest{
-		RepoPath: repo.Path(),
-		GitRef:   "HEAD~1..HEAD",
-		JobType:  storage.JobTypeFix,
-		Agent:    "test",
-	})
-	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "cannot run a range review")
-	claimed, err := db.ClaimJob(testWorkerID)
-	require.NoError(t, err)
-	assert.Nil(t, claimed)
+	shapes := []struct {
+		name string
+		set  func(t *testing.T, cfg *config.Config, repoPath string, req *EnqueueRequest)
+	}{
+		{
+			name: "global config host",
+			set: func(t *testing.T, cfg *config.Config, _ string, _ *EnqueueRequest) {
+				t.Helper()
+				cfg.Host = agent.CursorCloudHost
+			},
+		},
+		{
+			name: "repo config host",
+			set: func(t *testing.T, _ *config.Config, repoPath string, _ *EnqueueRequest) {
+				t.Helper()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(repoPath, ".roborev.toml"),
+					[]byte("host = \"cursor-cloud\"\n"),
+					0o644,
+				))
+			},
+		},
+		{
+			name: "--host",
+			set: func(_ *testing.T, _ *config.Config, _ string, req *EnqueueRequest) {
+				req.Host = agent.CursorCloudHost
+			},
+		},
+		{
+			name: "ROBOREV_DEFAULT_HOST",
+			set: func(t *testing.T, _ *config.Config, _ string, _ *EnqueueRequest) {
+				t.Helper()
+				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
+			},
+		},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			assert := assert.New(t)
+			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
+			t.Setenv(agent.EnvDefaultHost, "")
+			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+			db, tmpDir := testutil.OpenTestDBWithDir(t)
+			cfg := config.DefaultConfig()
+			cfg.MaxWorkers = 0
+			repo := testutil.InitTestGitRepo(t, filepath.Join(tmpDir, "repo"))
+			repo.CommitFile("a.txt", "one\n", "one")
+			repo.CommitFile("b.txt", "two\n", "two")
+			req := EnqueueRequest{
+				RepoPath: repo.Path(),
+				GitRef:   "HEAD~1..HEAD",
+				JobType:  storage.JobTypeFix,
+				Agent:    "test",
+			}
+			shape.set(t, cfg, repo.Path(), &req)
+			server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+			t.Cleanup(func() { _ = server.Close() })
+			w := enqueueRaw(t, server, req)
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(w.Body.String(), "cannot run a range review")
+			claimed, err := db.ClaimJob(testWorkerID)
+			require.NoError(t, err)
+			assert.Nil(claimed)
+		})
+	}
 }
