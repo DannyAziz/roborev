@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -308,10 +307,13 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	if err != nil {
 		return "", MarkUnavailable(err)
 	}
-	// Read a Prepare snapshot before reserving a launch. An unreadable or
-	// unconfined path creates nothing, so it must not take the hourly slot.
-	launchPrompt, err := cursorCloudLaunchPrompt(repoPath, prompt)
+	// Resolve a snapshot handoff before reserving a launch. A refused one
+	// creates nothing, so it must not take the hourly slot either.
+	launchPrompt, err := cursorCloudLaunchPrompt(prompt)
 	if err != nil {
+		if errors.Is(err, errPromptSnapshotRefused) {
+			return "", err
+		}
 		return "", MarkUnavailable(err)
 	}
 
@@ -1164,63 +1166,25 @@ func cloudFinalMessage(ctx context.Context, client cursorcloud.Client, id string
 	return "", err
 }
 
-// errCloudSnapshotOutside means a Prepare handoff names a file outside the
-// repository .roborev directory. The launch is refused and the file is not read.
-var errCloudSnapshotOutside = errors.New("cursor-cloud: refusing to launch because the prompt snapshot is outside .roborev")
+// errPromptSnapshotRefused means the prompt is a snapshot handoff that this
+// process did not prepare. The launch is refused and no file is read.
+var errPromptSnapshotRefused = errors.New("cursor-cloud: refusing to launch because the prompt is a snapshot handoff this process did not prepare")
 
-// cursorCloudLaunchPrompt is the text CreateAgent receives. The only path it
-// reads is a Prepare snapshot handoff that is the entire prompt, and only
-// when that path stays inside the repository .roborev directory. Any other
-// text, including a prior-range tag or a handoff copied into a diff, is sent
-// unchanged.
-func cursorCloudLaunchPrompt(repoPath, promptText string) (string, error) {
-	path, ok := prompt.ParseSnapshotHandoffPrompt(promptText)
-	if !ok {
-		return promptText, nil
+// cursorCloudLaunchPrompt is the text CreateAgent receives. A handoff that
+// Prepare returned in this process is replaced with the text Prepare kept in
+// memory. Any other prompt shaped as a whole handoff is refused. No path is
+// read from the prompt and no file is opened.
+func cursorCloudLaunchPrompt(promptText string) (string, error) {
+	if text, ok := prompt.PreparedPromptText(promptText); ok {
+		if strings.TrimSpace(text) == "" {
+			return "", errors.New("cursor-cloud: refusing to launch because the oversized prompt is empty")
+		}
+		return text, nil
 	}
-	resolved, err := confineCloudSnapshotPath(repoPath, path)
-	if err != nil {
-		return "", err
+	if prompt.LooksLikeSnapshotHandoff(promptText) {
+		return "", errPromptSnapshotRefused
 	}
-	body, err := os.ReadFile(resolved)
-	if err != nil {
-		return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
-	}
-	if strings.TrimSpace(string(body)) == "" {
-		return "", errors.New("cursor-cloud: refusing to launch because the oversized prompt is empty")
-	}
-	return string(body), nil
-}
-
-func confineCloudSnapshotPath(repoPath, path string) (string, error) {
-	if strings.TrimSpace(repoPath) == "" || strings.TrimSpace(path) == "" || !filepath.IsAbs(path) {
-		return "", errCloudSnapshotOutside
-	}
-	root, err := filepath.Abs(filepath.Join(repoPath, ".roborev"))
-	if err != nil {
-		return "", errCloudSnapshotOutside
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", errCloudSnapshotOutside
-	}
-	lexical, err := filepath.Rel(root, absPath)
-	if err != nil || !filepath.IsLocal(lexical) {
-		return "", errCloudSnapshotOutside
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
-	}
-	resolvedPath, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
-	}
-	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
-	if err != nil || !filepath.IsLocal(rel) {
-		return "", errCloudSnapshotOutside
-	}
-	return resolvedPath, nil
+	return promptText, nil
 }
 
 func cloudPrompt(prompt string, schema jsontext.Value) string {

@@ -3,9 +3,14 @@ package prompt
 import (
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.kenn.io/roborev/internal/config"
 )
+
+// preparedPrompts maps each handoff Prepare returned in this process to the
+// complete text it wrote, until that snapshot's cleanup runs.
+var preparedPrompts sync.Map
 
 // Prepare measures the complete prompt once content assembly is finished.
 // The configured threshold selects inline text or a complete prompt file;
@@ -29,10 +34,15 @@ func (b *Builder) Prepare(text string, target SnapshotTarget) (SnapshotResult, e
 	if err != nil {
 		return SnapshotResult{}, err
 	}
+	handoff := SnapshotHandoffPrompt(file)
+	preparedPrompts.Store(handoff, text)
 	return SnapshotResult{
-		Prompt:   SnapshotHandoffPrompt(file),
+		Prompt:   handoff,
 		FilePath: file,
-		Cleanup:  cleanup,
+		Cleanup: func() {
+			preparedPrompts.Delete(handoff)
+			cleanup()
+		},
 	}, nil
 }
 
@@ -42,26 +52,24 @@ const (
 )
 
 // SnapshotHandoffPrompt is the entire prompt Prepare uses when the assembled
-// text exceeds the size limit. The cloud adapter accepts this exact string
-// and no other path reference.
+// text exceeds the size limit.
 func SnapshotHandoffPrompt(path string) string {
 	return snapshotHandoffPrefix + strconv.Quote(path) + snapshotHandoffSuffix
 }
 
-// ParseSnapshotHandoffPrompt reports the path when prompt is exactly
-// SnapshotHandoffPrompt. A substring, including one copied into a diff, is
-// not a handoff.
-func ParseSnapshotHandoffPrompt(prompt string) (string, bool) {
-	if !strings.HasPrefix(prompt, snapshotHandoffPrefix) || !strings.HasSuffix(prompt, snapshotHandoffSuffix) {
+// PreparedPromptText returns the complete text behind a handoff that Prepare
+// returned in this process and has not cleaned up. It matches the whole
+// prompt only and never opens the file the handoff names.
+func PreparedPromptText(handoff string) (string, bool) {
+	text, ok := preparedPrompts.Load(handoff)
+	if !ok {
 		return "", false
 	}
-	quoted := strings.TrimSuffix(strings.TrimPrefix(prompt, snapshotHandoffPrefix), snapshotHandoffSuffix)
-	path, err := strconv.Unquote(quoted)
-	if err != nil || strings.TrimSpace(path) == "" {
-		return "", false
-	}
-	if SnapshotHandoffPrompt(path) != prompt {
-		return "", false
-	}
-	return path, true
+	return text.(string), true
+}
+
+// LooksLikeSnapshotHandoff reports whether prompt has the shape of a whole
+// SnapshotHandoffPrompt, whoever wrote it.
+func LooksLikeSnapshotHandoff(prompt string) bool {
+	return strings.HasPrefix(prompt, snapshotHandoffPrefix) && strings.HasSuffix(prompt, snapshotHandoffSuffix)
 }

@@ -32,6 +32,7 @@ import (
 	"go.kenn.io/roborev/internal/cursorcloud"
 	"go.kenn.io/roborev/internal/cursorcloud/cursorcloudtest"
 	"go.kenn.io/roborev/internal/prompt"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 const cursorCloudTestSecret = "cursor-test-secret-value-not-a-real-key"
@@ -1136,25 +1137,163 @@ func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
 }
 
 func TestCursorCloudSendsFullPromptInsteadOfLocalPath(t *testing.T) {
-	const sha = "0123456789abcdef0123456789abcdef01234567"
 	const body = "UNIQUE-FULL-PROMPT-BODY"
-	repo := t.TempDir()
-	path := writeRoborevSnapshot(t, repo, body)
-	handoff := prompt.SnapshotHandoffPrompt(path)
+	prepared := prepareOversizedPrompt(t, testutil.NewTestRepoWithCommit(t).Path(), body)
+	sent, creates, err := runCursorCloudPrompt(t, context.Background(), prepared.Prompt)
+	require.NoError(t, err)
+	require.Equal(t, 1, creates)
+	assert.Contains(t, sent, body)
+	assert.NotContains(t, sent, prepared.FilePath)
+	assert.NotContains(t, sent, "Read the complete task prompt from")
+}
+
+// TestCursorCloudHostileHandoffNeverReadsAFile is the hostile-repo pin for
+// the prompt snapshot handoff. Each case points a whole handoff, or text
+// around one, at a secret outside the repository. The secret must never
+// reach CreateAgent, and a whole handoff this process did not prepare is
+// refused before create.
+func TestCursorCloudHostileHandoffNeverReadsAFile(t *testing.T) {
+	const secret = "HOSTILE-HANDOFF-SECRET"
+	for _, tc := range []struct {
+		name    string
+		prompt  func(t *testing.T, repo, secretPath string) string
+		refused bool
+	}{
+		{name: "absolute path", refused: true, prompt: func(t *testing.T, repo, secretPath string) string {
+			return prompt.SnapshotHandoffPrompt(secretPath)
+		}},
+		{name: "dot-dot out of .roborev", refused: true, prompt: func(t *testing.T, repo, secretPath string) string {
+			require.NoError(t, os.MkdirAll(filepath.Join(repo, ".roborev", "roborev-snapshot-1"), 0o755))
+			rel, err := filepath.Rel(filepath.Join(repo, ".roborev", "roborev-snapshot-1"), secretPath)
+			require.NoError(t, err)
+			return prompt.SnapshotHandoffPrompt(filepath.Join(repo, ".roborev", "roborev-snapshot-1") + string(filepath.Separator) + rel)
+		}},
+		{name: "symlinked .roborev", refused: true, prompt: func(t *testing.T, repo, secretPath string) string {
+			if runtime.GOOS == "windows" {
+				t.Skip("skipping on Windows due to symlink semantics")
+			}
+			require.NoError(t, os.Symlink(filepath.Dir(secretPath), filepath.Join(repo, ".roborev")))
+			return prompt.SnapshotHandoffPrompt(filepath.Join(repo, ".roborev", filepath.Base(secretPath)))
+		}},
+		{name: "symlinked file inside .roborev", refused: true, prompt: func(t *testing.T, repo, secretPath string) string {
+			if runtime.GOOS == "windows" {
+				t.Skip("skipping on Windows due to symlink semantics")
+			}
+			dir := filepath.Join(repo, ".roborev", "roborev-snapshot-1")
+			require.NoError(t, os.MkdirAll(dir, 0o755))
+			require.NoError(t, os.Symlink(secretPath, filepath.Join(dir, "prompt.md")))
+			return prompt.SnapshotHandoffPrompt(filepath.Join(dir, "prompt.md"))
+		}},
+		{name: "unprepared file inside .roborev", refused: true, prompt: func(t *testing.T, repo, secretPath string) string {
+			secret, err := os.ReadFile(secretPath)
+			require.NoError(t, err)
+			return prompt.SnapshotHandoffPrompt(writeRoborevSnapshot(t, repo, string(secret)))
+		}},
+		{name: "embedded handoff", prompt: func(t *testing.T, repo, secretPath string) string {
+			return "Review this commit.\n\n" + prompt.SnapshotHandoffPrompt(secretPath)
+		}},
+		{name: "partial handoff", prompt: func(t *testing.T, repo, secretPath string) string {
+			return strings.TrimSuffix(prompt.SnapshotHandoffPrompt(secretPath), "\n")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testutil.NewTestRepoWithCommit(t).Path()
+			secretPath := writeSecretFile(t, secret)
+			fake, err := launchCursorCloudInRepo(t, repo, tc.prompt(t, repo, secretPath))
+			assertCreateRequestsOmit(t, fake, secret)
+			if tc.refused {
+				require.ErrorIs(t, err, errPromptSnapshotRefused)
+				assert.Zero(t, createCount(fake))
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, 1, createCount(fake))
+		})
+	}
+}
+
+// TestCursorCloudPreparedHandoffIgnoresSwappedFile swaps Prepare's file, and
+// then its .roborev directory, for a link to a secret after Prepare returns.
+// The launch sends the text Prepare kept, so the swap cannot redirect a read.
+func TestCursorCloudPreparedHandoffIgnoresSwappedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows due to symlink semantics")
+	}
+	const secret = "SWAPPED-SNAPSHOT-SECRET"
+	const body = "PREPARED-SNAPSHOT-BODY"
+	for _, tc := range []struct {
+		name string
+		swap func(t *testing.T, repo, file, secretPath string)
+	}{
+		{name: "file", swap: func(t *testing.T, repo, file, secretPath string) {
+			require.NoError(t, os.Remove(file))
+			require.NoError(t, os.Symlink(secretPath, file))
+		}},
+		{name: ".roborev", swap: func(t *testing.T, repo, file, secretPath string) {
+			outside := t.TempDir()
+			rel, err := filepath.Rel(filepath.Join(repo, ".roborev"), file)
+			require.NoError(t, err)
+			require.NoError(t, os.MkdirAll(filepath.Join(outside, filepath.Dir(rel)), 0o755))
+			require.NoError(t, os.Symlink(secretPath, filepath.Join(outside, rel)))
+			require.NoError(t, os.Rename(filepath.Join(repo, ".roborev"), filepath.Join(repo, ".roborev-moved")))
+			require.NoError(t, os.Symlink(outside, filepath.Join(repo, ".roborev")))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testutil.NewTestRepoWithCommit(t).Path()
+			prepared := prepareOversizedPrompt(t, repo, body)
+			tc.swap(t, repo, prepared.FilePath, writeSecretFile(t, secret))
+			fake, err := launchCursorCloudInRepo(t, repo, prepared.Prompt)
+			require.NoError(t, err)
+			require.Equal(t, 1, createCount(fake))
+			assertCreateRequestsOmit(t, fake, secret)
+			for _, call := range fake.Calls() {
+				if call.Method == cursorcloudtest.MethodCreate {
+					assert.Contains(t, call.Request.Prompt, body)
+				}
+			}
+		})
+	}
+}
+
+func TestCursorCloudRefusesHandoffAfterCleanup(t *testing.T) {
+	prepared := prepareOversizedPrompt(t, testutil.NewTestRepoWithCommit(t).Path(), "CLEANED-UP-BODY")
+	prepared.Cleanup()
+	sent, creates, err := runCursorCloudPrompt(t, context.Background(), prepared.Prompt)
+	require.ErrorIs(t, err, errPromptSnapshotRefused)
+	assert.Zero(t, creates)
+	assert.Empty(t, sent)
+}
+
+func prepareOversizedPrompt(t *testing.T, repo, body string) prompt.SnapshotResult {
+	t.Helper()
+	text := strings.Repeat("review line\n", 20) + body + "\n"
+	prepared, err := prompt.NewBuilderWithConfig(nil, &config.Config{DefaultMaxPromptSize: 32}).ForRepo(repo, 0).Prepare(text, prompt.SnapshotTarget{})
+	require.NoError(t, err)
+	require.NotEmpty(t, prepared.FilePath)
+	t.Cleanup(prepared.Cleanup)
+	return prepared
+}
+
+func launchCursorCloudInRepo(t *testing.T, repo, promptText string) (*cursorcloudtest.Fake, error) {
+	t.Helper()
+	const sha = "0123456789abcdef0123456789abcdef01234567"
 	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
 	_, err := (&CursorCloudAgent{Client: fake, RepoURL: "https://github.com/acme/api.git"}).Review(
-		context.Background(), repo, sha, handoff, nil,
+		context.Background(), repo, sha, promptText, nil,
 	)
-	require.NoError(t, err)
-	var sent string
+	return fake, err
+}
+
+// assertCreateRequestsOmit checks every recorded request body, not only the
+// prompt field.
+func assertCreateRequestsOmit(t *testing.T, fake *cursorcloudtest.Fake, secret string) {
+	t.Helper()
 	for _, call := range fake.Calls() {
-		if call.Method == cursorcloudtest.MethodCreate {
-			sent = call.Request.Prompt
-		}
+		raw, err := json.Marshal(call.Request)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), secret)
 	}
-	assert.Contains(t, sent, body)
-	assert.NotContains(t, sent, path)
-	assert.NotContains(t, sent, "Read the complete task prompt from")
 }
 
 func TestCursorCloudSnapshotHandoffIgnoresDiffSubstring(t *testing.T) {
@@ -1192,7 +1331,7 @@ func TestCursorCloudSnapshotHandoffRefusesPathOutsideRoborev(t *testing.T) {
 	outside := filepath.Join(repo, "prompt.md")
 	require.NoError(t, os.WriteFile(outside, []byte(canary), 0o644))
 	sent, creates, err := runCursorCloudPromptInRepo(t, context.Background(), repo, prompt.SnapshotHandoffPrompt(outside))
-	require.ErrorIs(t, err, errCloudSnapshotOutside)
+	require.ErrorIs(t, err, errPromptSnapshotRefused)
 	assert.Equal(t, 0, creates)
 	assert.NotContains(t, sent, canary)
 }
@@ -1206,7 +1345,7 @@ func TestCursorCloudSnapshotHandoffRefusesSymlinkEscape(t *testing.T) {
 	link := filepath.Join(linkDir, "prompt.md")
 	require.NoError(t, os.Symlink(outside, link))
 	sent, creates, err := runCursorCloudPromptInRepo(t, context.Background(), repo, prompt.SnapshotHandoffPrompt(link))
-	require.ErrorIs(t, err, errCloudSnapshotOutside)
+	require.ErrorIs(t, err, errPromptSnapshotRefused)
 	assert.Equal(t, 0, creates)
 	assert.NotContains(t, sent, canary)
 }
@@ -1308,8 +1447,7 @@ func TestCursorCloudRefusesUnreadablePromptSnapshot(t *testing.T) {
 	_, err := (&CursorCloudAgent{Client: fake, RepoURL: "https://github.com/acme/api.git"}).Review(
 		context.Background(), repo, sha, handoff, nil,
 	)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "oversized prompt")
+	require.ErrorIs(t, err, errPromptSnapshotRefused)
 	assert.Zero(t, createCount(fake))
 }
 
