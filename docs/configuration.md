@@ -1213,10 +1213,14 @@ and fix jobs stay on the local agent. CI launches `cursor-cloud` only when the
 repository's own `[ci] host` is `cursor-cloud`. The repository `host`, the
 global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. The check runs
 when a matrix member, a named-panel member, or synthesis would enqueue
-cursor-cloud. A fork or cross-repo pull request is refused. A pull request whose
-head or base repository is unknown is refused. A deferred retry carries both
-repository names. A retry that does not have them cannot launch cursor-cloud.
-Without the opt-in, CI keeps its local matrix. An opted-in same-repository
+cursor-cloud, not only when `[ci] host` is set. A fork or cross-repo pull
+request is refused on every one of those paths. An empty or unknown head or base
+repository, including a deleted fork, fails closed and does not launch. The
+deferred retry and the pull-request lookup both carry the head and base
+repository names. A retry that does not have them cannot launch cursor-cloud. An
+oversized prompt is not sent to cursor-cloud as a local file path. The adapter
+sends the full prompt text, and it refuses the launch when that text cannot be
+read. Without the opt-in, CI keeps its local matrix. An opted-in same-repository
 matrix launches one cloud agent.
 
 Launch limits are checked before the agent is created. The defaults are 4

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -324,6 +325,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	// still set so the launch record names the review. repoURL is already
 	// stripped of userinfo. The marker lets a create that fails after send
 	// be found by listing agents and reading the conversation.
+	launchPrompt, err := cursorCloudLaunchPrompt(prompt)
+	if err != nil {
+		// Nothing was created. A local path must not be sent to the remote agent.
+		return "", MarkUnavailable(err)
+	}
 	token := newLaunchToken()
 	if err := ctx.Err(); err != nil {
 		// Already done before CreateAgent. The POST was not sent.
@@ -353,7 +359,7 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	created, err := client.CreateAgent(ctx, cursorcloud.CreateAgentRequest{
 		Repo:   repoURL,
 		Ref:    sha,
-		Prompt: cloudPrompt(prompt, schema) + "\n" + marker + "\n",
+		Prompt: cloudPrompt(launchPrompt, schema) + "\n" + marker + "\n",
 		Model:  a.Model,
 		Title:  cursorCloudTitle(repoURL, sha),
 	})
@@ -1153,6 +1159,30 @@ func cloudFinalMessage(ctx context.Context, client cursorcloud.Client, id string
 		return "", fmt.Errorf("cursor-cloud agent %s finished with no assistant message: %w", id, err)
 	}
 	return "", err
+}
+
+// cursorCloudLaunchPrompt is the text CreateAgent receives. A local snapshot
+// handoff is read and inlined. A path that cannot be read is refused before
+// any launch, so the remote agent never sees a local filesystem path.
+func cursorCloudLaunchPrompt(prompt string) (string, error) {
+	const prefix = "Read the complete task prompt from "
+	const suffix = " and carry out its instructions. Read the file in full before starting.\n"
+	if !strings.HasPrefix(prompt, prefix) || !strings.HasSuffix(prompt, suffix) {
+		return prompt, nil
+	}
+	quoted := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), suffix)
+	path, err := strconv.Unquote(quoted)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "", errors.New("cursor-cloud: refusing to launch because the prompt points at a local file")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		return "", errors.New("cursor-cloud: refusing to launch because the oversized prompt is empty")
+	}
+	return string(body), nil
 }
 
 func cloudPrompt(prompt string, schema jsontext.Value) string {

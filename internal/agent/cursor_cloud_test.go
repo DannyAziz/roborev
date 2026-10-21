@@ -1134,6 +1134,42 @@ func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
 	}
 }
 
+func TestCursorCloudSendsFullPromptInsteadOfLocalPath(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	dir := t.TempDir()
+	body := "UNIQUE-FULL-PROMPT-BODY"
+	path := filepath.Join(dir, "prompt.md")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+	handoff := fmt.Sprintf("Read the complete task prompt from %q and carry out its instructions. Read the file in full before starting.\n", path)
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	_, err := (&CursorCloudAgent{Client: fake, RepoURL: "https://github.com/acme/api.git"}).Review(
+		context.Background(), t.TempDir(), sha, handoff, nil,
+	)
+	require.NoError(t, err)
+	var sent string
+	for _, call := range fake.Calls() {
+		if call.Method == cursorcloudtest.MethodCreate {
+			sent = call.Request.Prompt
+		}
+	}
+	assert.Contains(t, sent, body)
+	assert.NotContains(t, sent, path)
+	assert.NotContains(t, sent, "Read the complete task prompt from")
+}
+
+func TestCursorCloudRefusesUnreadablePromptSnapshot(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	path := filepath.Join(t.TempDir(), "missing.md")
+	handoff := fmt.Sprintf("Read the complete task prompt from %q and carry out its instructions. Read the file in full before starting.\n", path)
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	_, err := (&CursorCloudAgent{Client: fake, RepoURL: "https://github.com/acme/api.git"}).Review(
+		context.Background(), t.TempDir(), sha, handoff, nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "oversized prompt")
+	assert.Zero(t, createCount(fake))
+}
+
 func TestCursorCloudDialErrorDoesNotReconcile(t *testing.T) {
 	client := &dialFailCloud{}
 	_, err := (&CursorCloudAgent{Client: client, RepoURL: "https://github.com/acme/widgets.git"}).Review(
