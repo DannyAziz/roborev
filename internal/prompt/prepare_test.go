@@ -66,6 +66,7 @@ func TestPreparePreservesCompletePrompt(t *testing.T) {
 			saved, err := os.ReadFile(prepared.FilePath)
 			require.NoError(t, err)
 			assert.Equal(t, text, string(saved))
+			assert.Equal(t, SnapshotHandoffPrompt(prepared.FilePath), prepared.Prompt)
 			assert.Less(t, len(prepared.Prompt), 4096)
 		})
 	}

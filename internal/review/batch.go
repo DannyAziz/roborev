@@ -218,10 +218,6 @@ func runSingle(
 	if snapResult.Cleanup != nil {
 		defer snapResult.Cleanup()
 	}
-	ctx = agent.WithPriorRangeReviewAllowlist(ctx, agent.PriorRangeReviewAllowlist{
-		Dir:  snapResult.PriorRangeReviewDir,
-		Refs: snapResult.PriorRangeReviewRefs,
-	})
 
 	// Run review
 	log.Printf(

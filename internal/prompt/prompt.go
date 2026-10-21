@@ -242,12 +242,6 @@ type SnapshotResult struct {
 	Prompt   string
 	FilePath string
 	Cleanup  func()
-	// PriorRangeReviewDir is the directory the builder wrote prior-range
-	// review files into. PriorRangeReviewRefs maps the exact text inserted
-	// into Prompt to the file path. Callers pass both to the cloud launcher.
-	// The launcher must not discover paths by reading Prompt.
-	PriorRangeReviewDir  string
-	PriorRangeReviewRefs map[string]string
 }
 
 // SnapshotTarget controls where prompt, diff, and prior-review snapshots are written.
@@ -278,15 +272,15 @@ func (b *Builder) BuildWithSnapshotTarget(
 		}
 	}()
 
-	var priorReviewsFile string
+	var priorDoc string
 	if reviews := b.priorRangeReviewsForRef(gitRef, contextCount); len(reviews) > 0 {
-		priorReviewsFile, result.Cleanup, err = b.writePriorRangeReviewsSnapshot(reviews, target)
+		priorDoc, err = encodePriorRangeReviews(reviews)
 		if err != nil {
 			return result, err
 		}
 	}
 	text, err := b.buildWithOpts(gitRef, contextCount, agentName, reviewType, buildOpts{
-		minSeverity: minSeverity, priorRangeReviewsFile: &priorReviewsFile,
+		minSeverity: minSeverity, priorRangeReviewsFile: &priorDoc,
 	})
 	if err != nil {
 		return result, err
@@ -295,17 +289,7 @@ func (b *Builder) BuildWithSnapshotTarget(
 	if err != nil {
 		return result, err
 	}
-	priorCleanup := result.Cleanup
 	result = prepared
-	result.PriorRangeReviewDir, result.PriorRangeReviewRefs = priorRangeReviewAllowlist(priorReviewsFile)
-	if priorCleanup != nil {
-		result.Cleanup = func() {
-			if prepared.Cleanup != nil {
-				prepared.Cleanup()
-			}
-			priorCleanup()
-		}
-	}
 	return result, nil
 }
 

@@ -1224,12 +1224,14 @@ repository, including a deleted fork, fails closed and does not launch. The
 deferred retry and the pull-request lookup both carry the head and base
 repository names. A retry that does not have them cannot launch cursor-cloud. An
 oversized prompt is not sent to cursor-cloud as a local file path. The adapter
-sends the full prompt text, and it refuses the launch when that text cannot be
-read. Without the opt-in, CI keeps its local matrix. An opted-in same-repository
-matrix launches one cloud agent. That job is stored as a range review, and the
-prebuilt prompt covers the pull request range. The agent is launched at the head
-commit. The adapter still refuses a ref that is empty, `dirty`, or contains
-`..`. CI does not send that ref.
+inlines that file only when the entire launch text is the snapshot handoff
+Prepare builds and the file is inside the repository `.roborev` directory. Any
+other path text is left unread. The launch is refused when that handoff cannot
+be read. Without the opt-in, CI keeps its local matrix. An opted-in
+same-repository matrix launches one cloud agent. That job is stored as a range
+review, and the prebuilt prompt covers the pull request range. The agent is
+launched at the head commit. The adapter still refuses a ref that is empty,
+`dirty`, or contains `..`. CI does not send that ref.
 
 Launch limits are checked before the agent is created. The defaults are 4
 concurrent launches and 60 launches in a rolling hour. 4 matches the default

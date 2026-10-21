@@ -397,19 +397,11 @@ func testIsolatedReviewCallerRemoval(t *testing.T, prebuilt bool) {
 		if !strings.Contains(string(data), "large diff line") {
 			return "", fmt.Errorf("snapshot missing reviewed diff")
 		}
-		priorFiles, err := filepath.Glob(filepath.Join(path, "review-snapshots", "*", "prior-range-reviews.xml"))
-		if err != nil {
-			return "", fmt.Errorf("find prior review snapshot: %w", err)
+		if !strings.Contains(string(data), "earlier range finding") {
+			return "", fmt.Errorf("snapshot missing prior range finding")
 		}
-		if len(priorFiles) != 1 {
-			return "", fmt.Errorf("expected one prior review snapshot, got %d", len(priorFiles))
-		}
-		priorData, err := os.ReadFile(priorFiles[0])
-		if err != nil {
-			return "", err
-		}
-		if !strings.Contains(string(priorData), "earlier range finding") {
-			return "", fmt.Errorf("prior snapshot missing finding")
+		if strings.Contains(string(data), "<prior-range-reviews file=") {
+			return "", fmt.Errorf("prior range reviews still point at a file")
 		}
 		if prebuilt {
 			diffFiles, err := filepath.Glob(filepath.Join(path, "review-snapshots", "*", "*.diff"))

@@ -1,7 +1,7 @@
 package prompt
 
 import (
-	"fmt"
+	"strconv"
 	"strings"
 
 	"go.kenn.io/roborev/internal/config"
@@ -30,8 +30,38 @@ func (b *Builder) Prepare(text string, target SnapshotTarget) (SnapshotResult, e
 		return SnapshotResult{}, err
 	}
 	return SnapshotResult{
-		Prompt:   fmt.Sprintf("Read the complete task prompt from %q and carry out its instructions. Read the file in full before starting.\n", file),
+		Prompt:   SnapshotHandoffPrompt(file),
 		FilePath: file,
 		Cleanup:  cleanup,
 	}, nil
+}
+
+const (
+	snapshotHandoffPrefix = "Read the complete task prompt from "
+	snapshotHandoffSuffix = " and carry out its instructions. Read the file in full before starting.\n"
+)
+
+// SnapshotHandoffPrompt is the entire prompt Prepare uses when the assembled
+// text exceeds the size limit. The cloud adapter accepts this exact string
+// and no other path reference.
+func SnapshotHandoffPrompt(path string) string {
+	return snapshotHandoffPrefix + strconv.Quote(path) + snapshotHandoffSuffix
+}
+
+// ParseSnapshotHandoffPrompt reports the path when prompt is exactly
+// SnapshotHandoffPrompt. A substring, including one copied into a diff, is
+// not a handoff.
+func ParseSnapshotHandoffPrompt(prompt string) (string, bool) {
+	if !strings.HasPrefix(prompt, snapshotHandoffPrefix) || !strings.HasSuffix(prompt, snapshotHandoffSuffix) {
+		return "", false
+	}
+	quoted := strings.TrimSuffix(strings.TrimPrefix(prompt, snapshotHandoffPrefix), snapshotHandoffSuffix)
+	path, err := strconv.Unquote(quoted)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "", false
+	}
+	if SnapshotHandoffPrompt(path) != prompt {
+		return "", false
+	}
+	return path, true
 }
