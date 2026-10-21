@@ -149,9 +149,11 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 		name string
 		args []string
 		cfg  string
+		env  bool
 	}{
 		{name: "--host", args: []string{"--host", agent.CursorCloudHost}},
-		{name: "repo host", cfg: "host = \"cursor-cloud\"\n"},
+		{name: ".roborev.toml host", cfg: "host = \"cursor-cloud\"\n"},
+		{name: "ROBOREV_DEFAULT_HOST", env: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			httpCalls.Store(0)
@@ -159,6 +161,9 @@ func TestLocalReviewRefusesCursorCloudHost(t *testing.T) {
 			t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
 			t.Setenv(agent.EnvDefaultHost, "")
 			t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+			if tc.env {
+				t.Setenv(agent.EnvDefaultHost, agent.CursorCloudHost)
+			}
 			h := newReviewHarness(t)
 			if tc.cfg != "" {
 				h.writeConfig(tc.cfg)
