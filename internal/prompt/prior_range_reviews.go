@@ -34,6 +34,10 @@ func PriorRangeReviewsBlock(document string) string {
 // included. It is not a filesystem path.
 const PriorRangeReviewsFilePathPlaceholder = "/tmp/roborev prior range reviews placeholder"
 
+// priorRangeReviewsOmittedNote replaces a deferred prior-range section when
+// the execution ref is not a range. An empty document is not sent.
+const priorRangeReviewsOmittedNote = "Prior-range reviews were omitted: this job is pinned to the head commit and the pull request range was not available, so an empty document was not sent."
+
 type priorRangeReview struct {
 	Range    string                    `xml:"range,attr"`
 	Agent    string                    `xml:"agent,attr"`
@@ -79,6 +83,9 @@ func encodePriorRangeReviews(reviews []priorRangeReview) (string, error) {
 func (b *Builder) PreparePriorRangeReviewsSnapshot(reviewPrompt, rangeRef string, limit int, _ SnapshotTarget) (SnapshotResult, error) {
 	if !strings.Contains(reviewPrompt, PriorRangeReviewsFilePathPlaceholder) {
 		return SnapshotResult{Prompt: reviewPrompt}, nil
+	}
+	if !git.IsRange(rangeRef) {
+		return SnapshotResult{Prompt: strings.ReplaceAll(reviewPrompt, PriorRangeReviewsBlock(PriorRangeReviewsFilePathPlaceholder), priorRangeReviewsOmittedNote)}, nil
 	}
 	reviews := b.priorRangeReviewsForRef(rangeRef, limit)
 	document, err := encodePriorRangeReviews(reviews)

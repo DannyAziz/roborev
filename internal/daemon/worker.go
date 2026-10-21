@@ -652,6 +652,23 @@ func (wp *WorkerPool) prepareJobCheckout(
 	return checkout, nil
 }
 
+// priorRangeReviewRef is the git range whose earlier reviews belong in the
+// prompt. A CI cursor-cloud member is stored at the head commit; the frozen
+// pull request range lives on the synthesis job.
+func (wp *WorkerPool) priorRangeReviewRef(job *storage.ReviewJob) string {
+	if job == nil {
+		return ""
+	}
+	if gitpkg.IsRange(job.GitRef) || job.PanelRunUUID == nil || wp.db == nil {
+		return job.GitRef
+	}
+	synth, err := wp.db.GetSynthesisJob(*job.PanelRunUUID)
+	if err != nil || synth == nil || !gitpkg.IsRange(synth.GitRef) {
+		return job.GitRef
+	}
+	return synth.GitRef
+}
+
 func (wp *WorkerPool) promptBuilderForJob(
 	ctx context.Context,
 	checkout preparedJobCheckout,
@@ -1317,7 +1334,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 
 	priorResult, priorErr := pb.PreparePriorRangeReviewsSnapshot(
-		reviewPrompt, job.GitRef, cfg.ReviewContextCount, prompt.SnapshotTarget{
+		reviewPrompt, wp.priorRangeReviewRef(job), cfg.ReviewContextCount, prompt.SnapshotTarget{
 			RepoPath: reviewRepoPath, ConfigRepoPath: checkout.resolvedConfigRepoPath(),
 		},
 	)
