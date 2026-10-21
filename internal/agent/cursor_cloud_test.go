@@ -1098,6 +1098,18 @@ func TestCursorCloudStrippableCredentialStillLaunches(t *testing.T) {
 			want: "//host/x",
 			leak: "tok",
 		},
+		{
+			name: "git scp access_token query",
+			raw:  "git@github.com:o/r.git?access_token=sekret",
+			want: "git@github.com:o/r.git",
+			leak: "sekret",
+		},
+		{
+			name: "git scp access_token fragment",
+			raw:  "git@github.com:o/r.git#access_token=sekret",
+			want: "git@github.com:o/r.git",
+			leak: "sekret",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

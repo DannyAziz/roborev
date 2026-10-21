@@ -2689,17 +2689,22 @@ const RedactedURL = "redacted-url"
 const redactedURL = RedactedURL
 
 // stripURLCredentials removes userinfo and every query and fragment.
-// git@host:path has no password and stays unchanged so the launch URL still
-// names the repository. Anything url.Parse rejects, including a token in the
-// SCP user slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is
-// redactedURL. Callers must not launch with that value.
+// git@host:path has no password. Its query and fragment are dropped so a
+// credential in either one is not sent, and the launch URL still names the
+// repository. Anything url.Parse rejects, including a token in the SCP user
+// slot (ghp_x@github.com:o/r.git) and a bad percent-escape, is redactedURL.
+// Callers must not launch with that value.
 func stripURLCredentials(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return redactedURL
 	}
 	if _, ok := gitSCP(rawURL); ok {
-		return rawURL
+		var host, path string
+		if !scpUserPath(rawURL, &host, &path) || host == "" || path == "" {
+			return redactedURL
+		}
+		return "git@" + host + ":" + path
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {

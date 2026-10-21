@@ -3719,6 +3719,16 @@ func TestStripURLCredentials(t *testing.T) {
 			input:    "ssh://user:tok@github.com/o/r.git",
 			expected: "ssh://github.com/o/r.git",
 		},
+		{
+			name:     "git scp access_token query is removed",
+			input:    "git@github.com:o/r.git?access_token=sekret",
+			expected: "git@github.com:o/r.git",
+		},
+		{
+			name:     "git scp access_token fragment is removed",
+			input:    "git@github.com:o/r.git#access_token=sekret",
+			expected: "git@github.com:o/r.git",
+		},
 	}
 
 	for _, tt := range tests {

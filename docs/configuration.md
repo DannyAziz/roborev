@@ -1201,9 +1201,13 @@ pauses the VM. The v0 delete docs do not say that delete ends billing. A create
 that fails after it is sent, and returns no id, is found by a token in the
 prompt and stopped and deleted the same way. v0 launch has no idempotency key. A
 delete failure is logged and reported. When the review itself succeeded, that
-failure is returned as a non-retryable error instead of the agent's text.
-Userinfo, `access_token` query values, and unparseable credential URLs are
-removed before the repository URL is sent or stored. A dirty or range review
+failure is returned as a non-retryable error instead of the agent's text. The
+URL sent to Cursor drops userinfo, every query key, and the fragment.
+`git@host:path` keeps that shape and drops a query or fragment. A URL that
+cannot be parsed, including a token in the SCP user slot and a bad
+percent-escape, is not sent: the launch is refused. The stored repository
+identity is separate. It drops userinfo from transport URLs, keeps the query and
+the fragment, and stores an unparseable URL unchanged. A dirty or range review
 cannot use `cursor-cloud` and is not rewritten to a local agent. Goal reviews
 and fix jobs stay on the local agent. CI launches `cursor-cloud` only when the
 repository's own `[ci] host` is `cursor-cloud`. The repository `host`, the
