@@ -677,3 +677,40 @@ func TestWorkerAutoBackupHonorsReviewType(t *testing.T) {
 		})
 	}
 }
+
+// A rerun pins an "auto" backup again against the rerun's primary and the
+// current agents: an empty pin picks up an agent installed since, and a pin
+// that matches the newly selected primary moves to another agent.
+func TestRerunRepinsAutoBackup(t *testing.T) {
+	for _, tc := range []struct {
+		name, pinned, selected      string
+		wantAgent, wantBackupPinned string
+	}{
+		{name: "empty pin", pinned: "", selected: "", wantAgent: "codex", wantBackupPinned: "claude-code"},
+		{name: "pin equals new primary", pinned: "claude-code", selected: "claude", wantAgent: "claude-code", wantBackupPinned: "codex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noHostMarker(t)
+			wtc := newWorkerTestContext(t, 1)
+			cfg := config.DefaultConfig()
+			cfg.DefaultBackupAgent = "auto"
+			wtc.reconfigurePool(cfg)
+			job := enqueueCodexJob(t, wtc, tc.pinned, true)
+			_, err := wtc.DB.Exec(`UPDATE review_jobs SET status = 'failed' WHERE id = ?`, job.ID)
+			require.NoError(t, err)
+			stubAgentPath(t, "codex", "claude")
+
+			job, err = wtc.DB.GetJobByID(job.ID)
+			require.NoError(t, err)
+			opts, err := resolveRerunOpts(job, cfg, nil, tc.selected)
+			require.NoError(t, err)
+			require.NoError(t, wtc.DB.ReenqueueJob(job.ID, opts))
+
+			rerun, err := wtc.DB.GetJobByID(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAgent, rerun.Agent)
+			assert.Equal(t, tc.wantBackupPinned, rerun.BackupAgent)
+			assert.True(t, rerun.BackupAuto)
+		})
+	}
+}
