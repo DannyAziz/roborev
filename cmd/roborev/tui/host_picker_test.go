@@ -14,18 +14,11 @@ func TestRerunAgentPickerListsHostOnlyWithMarker(t *testing.T) { //nolint:parall
 	registerRerunPickerAgent(t, "picker-current")
 	registerRerunPickerAgent(t, "picker-alternate")
 	for _, tc := range []struct {
-		marker   string
-		detected bool
-		want     bool
-	}{{"0", false, false}, {"0", true, false}, {"", false, false}, {"", true, false}, {"1", false, true}} {
-		t.Run(agent.HostMarkerEnv+"="+tc.marker+"/detected="+map[bool]string{true: "yes", false: "no"}[tc.detected], func(t *testing.T) {
+		marker string
+		want   bool
+	}{{"0", false}, {"", false}, {"1", true}} {
+		t.Run(agent.HostMarkerEnv+"="+tc.marker, func(t *testing.T) {
 			t.Setenv(agent.HostMarkerEnv, tc.marker)
-			t.Setenv("CURSOR_AGENT", "")
-			if tc.detected {
-				// Detection never lists host and never lets a named host run.
-				t.Setenv("CURSOR_AGENT", "1")
-				t.Setenv("CLOUD_AGENT_TEST_DETECTION", "1")
-			}
 			m := rerunPickerModel(t, rerunOKHandler)
 			options, err := m.availableRerunAgents(&m.jobs[0])
 			require.NoError(t, err)

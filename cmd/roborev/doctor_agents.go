@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	"go.kenn.io/roborev/internal/agent"
@@ -79,13 +78,6 @@ func checkDoctorAgents(env *doctorEnv) []doctorCheck {
 	for _, d := range source {
 		if d.Available {
 			installed = append(installed, d)
-		}
-	}
-	if len(installed) == 0 && slices.Contains(doctorAgentNames(env), "host") {
-		// Listings show host only with ROBOREV_HOST_AGENT=1. Named host
-		// uses the same marker; detection never makes Diagnose succeed.
-		if v := env.viewAgent("host"); v.diag.Available {
-			installed = append(installed, v.diag)
 		}
 	}
 	if len(installed) == 0 {

@@ -162,7 +162,7 @@ func isAvailableWithConfig(name string, cfg *config.Config) bool {
 	}
 	if name == hostAgentName {
 		// Only a lookup that names host gets here: automatic picks skip it.
-		return HostAllowed(HostNamed)
+		return HostAllowed()
 	}
 	ca, ok := a.(CommandAgent)
 	if !ok {
@@ -205,9 +205,9 @@ func GetPreferredOrBackupWithConfigFromConfig(
 }
 
 // GetPreferredOrBackupEligible is GetPreferredOrBackupWithConfigFromConfig
-// with an auto-backup capability filter. Named preferred and named backups
-// are unchanged; "auto" backup skips agents that eligible rejects. nil
-// eligible accepts any agent, matching ResolveAutoBackup.
+// with a capability filter for "auto" picks. Named preferred and named backups
+// are unchanged; an "auto" preferred agent or backup skips agents that
+// eligible rejects. nil eligible accepts any agent, matching ResolveAutoBackup.
 func GetPreferredOrBackupEligible(
 	repoCfg *config.RepoConfig,
 	preferred string,
@@ -217,7 +217,12 @@ func GetPreferredOrBackupEligible(
 ) (Agent, error) {
 	backups, autoBackup := splitAuto(backups)
 	if agentname.IsAuto(preferred) {
-		// No named preference: the normal availability order.
+		// No named preference: the first eligible agent in the normal order.
+		if eligible != nil {
+			if name := resolveAutoBackup(repoCfg, cfg, "", eligible, true); name != "" {
+				return GetAvailableWithConfigFromConfig(repoCfg, name, cfg)
+			}
+		}
 		return GetAvailableWithConfigFromConfig(repoCfg, "", cfg, backups...)
 	}
 

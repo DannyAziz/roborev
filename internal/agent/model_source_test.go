@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -192,11 +190,11 @@ func TestResolveAutoBackup(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				stubPath(t, tt.path...)
 				want := tt.want
-				if mode.explicit && tt.explicit != "" {
+				if mode.on && tt.explicit != "" {
 					want = tt.explicit
 				}
 				assert.Equal(t, want, ResolveAutoBackup(nil, cfg, tt.exclude, nil))
-				assert.Equal(t, mode.explicit, !strings.Contains(AutoBackupNotFound(), HostMarkerEnv))
+				assert.Equal(t, mode.on, !strings.Contains(AutoBackupNotFound(), HostMarkerEnv))
 			})
 		}
 	})
@@ -213,26 +211,11 @@ func TestHostModelHint(t *testing.T) {
 		t.Run("model="+model, func(t *testing.T) {
 			dir := t.TempDir()
 			a := hostTestAgent(dir, 5*time.Second).WithModel(model)
-			instructions := make(chan string, 1)
-			go func() {
-				defer close(instructions)
-				for range 2000 {
-					matches, _ := filepath.Glob(filepath.Join(dir, "*", "instructions.md"))
-					if len(matches) == 1 {
-						body, _ := os.ReadFile(matches[0])
-						instructions <- string(body)
-						d := filepath.Dir(matches[0])
-						_ = os.WriteFile(filepath.Join(d, "answer.md.tmp"), []byte("LGTM"), 0o600)
-						_ = os.Rename(filepath.Join(d, "answer.md.tmp"), filepath.Join(d, "answer.md"))
-						return
-					}
-					time.Sleep(2 * time.Millisecond)
-				}
-			}()
+			handoffs := fakeHost(t, dir, answerWith("LGTM"))
 			out, err := a.Review(context.Background(), "/repo", "HEAD", "prompt", nil)
 			require.NoError(t, err)
 			assert.Equal(t, "LGTM", out)
-			instr := <-instructions
+			instr := (<-handoffs).instructions
 			assert.Contains(t, instr, "answer.md")
 			if model == "" {
 				assert.NotContains(t, instr, "Requested model")
@@ -269,8 +252,7 @@ func TestAutoBackupForCustomReview(t *testing.T) {
 
 // Strict lookup with an "auto" backup must honor eligible: a goal review
 // with unavailable pi and Codex+Claude installed should pick Claude, not
-// Codex. Mutant pin: passing nil to resolveAutoBackup in strictAutoBackupOr
-// selects Codex.
+// Codex.
 func TestStrictAutoBackupHonorsEligible(t *testing.T) {
 	setHostMarker(t, false)
 	stubPath(t, "codex", "claude")
