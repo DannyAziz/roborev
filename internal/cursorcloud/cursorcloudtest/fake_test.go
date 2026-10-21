@@ -3,6 +3,9 @@ package cursorcloudtest
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -100,27 +103,76 @@ func TestFakeDefaultFinalAndErrors(t *testing.T) {
 	require.ErrorIs(t, err, cursorcloud.ErrNoAssistantMessage)
 }
 
-func TestFakeMatchesAPIEdges(t *testing.T) {
-	fake := &Fake{}
-	_, err := fake.CreateAgent(nil, cursorcloud.CreateAgentRequest{Repo: "r", Prompt: "p"}) //nolint:staticcheck // SA1012: nil context is the case under test.
-	require.ErrorContains(t, err, "nil context")
-	_, err = fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{Prompt: "p"})
-	require.ErrorContains(t, err, "repository is empty")
-	_, err = fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{Repo: "r"})
-	require.ErrorContains(t, err, "prompt is empty")
-	_, err = fake.GetAgent(context.Background(), " ")
-	require.ErrorContains(t, err, "agent id is empty")
-	_, err = fake.GetAgent(context.Background(), "../x")
-	require.ErrorContains(t, err, "agent id is invalid")
+// TestFakeMatchesHTTPClient runs the same cases against the fake and an
+// httptest-backed real client so the two cannot drift apart.
+func TestFakeMatchesHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v0/agents/missing" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"not found"}`)
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	clients := map[string]cursorcloud.Client{
+		"fake": &Fake{},
+		"http": cursorcloud.NewHTTPClient("k", cursorcloud.WithBaseURL(srv.URL)),
+	}
+	ctx := context.Background()
+	cases := []struct {
+		name       string
+		call       func(cursorcloud.Client) error
+		wantErr    string
+		wantStatus int
+	}{
+		{"nil context", func(c cursorcloud.Client) error {
+			_, err := c.GetAgent(nil, "bc_1") //nolint:staticcheck // SA1012: nil context is the case under test.
+			return err
+		}, "nil context", 0},
+		{"empty repo", func(c cursorcloud.Client) error {
+			_, err := c.CreateAgent(ctx, cursorcloud.CreateAgentRequest{Prompt: "p"})
+			return err
+		}, "repository is empty", 0},
+		{"empty prompt", func(c cursorcloud.Client) error {
+			_, err := c.CreateAgent(ctx, cursorcloud.CreateAgentRequest{Repo: "r"})
+			return err
+		}, "prompt is empty", 0},
+		{"empty id", func(c cursorcloud.Client) error {
+			_, err := c.GetAgent(ctx, " ")
+			return err
+		}, "agent id is empty", 0},
+		{"invalid id", func(c cursorcloud.Client) error {
+			_, err := c.FinalMessage(ctx, "../x")
+			return err
+		}, "agent id is invalid", 0},
+		{"missing agent", func(c cursorcloud.Client) error {
+			_, err := c.GetAgent(ctx, "missing")
+			return err
+		}, "status 404", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		for name, client := range clients {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				err := tc.call(client)
+				require.ErrorContains(t, err, tc.wantErr)
+				if tc.wantStatus != 0 {
+					var apiErr *cursorcloud.APIError
+					require.ErrorAs(t, err, &apiErr)
+					assert.Equal(t, tc.wantStatus, apiErr.StatusCode)
+				}
+			})
+		}
+	}
+}
 
+func TestFakeCreateMatchesV0Launch(t *testing.T) {
+	fake := &Fake{}
 	created, err := fake.CreateAgent(context.Background(), cursorcloud.CreateAgentRequest{
 		Repo: "https://example.com/acme/repo.git", Prompt: "review", Title: "ignored",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, cursorcloud.StatusCreating, created.Status)
 	assert.Empty(t, created.Title)
-	_, err = fake.GetAgent(context.Background(), "missing")
-	var apiErr *cursorcloud.APIError
-	require.ErrorAs(t, err, &apiErr)
-	assert.Equal(t, 404, apiErr.StatusCode)
 }

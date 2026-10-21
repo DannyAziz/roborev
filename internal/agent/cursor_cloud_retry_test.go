@@ -91,20 +91,24 @@ func (c *timeoutThenList) ListAgents(context.Context) ([]cursorcloud.Agent, erro
 	}}, nil
 }
 
-// TestCursorCloudRetryCancelStopsPromptly cancels during Retry-After.
-// The wait ends without a second list or delete. A sleep that ignores
-// the context is still blocked when the bubble is idle.
+// TestCursorCloudRetryCancelStopsPromptly cancels a list during
+// Retry-After. The wait ends without a second list.
 func TestCursorCloudRetryCancelStopsPromptly(t *testing.T) {
-	t.Run("list", func(t *testing.T) {
-		assertRetryCancelStops(t, func(ctx context.Context, client *cancelAfter429) error {
-			_, err := listCursorCloudAgents(ctx, client)
-			return err
-		})
+	assertRetryCancelStops(t, func(ctx context.Context, client *cancelAfter429) error {
+		_, err := listCursorCloudAgents(ctx, client)
+		return err
 	})
-	t.Run("delete", func(t *testing.T) {
-		assertRetryCancelStops(t, func(ctx context.Context, client *cancelAfter429) error {
-			return deleteCursorCloudAgent(ctx, client, "bc_cancel", nil)
-		})
+}
+
+// TestCursorCloudDeleteRetriesAfterCallerDone is a deferred delete after
+// the review context ended. It still gets every attempt.
+func TestCursorCloudDeleteRetriesAfterCallerDone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client := &cancelAfter429{Fake: &cursorcloudtest.Fake{}, started: make(chan struct{})}
+		require.Error(t, deleteCursorCloudAgent(ctx, client, "bc_cancel", nil))
+		assert.Equal(t, cursorCloudDeleteAttempts, client.calls())
 	})
 }
 

@@ -726,8 +726,8 @@ func resolvePanelMemberExecution(
 		strings.TrimSpace(resolution.BackupAgent) != ""
 	var selected agent.Agent
 	if strictWorkflowAgent {
-		selected, err = agent.GetPreferredOrBackupWithConfigFromConfig(
-			repoCfg, resolution.PreferredAgent, cfg, resolution.BackupAgent,
+		selected, err = agent.GetPreferredOrBackupEligible(
+			repoCfg, resolution.PreferredAgent, cfg, autoBackupEligible(m.ReviewType), resolution.BackupAgent,
 		)
 	} else {
 		selected, err = agent.GetAvailableWithConfigFromConfig(

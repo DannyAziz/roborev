@@ -24,5 +24,9 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	kittelemetry.DisablePostHogTelemetry()
+	// Tests share the process-wide cursor-cloud launch cap. Lift it so
+	// unrelated tests cannot refuse each other's launches.
+	_ = os.Setenv("ROBOREV_CURSOR_CLOUD_MAX_CONCURRENT", "1000000")
+	_ = os.Setenv("ROBOREV_CURSOR_CLOUD_MAX_PER_HOUR", "1000000")
 	os.Exit(testenv.RunIsolatedMain(m))
 }

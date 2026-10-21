@@ -19,14 +19,14 @@ import (
 	"go.kenn.io/roborev/internal/testutil"
 )
 
-func TestBeginCloudLaunchNoteFailureDoesNotPost(t *testing.T) {
+func TestBeginCloudLaunchFailureDoesNotPost(t *testing.T) {
 	tc, _ := cursorCloudRestartFixture(t)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_orphan_note
-		BEFORE UPDATE OF orphan_note ON review_job_cloud_launches
+	_, err := tc.DB.Exec(`CREATE TRIGGER roborev_fail_launch_insert
+		BEFORE INSERT ON review_job_cloud_launches
 		BEGIN
-			SELECT RAISE(ABORT, 'note write failed');
+			SELECT RAISE(ABORT, 'launch insert failed');
 		END`)
 	require.NoError(t, err)
 
@@ -56,87 +56,6 @@ type countingCreate struct {
 func (c *countingCreate) CreateAgent(ctx context.Context, req cursorcloud.CreateAgentRequest) (cursorcloud.Agent, error) {
 	*c.posts++
 	return c.Fake.CreateAgent(ctx, req)
-}
-
-// TestKnownIDDeleteCleansOnlyAfterNilOr404 still deletes a saved id. An
-// empty token is not marked cleaned after that delete: there is no marker
-// for any other VM, so the row stays uncleaned.
-func TestKnownIDDeleteCleansOnlyAfterNilOr404(t *testing.T) {
-	t.Run("delete error", func(t *testing.T) {
-		tc, fake := cursorCloudRestartFixture(t)
-		job, id := cursorCloudEmptyTokenAgent(t, tc, fake, true)
-		fake.MethodErrors = map[string]error{
-			cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-				Op: "delete agent", StatusCode: http.StatusBadRequest, Message: "no",
-			},
-		}
-		require.Error(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		assert.Equal(t, id, cursorCloudLaunchAgentID(t, tc.DB, job.ID))
-	})
-	t.Run("nil delete", func(t *testing.T) {
-		tc, fake := cursorCloudRestartFixture(t)
-		job, id := cursorCloudEmptyTokenAgent(t, tc, fake, true)
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		_, err := fake.GetAgent(t.Context(), id)
-		require.Error(t, err)
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		updated, err := tc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.Contains(t, updated.Error, "orphan risk")
-	})
-	t.Run("404 delete", func(t *testing.T) {
-		tc, fake := cursorCloudRestartFixture(t)
-		job, _ := cursorCloudEmptyTokenAgent(t, tc, fake, true)
-		fake.MethodErrors = map[string]error{
-			cursorcloudtest.MethodDelete: &cursorcloud.APIError{
-				Op: "delete agent", StatusCode: http.StatusNotFound, Message: "gone",
-			},
-		}
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-	})
-}
-
-// TestEmptyTokenStaysUncleanedWithoutConfirmedDelete does not list and does
-// not mark the row cleaned. An empty token has no marker that can prove a
-// VM is gone.
-func TestEmptyTokenStaysUncleanedWithoutConfirmedDelete(t *testing.T) {
-	t.Run("non-empty list", func(t *testing.T) {
-		tc, fake := cursorCloudRestartFixture(t)
-		sha := testutil.GetHeadSHA(t, tc.TmpDir)
-		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-		cursorCloudSeedAgent(t, fake, sha, "someone else")
-		cursorCloudInsertEmptyToken(t, tc.DB, job.ID, "")
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
-		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodDelete))
-		assert.Contains(t, cursorCloudLaunchNote(t, tc.DB, job.ID), "orphan risk")
-		updated, err := tc.DB.GetJobByID(job.ID)
-		require.NoError(t, err)
-		assert.Contains(t, updated.Error, "orphan risk")
-	})
-	t.Run("empty list", func(t *testing.T) {
-		tc, fake := cursorCloudRestartFixture(t)
-		sha := testutil.GetHeadSHA(t, tc.TmpDir)
-		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-		cursorCloudInsertEmptyToken(t, tc.DB, job.ID, "")
-		require.NoError(t, recoverStaleJobs(context.Background(), tc.DB, fake))
-		n, err := tc.DB.CountUncleanedCloudLaunches(job.ID)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		assert.Empty(t, cursorCloudCallIDs(fake, cursorcloudtest.MethodList))
-		assert.Contains(t, cursorCloudLaunchNote(t, tc.DB, job.ID), "orphan risk")
-	})
 }
 
 func TestInProcessKnownIDDeleteClearsNoteOnlyOnSuccess(t *testing.T) {
@@ -173,8 +92,8 @@ func assertInProcessClear(t *testing.T, deleteErr error, cleaned bool) {
 	require.NoError(t, nerr)
 	if cleaned {
 		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		assert.Equal(t, storage.CloudLaunchPendingNote, cursorCloudLaunchNote(t, tc.DB, job.ID))
+		assert.Equal(t, 0, n)
+		assert.Empty(t, cursorCloudLaunchNote(t, tc.DB, job.ID))
 		return
 	}
 	require.Error(t, err)
@@ -258,31 +177,10 @@ func cursorCloudAssertAPIWarning(t *testing.T, srv *Server, jobID int64, want bo
 	require.Len(t, body.Jobs, 1)
 	if want {
 		assert.Contains(t, body.Jobs[0].OrphanWarning, "orphan risk")
-		assert.Contains(t, body.Jobs[0].Error, "orphan risk")
 		return
 	}
 	assert.Empty(t, body.Jobs[0].OrphanWarning)
 	assert.NotContains(t, body.Jobs[0].Error, "orphan risk")
-}
-
-func cursorCloudEmptyTokenAgent(t *testing.T, tc *workerTestContext, fake *cursorcloudtest.Fake, seed bool) (*storage.ReviewJob, string) {
-	t.Helper()
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agent.CursorCloudHost)
-	id := "bc_missing"
-	if seed {
-		id = cursorCloudSeedAgent(t, fake, sha, "review").ID
-	}
-	cursorCloudInsertEmptyToken(t, tc.DB, job.ID, id)
-	return job, id
-}
-
-func cursorCloudInsertEmptyToken(t *testing.T, db *storage.DB, jobID int64, agentID string) {
-	t.Helper()
-	_, err := db.Exec(`INSERT INTO review_job_cloud_launches
-		(job_id, launch_token, agent_id, repo_identity, orphan_note)
-		VALUES (?, '', ?, ?, ?)`, jobID, agentID, cursorCloudRestartRepo, storage.CloudLaunchPendingNote)
-	require.NoError(t, err)
 }
 
 func cursorCloudStoredError(t *testing.T, db *storage.DB, jobID int64) string {
@@ -297,13 +195,6 @@ func cursorCloudLaunchNote(t *testing.T, db *storage.DB, jobID int64) string {
 	var note string
 	require.NoError(t, db.QueryRow(`SELECT COALESCE(orphan_note, '') FROM review_job_cloud_launches WHERE job_id = ?`, jobID).Scan(&note))
 	return note
-}
-
-func cursorCloudLaunchAgentID(t *testing.T, db *storage.DB, jobID int64) string {
-	t.Helper()
-	var id string
-	require.NoError(t, db.QueryRow(`SELECT agent_id FROM review_job_cloud_launches WHERE job_id = ?`, jobID).Scan(&id))
-	return id
 }
 
 func cursorCloudCleanToken(t *testing.T, db *storage.DB, job *storage.ReviewJob, token string) {
@@ -329,7 +220,6 @@ func TestBatchJobStatusShowsLaunchOrphanWarning(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 	assert.Contains(t, resp.Results[job.ID].Job.OrphanWarning, "orphan risk")
-	assert.Contains(t, resp.Results[job.ID].Job.Error, "orphan risk")
 	assert.Empty(t, resp.Results[quiet.ID].Job.OrphanWarning)
 }
 

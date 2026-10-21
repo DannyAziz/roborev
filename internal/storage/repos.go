@@ -600,21 +600,6 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 	}
 	defer conn.Close()
 
-	// A launch table that still references review_jobs ON DELETE CASCADE
-	// drops its rows when the job is deleted. foreign_keys cannot be changed
-	// inside a transaction, so turn it off on this connection before BEGIN.
-	// The migrated table has no job foreign key; this is a no-op there.
-	var launchFKs int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_list('review_job_cloud_launches')`).Scan(&launchFKs); err != nil {
-		return err
-	}
-	if launchFKs > 0 {
-		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
-			return err
-		}
-		defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
-	}
-
 	// BEGIN IMMEDIATE acquires a write lock immediately, preventing races
 	if err := beginImmediate(ctx, conn); err != nil {
 		return err

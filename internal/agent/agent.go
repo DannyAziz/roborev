@@ -259,7 +259,7 @@ func IsAvailable(name string) bool {
 	}
 	if name == hostAgentName {
 		// Only a lookup that names host gets here: automatic picks skip it.
-		return HostAllowed(HostNamed)
+		return HostAllowed()
 	}
 	if name == cursorCloudAgentName {
 		// Key presence never makes cursor-cloud an automatic pick.

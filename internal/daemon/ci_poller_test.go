@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -5282,5 +5283,22 @@ func TestPRDiscussionPreservesAllCommentsAndBodies(t *testing.T) {
 	context := formatPRDiscussionContext(comments)
 	for _, comment := range comments {
 		assert.Contains(t, context, comment.Body)
+	}
+}
+
+func TestRefuseHostForCI(t *testing.T) {
+	members := []config.ResolvedMember{{Agent: "codex", BackupAgent: "claude-code"}}
+	synth := config.SynthesisSpec{Agent: "codex"}
+	require.NoError(t, refuseHostForCI(members, synth))
+
+	for name, mutate := range map[string]func(m []config.ResolvedMember, s *config.SynthesisSpec){
+		"member":           func(m []config.ResolvedMember, _ *config.SynthesisSpec) { m[0].Agent = "host" },
+		"member backup":    func(m []config.ResolvedMember, _ *config.SynthesisSpec) { m[0].BackupAgent = "host" },
+		"synthesis":        func(_ []config.ResolvedMember, s *config.SynthesisSpec) { s.Agent = "host" },
+		"synthesis backup": func(_ []config.ResolvedMember, s *config.SynthesisSpec) { s.BackupAgent = "host" },
+	} {
+		m, s := slices.Clone(members), synth
+		mutate(m, &s)
+		assert.ErrorContains(t, refuseHostForCI(m, s), "host agent cannot run CI reviews", name)
 	}
 }

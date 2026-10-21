@@ -42,8 +42,6 @@ func unsetCursorCloudEnv(t *testing.T) {
 	unsetForTest(t, EnvDefaultHost)
 	unsetForTest(t, cursorcloud.EnvAPIKey)
 	unsetForTest(t, HostMarkerEnv)
-	unsetForTest(t, "CURSOR_AGENT")
-	clearCloudAgentEnv(t)
 }
 
 // TestDefaultConfigUnchanged proves an empty flag and config, with no
@@ -594,7 +592,7 @@ func TestCursorCloudLaunchLimitDefaults(t *testing.T) {
 
 func TestCursorCloudProductionUsesProcessLaunchGate(t *testing.T) {
 	injected := &CursorCloudAgent{Client: &cursorcloudtest.Fake{}}
-	assert.Nil(t, injected.launchGate())
+	assert.Same(t, cursorCloudLaunches, injected.launchGate())
 	assert.Same(t, cursorCloudLaunches, (&CursorCloudAgent{}).launchGate())
 }
 
@@ -670,7 +668,9 @@ func TestCursorCloudHourlyCapRefusesBeforeCreate(t *testing.T) {
 	assert.Equal(t, n, before)
 
 	_, err := a.Review(context.Background(), t.TempDir(), sha, "prompt", nil)
-	require.Error(t, err)
+	capErr, ok := errors.AsType[*CursorCloudCapError](err)
+	require.True(t, ok)
+	assert.Equal(t, clock.Add(time.Hour), capErr.RetryAt)
 	assert.Contains(t, err.Error(), "last hour")
 	assert.Equal(t, before, createCount(fake))
 
@@ -842,7 +842,7 @@ func TestCursorCloudCredentialFormsStayOutOfLaunch(t *testing.T) {
 	}
 }
 
-// cloudLaunchShape is one input built from a branch of stripURLCredentials
+// cloudLaunchShape is one input built from a branch of StripURLCredentials
 // or RemoteIdentity. producer is true when repoURL would store the stripped
 // value. identity is true when RemoteIdentity names a repository.
 type cloudLaunchShape struct {
@@ -920,7 +920,7 @@ func TestCursorCloudBindRefusalRefundsHourlySlot(t *testing.T) {
 }
 
 // cloudLaunchShapes builds one raw URL for each branch of the producer
-// (stripURLCredentials, then repoURL's redacted refusal) and of
+// (StripURLCredentials, then repoURL's redacted refusal) and of
 // RemoteIdentity (transport schemes read from that function, empty host,
 // empty path, SCP, protocol-relative, scheme-less path). Duplicate stored
 // values collapse to one row.

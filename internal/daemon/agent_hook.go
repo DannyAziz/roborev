@@ -37,7 +37,8 @@ func (s daemonAgentHookSource) ResolveTrackedRepo(
 		// .roborev.toml on the default branch, falling back to REVIEW.md.
 		// Global guidelines alone do not count; they are not tuned to
 		// this repo.
-		resolved.ReviewGuidelinesMissing = strings.TrimSpace(prompt.LoadGuidelines(ctx, resolved.RootPath)) == ""
+		resolved.ReviewGuidelinesMissing =
+			strings.TrimSpace(prompt.LoadGuidelines(ctx, resolved.RootPath)) == ""
 	}
 	return resolved, true
 }
@@ -58,7 +59,7 @@ func resolveTrackedRepo(
 		return agenthook.TrackedRepoResolution{}, fmt.Errorf("lookup repo: %w", err)
 	}
 	if repo.Identity != "" &&
-		!config.SameRepoIdentity(repo.Identity, config.ResolveRepoIdentity(lookupPath, nil)) {
+		config.ResolveRepoIdentity(lookupPath, nil) != repo.Identity {
 		return agenthook.TrackedRepoResolution{}, nil
 	}
 	resolved := agenthook.TrackedRepoResolution{

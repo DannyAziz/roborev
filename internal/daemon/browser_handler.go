@@ -273,7 +273,7 @@ type browserReviewResponse struct {
 
 func projectBrowserReviewJob(job storage.ReviewJob) browserReviewJob {
 	errorMessage := ""
-	if job.Status == storage.JobStatusFailed || job.OrphanWarning != "" || strings.Contains(job.Error, "orphan risk") {
+	if job.Status == storage.JobStatusFailed {
 		errorMessage = job.Error
 	}
 	displayPrompt := job.Prompt
