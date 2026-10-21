@@ -25,12 +25,21 @@ func reviewHostApplies(workflow, reviewType, jobType string) bool {
 	}
 }
 
-// enqueueHostJobType is the job type the host guard should see. The git ref
-// wins over a declared job type: job_type "review" with a dirty or range ref
-// is still a dirty or range review. An empty field is classified the same
+// enqueueHostJobType is the job type the host guard should see. A custom
+// prompt is a task even when its label looks like a range. Otherwise the git
+// ref wins over a declared job type: job_type "review" with a dirty or range
+// ref is still a dirty or range review. An empty field is classified the same
 // way. A single commit stays empty so storage still infers "review" after
 // the commit id is known.
 func enqueueHostJobType(explicit, customPrompt, gitRef string) string {
+	// run and analyze send a custom prompt and put a label in git_ref.
+	// That label is not a commit, even when it contains "..". A task cannot
+	// run on cursor-cloud, so the host guard must see "task" and the
+	// local-agent exemption can keep it off the cloud path.
+	explicit = strings.TrimSpace(explicit)
+	if explicit == storage.JobTypeTask || (explicit == "" && strings.TrimSpace(customPrompt) != "") {
+		return storage.JobTypeTask
+	}
 	switch classifyTarget("", gitRef) {
 	case kindDirty:
 		return storage.JobTypeDirty
