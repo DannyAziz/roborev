@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json/jsontext"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -1169,22 +1170,69 @@ func cloudFinalMessage(ctx context.Context, client cursorcloud.Client, id string
 func cursorCloudLaunchPrompt(prompt string) (string, error) {
 	const prefix = "Read the complete task prompt from "
 	const suffix = " and carry out its instructions. Read the file in full before starting.\n"
-	if !strings.HasPrefix(prompt, prefix) || !strings.HasSuffix(prompt, suffix) {
-		return prompt, nil
+	if strings.HasPrefix(prompt, prefix) && strings.HasSuffix(prompt, suffix) {
+		quoted := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), suffix)
+		path, err := strconv.Unquote(quoted)
+		if err != nil || strings.TrimSpace(path) == "" {
+			return "", errors.New("cursor-cloud: refusing to launch because the prompt points at a local file")
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
+		}
+		if strings.TrimSpace(string(body)) == "" {
+			return "", errors.New("cursor-cloud: refusing to launch because the oversized prompt is empty")
+		}
+		prompt = string(body)
 	}
-	quoted := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), suffix)
-	path, err := strconv.Unquote(quoted)
-	if err != nil || strings.TrimSpace(path) == "" {
-		return "", errors.New("cursor-cloud: refusing to launch because the prompt points at a local file")
+	return cursorCloudInlinePriorRangeReviews(prompt), nil
+}
+
+// cursorCloudInlinePriorRangeReviews replaces a local prior-range-reviews
+// file reference with that file's text. An unreadable reference is removed.
+// The cloud agent cannot read the daemon's temp path.
+func cursorCloudInlinePriorRangeReviews(prompt string) string {
+	const open = "<prior-range-reviews "
+	const closeTag = "</prior-range-reviews>"
+	for {
+		start := strings.Index(prompt, open)
+		if start < 0 {
+			return prompt
+		}
+		rel := strings.Index(prompt[start:], closeTag)
+		if rel < 0 {
+			return prompt[:start]
+		}
+		end := start + rel + len(closeTag)
+		prompt = prompt[:start] + priorRangeReviewsInline(prompt[start:end]) + prompt[end:]
+	}
+}
+
+func priorRangeReviewsInline(block string) string {
+	var reference struct {
+		File string `xml:"file,attr"`
+	}
+	if err := xml.NewDecoder(strings.NewReader(block)).Decode(&reference); err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(reference.File)
+	if path == "" {
+		return ""
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("cursor-cloud: refusing to launch because the oversized prompt cannot be read: %w", err)
+		return ""
 	}
-	if strings.TrimSpace(string(body)) == "" {
-		return "", errors.New("cursor-cloud: refusing to launch because the oversized prompt is empty")
+	text := strings.TrimSpace(string(body))
+	if rest, ok := strings.CutPrefix(text, "<?xml"); ok {
+		if _, after, found := strings.Cut(rest, "?>"); found {
+			text = strings.TrimSpace(after)
+		}
 	}
-	return string(body), nil
+	if text == "" {
+		return ""
+	}
+	return text + "\n"
 }
 
 func cloudPrompt(prompt string, schema jsontext.Value) string {

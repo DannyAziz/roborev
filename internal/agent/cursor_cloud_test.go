@@ -1157,6 +1157,29 @@ func TestCursorCloudSendsFullPromptInsteadOfLocalPath(t *testing.T) {
 	assert.NotContains(t, sent, "Read the complete task prompt from")
 }
 
+func TestCursorCloudInlinesPriorRangeReviewsFile(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const marker = "UNIQUE-PRIOR-RANGE-BODY"
+	path := filepath.Join(t.TempDir(), "prior-range-reviews.xml")
+	document := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<prior-range-reviews>\n  <review range=\"aaa..bbb\" agent=\"test\"><output>" + marker + "</output></review>\n</prior-range-reviews>\n"
+	require.NoError(t, os.WriteFile(path, []byte(document), 0o644))
+	prompt := "Review the change.\n\n<prior-range-reviews file=\"" + path + "\">\nOptional historical context: this XML document contains reviews.\n</prior-range-reviews>\n"
+	fake := &cursorcloudtest.Fake{CreateStatus: cursorcloud.StatusFinished, Final: "ok"}
+	_, err := (&CursorCloudAgent{Client: fake, RepoURL: "https://github.com/acme/api.git"}).Review(
+		context.Background(), t.TempDir(), sha, prompt, nil,
+	)
+	require.NoError(t, err)
+	var sent string
+	for _, call := range fake.Calls() {
+		if call.Method == cursorcloudtest.MethodCreate {
+			sent = call.Request.Prompt
+		}
+	}
+	assert.Contains(t, sent, marker)
+	assert.NotContains(t, sent, path)
+	assert.NotContains(t, sent, "<prior-range-reviews file=")
+}
+
 func TestCursorCloudRefusesUnreadablePromptSnapshot(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	path := filepath.Join(t.TempDir(), "missing.md")

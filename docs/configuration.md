@@ -1207,9 +1207,10 @@ URL sent to Cursor drops userinfo, every query key, and the fragment.
 cannot be parsed, including a token in the SCP user slot and a bad
 percent-escape, is not sent: the launch is refused. The stored repository
 identity is separate. It drops userinfo from transport URLs, keeps the query and
-the fragment, and stores an unparseable URL unchanged. A dirty or range review
-cannot use `cursor-cloud`. Enqueue refuses it and does
-not rewrite it onto a local agent. A declared fix, compact, or task with no
+the fragment, and stores an unparseable URL unchanged. Ordinary enqueue
+refuses a dirty or range review on `cursor-cloud` and does not rewrite it
+onto a local agent. CI is separate: an opted-in same-repository pull request
+runs that range on cursor-cloud. A declared fix, compact, or task with no
 prompt and a dirty or range ref is that review, so `cursor-cloud` refuses it.
 Goal reviews stay on the local agent. A custom prompt is the created job: fix
 and compact keep that type, and run or analyze is a task even when the label
