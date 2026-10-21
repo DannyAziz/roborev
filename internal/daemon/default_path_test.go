@@ -25,13 +25,8 @@ import (
 // the test sees the environment of a user who never set it up.
 func defaultPathEnv(t *testing.T) {
 	t.Helper()
-	for _, kv := range os.Environ() {
-		key, _, _ := strings.Cut(kv, "=")
-		if key == "ROBOREV_HOST_AGENT" || strings.HasPrefix(key, "CURSOR_AGENT") || strings.HasPrefix(key, "CLOUD_AGENT_") {
-			t.Setenv(key, "")
-			require.NoError(t, os.Unsetenv(key))
-		}
-	}
+	t.Setenv("ROBOREV_HOST_AGENT", "")
+	require.NoError(t, os.Unsetenv("ROBOREV_HOST_AGENT"))
 }
 
 func defaultPathStubs(t *testing.T, commands ...string) {

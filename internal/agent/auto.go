@@ -42,7 +42,7 @@ func resolveAutoBackup(repoCfg *config.RepoConfig, cfg *config.Config, exclude s
 			return name
 		}
 	}
-	if lastResort && usable(hostAgentName) && HostAllowed(HostAuto) {
+	if lastResort && usable(hostAgentName) && HostAllowed() {
 		return hostAgentName
 	}
 	return ""
@@ -50,7 +50,7 @@ func resolveAutoBackup(repoCfg *config.RepoConfig, cfg *config.Config, exclude s
 
 // AutoBackupNotFound explains an "auto" backup that resolved to no agent.
 func AutoBackupNotFound() string {
-	if HostAllowed(HostAuto) {
+	if HostAllowed() {
 		return fmt.Sprintf("\nbackup %q found no available agent", agentname.Auto)
 	}
 	return fmt.Sprintf("\nbackup %q found no available agent; host is an automatic pick only with %s=1", agentname.Auto, HostMarkerEnv)

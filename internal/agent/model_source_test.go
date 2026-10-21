@@ -192,11 +192,11 @@ func TestResolveAutoBackup(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				stubPath(t, tt.path...)
 				want := tt.want
-				if mode.explicit && tt.explicit != "" {
+				if mode.on && tt.explicit != "" {
 					want = tt.explicit
 				}
 				assert.Equal(t, want, ResolveAutoBackup(nil, cfg, tt.exclude, nil))
-				assert.Equal(t, mode.explicit, !strings.Contains(AutoBackupNotFound(), HostMarkerEnv))
+				assert.Equal(t, mode.on, !strings.Contains(AutoBackupNotFound(), HostMarkerEnv))
 			})
 		}
 	})
