@@ -520,12 +520,26 @@ roborev creates `ROBOREV_HOST_DIR` with mode 0700 if it is missing, but does not
 change the mode or owner of a directory that already exists. Job directories are
 always 0700.
 
-### Failure behavior
+### Selection and failure behavior
 
+- A named `host` without the marker fails the review at once, with no retries
+    and no failover to a backup.
+- A `host` backup without the marker is skipped, and the final error names
+    `ROBOREV_HOST_AGENT`.
+- With the marker set and no CLI agent installed, a pick that would otherwise
+    fail with "no agents available" uses `host` as a last resort and prints one
+    line to stderr. A foreground command such as `roborev fix` then waits on the
+    file handoff instead of erroring. A strictly named agent never falls back to
+    `host`.
 - A timeout, an invalid `ROBOREV_HOST_TIMEOUT`, or a refused `answer.md` fails
-    the review without same-agent retries. The job fails over to its backup
-    agent if it has one.
+    the review without same-agent retries. Reviews and panel synthesis fail over
+    to their backup agent if they have one.
 - The host timeout is separate from the job timeout.
+- Budget routing never substitutes `host` for another agent or another agent for
+    a named `host`, and `budget.agent_costs` cannot price it.
+- `classify_agent` and `classify_backup_agent` cannot be `host`.
+- `roborev doctor` reports a named `host` without the marker as a failure, and
+    warns when this shell has the marker but the daemon does not.
 
 ### Daemon and CI limits
 
