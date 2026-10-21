@@ -1728,6 +1728,30 @@ func (wp *WorkerPool) failGetAgentContext(ctx context.Context, workerID string, 
 	})
 }
 
+// finishAgentError routes a finished agent error. A typed cursor-cloud launch
+// failure is terminal even when it unwraps to context.DeadlineExceeded.
+// Pre-launch validation and the launch cap do not carry that sentinel, so
+// they still use the deadline path below.
+func (wp *WorkerPool) finishAgentError(ctx context.Context, workerID string, job *storage.ReviewJob, agentName string, err error, jobTimeout time.Duration) {
+	if errors.Is(err, agent.ErrCursorCloudNonRetryable) {
+		log.Printf("[%s] cursor-cloud launch will not be retried for job %d: %v", workerID, job.ID, err)
+		wp.failCursorCloudWithoutRetry(workerID, job, agentName, err)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
+		timeoutErr := fmt.Sprintf(
+			"%s %s",
+			agentTimeoutErrorPrefix,
+			jobTimeout.Round(time.Second),
+		)
+		log.Printf("[%s] Job %d timed out: %v", workerID, job.ID, err)
+		wp.failOrRetryAgentContext(ctx, workerID, job, agentName, timeoutErr)
+		return
+	}
+	log.Printf("[%s] Agent error on job %d: %v", workerID, job.ID, err)
+	wp.failOrRetryAgentExecutionContext(ctx, workerID, job, agentName, err)
+}
+
 // failOrRetryAgentExecutionContext preserves the typed category attached by an
 // agent adapter until existing provider-limit classification has run. Unknown
 // pre-protocol failures skip same-agent retries and use the non-retryable
