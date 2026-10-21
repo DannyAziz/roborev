@@ -572,6 +572,8 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 		WithStructuredOutput(true)
 	var reviewPrompt string
 	var snapshotCleanup func()
+	var priorRangeDir string
+	var priorRangeRefs map[string]string
 	if diffContent != "" || len(dirtyFiles) > 0 {
 		// Dirty review
 		dirtyResult, dirtyErr := pb.BuildDirtyWithSnapshotAndFiles(diffContent, dirtyFiles, cfg.ReviewContextCount, a.Name(), reviewType, resolvedMinSev)
@@ -583,6 +585,8 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 		result, buildErr := pb.BuildWithSnapshot(gitRef, cfg.ReviewContextCount, a.Name(), reviewType, resolvedMinSev, excludes)
 		reviewPrompt = result.Prompt
 		snapshotCleanup = result.Cleanup
+		priorRangeDir = result.PriorRangeReviewDir
+		priorRangeRefs = result.PriorRangeReviewRefs
 		err = buildErr
 	}
 	if snapshotCleanup != nil {
@@ -593,7 +597,10 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 	}
 
 	_, err = reviewpkg.RunAgentReview(
-		cmd.Context(), a, repoPath, gitRef, reviewPrompt, reviewType,
+		agent.WithPriorRangeReviewAllowlist(cmd.Context(), agent.PriorRangeReviewAllowlist{
+			Dir:  priorRangeDir,
+			Refs: priorRangeRefs,
+		}), a, repoPath, gitRef, reviewPrompt, reviewType,
 		resolvedMinSev, out,
 	)
 	if err != nil {

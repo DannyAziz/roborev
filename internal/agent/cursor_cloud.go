@@ -5,14 +5,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json/jsontext"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -310,8 +311,11 @@ func (a *CursorCloudAgent) review(ctx context.Context, repoPath, commitSHA, prom
 	}
 	// Read a local snapshot before reserving a launch. An unreadable path
 	// creates nothing, so it must not take the hourly slot either.
-	launchPrompt, err := cursorCloudLaunchPrompt(prompt)
+	launchPrompt, err := cursorCloudLaunchPrompt(ctx, prompt)
 	if err != nil {
+		if errors.Is(err, errPriorRangeReviewRefused) {
+			return "", err
+		}
 		return "", MarkUnavailable(err)
 	}
 
@@ -1164,10 +1168,42 @@ func cloudFinalMessage(ctx context.Context, client cursorcloud.Client, id string
 	return "", err
 }
 
+// errPriorRangeReviewRefused means a builder-recorded prior-range reviews
+// path is outside the prior-reviews directory. The launch is refused.
+var errPriorRangeReviewRefused = errors.New("cursor-cloud: refusing to launch because a prior-range reviews file is outside the prior-reviews dir")
+
+type priorRangeReviewAllowlistKey struct{}
+
+// PriorRangeReviewAllowlist is the set of prior-range review files the prompt
+// builder inserted. Refs maps that exact inserted text to its path. Dir is
+// the prior-reviews directory those paths must stay inside.
+type PriorRangeReviewAllowlist struct {
+	Dir  string
+	Refs map[string]string
+}
+
+// WithPriorRangeReviewAllowlist attaches the builder's prior-range review
+// files to ctx. The cloud launcher expands only these references.
+func WithPriorRangeReviewAllowlist(ctx context.Context, list PriorRangeReviewAllowlist) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cloned := PriorRangeReviewAllowlist{Dir: list.Dir, Refs: maps.Clone(list.Refs)}
+	return context.WithValue(ctx, priorRangeReviewAllowlistKey{}, cloned)
+}
+
+func priorRangeReviewAllowlistFrom(ctx context.Context) PriorRangeReviewAllowlist {
+	if ctx == nil {
+		return PriorRangeReviewAllowlist{}
+	}
+	list, _ := ctx.Value(priorRangeReviewAllowlistKey{}).(PriorRangeReviewAllowlist)
+	return list
+}
+
 // cursorCloudLaunchPrompt is the text CreateAgent receives. A local snapshot
 // handoff is read and inlined. A path that cannot be read is refused before
 // any launch, so the remote agent never sees a local filesystem path.
-func cursorCloudLaunchPrompt(prompt string) (string, error) {
+func cursorCloudLaunchPrompt(ctx context.Context, prompt string) (string, error) {
 	const prefix = "Read the complete task prompt from "
 	const suffix = " and carry out its instructions. Read the file in full before starting.\n"
 	if strings.HasPrefix(prompt, prefix) && strings.HasSuffix(prompt, suffix) {
@@ -1185,40 +1221,59 @@ func cursorCloudLaunchPrompt(prompt string) (string, error) {
 		}
 		prompt = string(body)
 	}
-	return cursorCloudInlinePriorRangeReviews(prompt), nil
+	return cursorCloudInlinePriorRangeReviews(prompt, priorRangeReviewAllowlistFrom(ctx))
 }
 
-// cursorCloudInlinePriorRangeReviews replaces a local prior-range-reviews
-// file reference with that file's text. An unreadable reference is removed.
-// The cloud agent cannot read the daemon's temp path.
-func cursorCloudInlinePriorRangeReviews(prompt string) string {
-	const open = "<prior-range-reviews "
-	const closeTag = "</prior-range-reviews>"
-	for {
-		start := strings.Index(prompt, open)
-		if start < 0 {
-			return prompt
-		}
-		rel := strings.Index(prompt[start:], closeTag)
-		if rel < 0 {
-			return prompt[:start]
-		}
-		end := start + rel + len(closeTag)
-		prompt = prompt[:start] + priorRangeReviewsInline(prompt[start:end]) + prompt[end:]
+// cursorCloudInlinePriorRangeReviews replaces builder-inserted prior-range
+// review references with those files' text. It does not scan the prompt.
+// An unreadable allowlisted file drops that reference. A path outside the
+// prior-reviews directory, including through a symlink, refuses the launch.
+// Text that is not in the allowlist, including an unclosed tag, stays as it is.
+func cursorCloudInlinePriorRangeReviews(prompt string, list PriorRangeReviewAllowlist) (string, error) {
+	if len(list.Refs) == 0 {
+		return prompt, nil
 	}
+	for block, path := range list.Refs {
+		if block == "" {
+			return "", errPriorRangeReviewRefused
+		}
+		resolved, err := confinePriorRangeReviewPath(list.Dir, path)
+		if err != nil {
+			return "", err
+		}
+		prompt = strings.ReplaceAll(prompt, block, priorRangeReviewInline(resolved))
+	}
+	return prompt, nil
 }
 
-func priorRangeReviewsInline(block string) string {
-	var reference struct {
-		File string `xml:"file,attr"`
+func confinePriorRangeReviewPath(dir, path string) (string, error) {
+	if strings.TrimSpace(dir) == "" || strings.TrimSpace(path) == "" || !filepath.IsAbs(dir) || !filepath.IsAbs(path) {
+		return "", errPriorRangeReviewRefused
 	}
-	if err := xml.NewDecoder(strings.NewReader(block)).Decode(&reference); err != nil {
-		return ""
+	lexical, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	if err != nil || pathEscapesDir(lexical) {
+		return "", errPriorRangeReviewRefused
 	}
-	path := strings.TrimSpace(reference.File)
-	if path == "" {
-		return ""
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", errPriorRangeReviewRefused
 	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", errPriorRangeReviewRefused
+	}
+	rel, err := filepath.Rel(resolvedDir, resolvedPath)
+	if err != nil || pathEscapesDir(rel) {
+		return "", errPriorRangeReviewRefused
+	}
+	return resolvedPath, nil
+}
+
+func pathEscapesDir(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel)
+}
+
+func priorRangeReviewInline(path string) string {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return ""

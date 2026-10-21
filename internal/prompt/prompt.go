@@ -242,6 +242,12 @@ type SnapshotResult struct {
 	Prompt   string
 	FilePath string
 	Cleanup  func()
+	// PriorRangeReviewDir is the directory the builder wrote prior-range
+	// review files into. PriorRangeReviewRefs maps the exact text inserted
+	// into Prompt to the file path. Callers pass both to the cloud launcher.
+	// The launcher must not discover paths by reading Prompt.
+	PriorRangeReviewDir  string
+	PriorRangeReviewRefs map[string]string
 }
 
 // SnapshotTarget controls where prompt, diff, and prior-review snapshots are written.
@@ -291,6 +297,7 @@ func (b *Builder) BuildWithSnapshotTarget(
 	}
 	priorCleanup := result.Cleanup
 	result = prepared
+	result.PriorRangeReviewDir, result.PriorRangeReviewRefs = priorRangeReviewAllowlist(priorReviewsFile)
 	if priorCleanup != nil {
 		result.Cleanup = func() {
 			if prepared.Cleanup != nil {
