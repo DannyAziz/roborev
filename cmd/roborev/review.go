@@ -537,8 +537,11 @@ func refuseLocalCursorCloud(repoPath, hostFlag, agentName, reviewType, reasoning
 	a, err := agent.GetPreferredOrBackupWithConfig(
 		repoPath, resolution.PreferredAgent, cfg, resolution.BackupAgent,
 	)
+	// Availability failures belong to runLocalReview. Returning them here
+	// rejects a valid --local run whose level-specific agent is available
+	// when this lookup is not, and it reports the failure before hooks.
 	if err != nil {
-		return err
+		return nil
 	}
 	if a != nil && a.Name() == agent.CursorCloudHost {
 		return errors.New("--local cannot use a cursor-cloud host")

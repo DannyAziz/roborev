@@ -247,6 +247,30 @@ func TestRunLocalReviewNameGuardRefusesCursorCloud(t *testing.T) {
 	assert.Equal(t, int32(0), posts.Load())
 }
 
+func TestLocalReviewLevelAgentSurvivesUnavailableGeneric(t *testing.T) {
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	dataDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", dataDir)
+	require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte("codex_cmd = \"/nonexistent/codex-for-local-refusal\"\n"), 0o600))
+	h := newReviewHarness(t)
+	h.writeConfig("review_agent = \"codex\"\nreview_agent_thorough = \"test\"\n")
+	err := h.runCmd("--local", "--repo", h.Dir, "--quiet")
+	require.NoError(t, err)
+}
+
+func TestLocalReviewUnavailableAgentStaysOnNormalPath(t *testing.T) {
+	t.Setenv(agent.EnvDefaultHost, "")
+	t.Setenv("ROBOREV_TELEMETRY_ENABLED", "0")
+	dataDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", dataDir)
+	require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte("codex_cmd = \"/nonexistent/codex-for-local-refusal\"\n"), 0o600))
+	h := newReviewHarness(t)
+	h.writeConfig("review_agent = \"codex\"\n")
+	err := h.runCmd("--local", "--repo", h.Dir, "--quiet")
+	require.ErrorContains(t, err, "get agent:")
+}
+
 func TestLocalReviewRefusesCursorCloudBeforeHooks(t *testing.T) {
 	cloudCreateFails(t)
 	t.Setenv(cursorcloud.EnvAPIKey, "cursor-test-secret-not-real")
