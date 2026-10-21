@@ -1208,20 +1208,25 @@ cannot be parsed, including a token in the SCP user slot and a bad
 percent-escape, is not sent: the launch is refused. The stored repository
 identity is separate. It drops userinfo from transport URLs, keeps the query and
 the fragment, and stores an unparseable URL unchanged. A dirty or range review
-cannot use `cursor-cloud` and is not rewritten to a local agent. Goal reviews
-and fix jobs stay on the local agent. CI launches `cursor-cloud` only when the
-repository's own `[ci] host` is `cursor-cloud`. The repository `host`, the
-global `host`, and `ROBOREV_DEFAULT_HOST` never select it for CI. The check runs
-when a matrix member, a named-panel member, or synthesis would enqueue
-cursor-cloud, not only when `[ci] host` is set. A fork or cross-repo pull
-request is refused on every one of those paths. An empty or unknown head or base
-repository, including a deleted fork, fails closed and does not launch. The
-deferred retry and the pull-request lookup both carry the head and base
-repository names. A retry that does not have them cannot launch cursor-cloud. An
-oversized prompt is not sent to cursor-cloud as a local file path. The adapter
-sends the full prompt text, and it refuses the launch when that text cannot be
-read. Without the opt-in, CI keeps its local matrix. An opted-in same-repository
-matrix launches one cloud agent.
+cannot use `cursor-cloud`. Enqueue refuses it and does
+not rewrite it onto a local agent. Goal reviews and fix jobs stay on the local
+agent. A fix job whose git ref is a range stays local even when `host` is
+`cursor-cloud`. CI launches `cursor-cloud` only when the repository's own
+`[ci] host` is `cursor-cloud`. The repository `host`, the global `host`, and
+`ROBOREV_DEFAULT_HOST` never select it for CI. The check runs when a matrix
+member, a named-panel member, or synthesis would enqueue cursor-cloud, not only
+when `[ci] host` is set. A fork or cross-repo pull request is refused on every
+one of those paths. An empty or unknown head or base repository, including a
+deleted fork, fails closed and does not launch. The deferred retry and the
+pull-request lookup both carry the head and base repository names. A retry that
+does not have them cannot launch cursor-cloud. An oversized prompt is not sent
+to cursor-cloud as a local file path. The adapter sends the full prompt text,
+and it refuses the launch when that text cannot be read. Without the opt-in,
+CI keeps its local matrix. An opted-in same-repository matrix launches one
+cloud agent. That job is stored as a range review, and the prebuilt prompt
+covers the pull request range. The agent is launched at the head commit. The
+adapter still refuses a ref that is empty, `dirty`, or contains `..`. CI does
+not send that ref.
 
 Launch limits are checked before the agent is created. The defaults are 4
 concurrent launches and 60 launches in a rolling hour. 4 matches the default
